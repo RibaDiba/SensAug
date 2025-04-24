@@ -3,13 +3,14 @@
 
 _base_ = [
     # './mmseg/_base_/models/upernet_vit-b16_ln_mln.py',
-    './mmseg/_base_/datasets/cityscapes.py', './mmseg/_base_/default_runtime.py',
-    './mmseg/_base_/schedules/schedule_80k.py'
+    "./mmseg/_base_/datasets/cityscapes.py",
+    "./mmseg/_base_/default_runtime.py",
+    "./mmseg/_base_/schedules/schedule_80k.py",
 ]
 crop_size = (1024, 1024)
 
 data_preprocessor = dict(
-    type='SegDataPreProcessor',
+    type="SegDataPreProcessor",
     size=crop_size,
     # RGB format normalization parameters
     mean=[123.675, 116.28, 103.53],
@@ -17,10 +18,10 @@ data_preprocessor = dict(
     # convert image from BGR to RGB
     bgr_to_rgb=True,
     pad_val=0,
-    seg_pad_val=255
+    seg_pad_val=255,
 )
 pretrained_sam = "https://download.openmmlab.com/mmclassification/v1/vit_sam/vit-base-p16_sam-pre_3rdparty_sa1b-1024px_20230411-2320f9cc.pth"
-norm_cfg = dict(requires_grad=True, type='BN')
+norm_cfg = dict(requires_grad=True, type="BN")
 model = dict(
     type="EncoderDecoder",
     data_preprocessor=data_preprocessor,
@@ -96,27 +97,27 @@ model = dict(
 # in backbone
 optim_wrapper = dict(
     _delete_=True,
-    type='OptimWrapper',
-    optimizer=dict(
-        type='AdamW', lr=0.00006, betas=(0.9, 0.999), weight_decay=0.01),
+    type="OptimWrapper",
+    optimizer=dict(type="AdamW", lr=0.00006, betas=(0.9, 0.999), weight_decay=0.01),
     paramwise_cfg=dict(
         custom_keys={
-            'pos_embed': dict(decay_mult=0.),
-            'cls_token': dict(decay_mult=0.),
-            'norm': dict(decay_mult=0.)
-        }))
+            "pos_embed": dict(decay_mult=0.0),
+            "cls_token": dict(decay_mult=0.0),
+            "norm": dict(decay_mult=0.0),
+        }
+    ),
+)
 
 param_scheduler = [
+    dict(type="LinearLR", start_factor=1e-6, by_epoch=False, begin=0, end=1500),
     dict(
-        type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
-    dict(
-        type='PolyLR',
+        type="PolyLR",
         eta_min=0.0,
         power=1.0,
         begin=1500,
         end=80000,
         by_epoch=False,
-    )
+    ),
 ]
 
 # By default, models are trained on 8 GPUs with 2 images per GPU

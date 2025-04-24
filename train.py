@@ -26,7 +26,13 @@ from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
 
 ### CHANGE VARS IN THIS FILE / IMPORT YOUR OWN
 # TO FIT YOUR SYSTEM (data root, mmseg config path, data root lookup)
-from SEG_CONFIG import PRIMARY_METRIC, DATA_ROOT_LOOKUP, SUPPORTED_DATASETS, SUPPORTED_BACKBONES, MMCONFIG_PATH
+from SEG_CONFIG import (
+    PRIMARY_METRIC,
+    DATA_ROOT_LOOKUP,
+    SUPPORTED_DATASETS,
+    SUPPORTED_BACKBONES,
+    MMCONFIG_PATH,
+)
 ###
 
 
@@ -106,8 +112,12 @@ def apply_acdc_train_eval(cfg, split="all"):
     else:
         split = "_" + split
 
-    cfg.train_dataloader.dataset.data_prefix = dict(img_path=f"rgb_anno{split}/train", seg_map_path=f"gt{split}/train")
-    cfg.val_dataloader.dataset.data_prefix = dict(img_path=f"rgb_anno{split}/test", seg_map_path=f"gt{split}/test")
+    cfg.train_dataloader.dataset.data_prefix = dict(
+        img_path=f"rgb_anno{split}/train", seg_map_path=f"gt{split}/train"
+    )
+    cfg.val_dataloader.dataset.data_prefix = dict(
+        img_path=f"rgb_anno{split}/test", seg_map_path=f"gt{split}/test"
+    )
     cfg.test_dataloader = cfg.val_dataloader
 
     return cfg
@@ -122,17 +132,25 @@ def build_config(args):
         if "acdc" in args.dataset:  # use cityscapes config for acdc
             mm_configs = glob.glob(f"{MMCONFIG_PATH}/{args.backbone}/*cityscapes*.py")
         else:
-            mm_configs = glob.glob(f"{MMCONFIG_PATH}/{args.backbone}/*{args.dataset}*.py")
-        mm_configs.sort(key=natural_keys)  # sorting to use the smallest resnet backbone available
+            mm_configs = glob.glob(
+                f"{MMCONFIG_PATH}/{args.backbone}/*{args.dataset}*.py"
+            )
+        mm_configs.sort(
+            key=natural_keys
+        )  # sorting to use the smallest resnet backbone available
 
         print("Existing configs found: ", mm_configs)
-        
+
         if len(mm_configs) == 0:  # no configs exist for this configuration
-            mm_configs = glob.glob(f"{MMCONFIG_PATH}/{args.backbone}/*.py")  # use any existing config
+            mm_configs = glob.glob(
+                f"{MMCONFIG_PATH}/{args.backbone}/*.py"
+            )  # use any existing config
             mm_configs.sort(key=natural_keys)
             config = mm_configs.pop(0)
 
-            while "r101" in config and len(mm_configs) > 0:  # don't use a big model if we don't have to, lol
+            while (
+                "r101" in config and len(mm_configs) > 0
+            ):  # don't use a big model if we don't have to, lol
                 config = mm_configs.pop(0)
 
             dist_print(f"Using base config: {config}")
@@ -140,12 +158,16 @@ def build_config(args):
 
             # update dataset
             dataset_name = args.dataset
-            data_cfg = Config.fromfile(f"{MMCONFIG_PATH}/_base_/datasets/{dataset_name}.py").to_dict()
+            data_cfg = Config.fromfile(
+                f"{MMCONFIG_PATH}/_base_/datasets/{dataset_name}.py"
+            ).to_dict()
             cfg.merge_from_dict(data_cfg)
 
             # update schedule
             original_optim_wrapper = cfg.get("optim_wrapper", None)
-            schedule_cfg = Config.fromfile(f"{MMCONFIG_PATH}/_base_/schedules/schedule_320k.py").to_dict()
+            schedule_cfg = Config.fromfile(
+                f"{MMCONFIG_PATH}/_base_/schedules/schedule_320k.py"
+            ).to_dict()
             cfg.merge_from_dict(schedule_cfg)
             if original_optim_wrapper is not None:
                 cfg.optim_wrapper = original_optim_wrapper
@@ -185,7 +207,11 @@ def build_config(args):
     # Set up working dir to save files and logs.
     cfg.work_dir = os.path.join(args.work_dir, args.exp_name)
 
-    if args.resume or os.path.isdir(cfg.work_dir) and os.path.isfile(os.path.join(cfg.work_dir, "last_checkpoint")):
+    if (
+        args.resume
+        or os.path.isdir(cfg.work_dir)
+        and os.path.isfile(os.path.join(cfg.work_dir, "last_checkpoint"))
+    ):
         cfg.resume = True
         cfg.load_from = None
 
@@ -202,7 +228,11 @@ def build_config(args):
             "RandomResize",
             "PackSegInputs",
         ]
-        pipeline = [x for x in cfg.train_dataloader.dataset.pipeline if (x["type"] not in excluded_augmentations)]
+        pipeline = [
+            x
+            for x in cfg.train_dataloader.dataset.pipeline
+            if (x["type"] not in excluded_augmentations)
+        ]
         pipeline.append(dict(type="PackSegInputs"))
 
     else:  # use custom augmentations
@@ -213,7 +243,11 @@ def build_config(args):
             "PackSegInputs",
             "LoadAnnotations",
         ]
-        pipeline = [x for x in cfg.train_dataloader.dataset.pipeline if (x["type"] not in excluded_augmentations)]
+        pipeline = [
+            x
+            for x in cfg.train_dataloader.dataset.pipeline
+            if (x["type"] not in excluded_augmentations)
+        ]
 
         augmentation_type = args.aug_type
         if augmentation_type == "autoaugment":
@@ -263,11 +297,17 @@ def build_config(args):
     # set up visualizer
     cfg.randomness = dict(seed=0)
     np.random.seed(0)
-    cfg.visualizer = dict(type="Visualizer", vis_backends=[dict(type="TensorboardVisBackend")])
+    cfg.visualizer = dict(
+        type="Visualizer", vis_backends=[dict(type="TensorboardVisBackend")]
+    )
 
     N_ROUNDS = 20
 
-    round_interval = args.round_interval if args.round_interval is not None else cfg.train_cfg.max_iters // N_ROUNDS
+    round_interval = (
+        args.round_interval
+        if args.round_interval is not None
+        else cfg.train_cfg.max_iters // N_ROUNDS
+    )
     cfg.train_cfg.val_interval = round_interval
 
     # if "acdc" not in args.dataset.lower():
@@ -455,7 +495,9 @@ if __name__ == "__main__":
         default=False,
         help="whether to prioritize less severe augmentations",
     )
-    parser.add_argument("--uniform", action="store_true", default=False, help="use uniform augmentation")
+    parser.add_argument(
+        "--uniform", action="store_true", default=False, help="use uniform augmentation"
+    )
     parser.add_argument(
         "--adamw",
         action="store_true",

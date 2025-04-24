@@ -1,7 +1,7 @@
 REPO_NAME = "mmsegmentation"
 
 # DATA_ROOT = "data/"
-DATA_ROOT="/fs/nexus-projects/robustness_datasets/segmentation"
+DATA_ROOT = "/fs/nexus-projects/robustness_datasets/segmentation"
 MMCONFIG_PATH = "/fs/nexus-scratch/lyzheng/sensaug/sensaug/custom_configs/mmseg"
 
 PRIMARY_METRIC = "mIoU"

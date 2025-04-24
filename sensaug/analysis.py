@@ -36,15 +36,23 @@ UNSEEN_PERTURBATIONS = [
     "fog",
 ]
 
-PERTURBATION_ORDER = ["clean"] + SEEN_PERTURBATIONS + ["combination"] + UNSEEN_PERTURBATIONS
+PERTURBATION_ORDER = (
+    ["clean"] + SEEN_PERTURBATIONS + ["combination"] + UNSEEN_PERTURBATIONS
+)
 
 AGGREGATE_CATEGORY_ORDER = ["a_clean", "b_seen", "combination", "d_imgnetc"]
 
 plt.rcParams["figure.figsize"] = (20, 4)
 
 
-def histogram_eval_csv(work_dir, pattern=None, dataset=None, backbone=None, name="temp", metric="mIoU"):
-    workdir_pattern = os.path.join(work_dir, pattern) if pattern is not None else os.path.join(work_dir, "*")
+def histogram_eval_csv(
+    work_dir, pattern=None, dataset=None, backbone=None, name="temp", metric="mIoU"
+):
+    workdir_pattern = (
+        os.path.join(work_dir, pattern)
+        if pattern is not None
+        else os.path.join(work_dir, "*")
+    )
     all_workdirs = glob.glob(workdir_pattern)
 
     v1 = []  # imagenet-C
@@ -77,7 +85,11 @@ def histogram_eval_csv(work_dir, pattern=None, dataset=None, backbone=None, name
             bp_miou = df[df.index == "bseen"][metric]
             comb_miou = df[df.index == "combination"][metric]
 
-            if len(imagenetc_miou) == 1 and len(proxy_miou) == 1 and len(clean_miou) == 1:
+            if (
+                len(imagenetc_miou) == 1
+                and len(proxy_miou) == 1
+                and len(clean_miou) == 1
+            ):
                 datasets.append(dataset_name)
                 methods.append(method_name)
                 backbones.append(backbone_name)
@@ -136,10 +148,14 @@ def _get_pearson_sample(csv_path):
         else "proxy"
     )
     results_df["level"] = results_df["perturbation"].apply(
-        lambda x: (x.split(" ")[-1] if len(x.split(" ")) > 1 else None) if x != "proxy" else 3
+        lambda x: (x.split(" ")[-1] if len(x.split(" ")) > 1 else None)
+        if x != "proxy"
+        else 3
     )
     results_df["perturbation"] = results_df["perturbation"].apply(
-        lambda x: ("".join(x.split(" ")[:-1]) if len(x.split(" ")) > 1 else "clean") if x != "proxy" else "proxy"
+        lambda x: ("".join(x.split(" ")[:-1]) if len(x.split(" ")) > 1 else "clean")
+        if x != "proxy"
+        else "proxy"
     )
 
     # results_df = results_df.drop(results_df[(results_df.level == "5") & (results_df.perturbation.isin(SEEN_PERTURBATIONS))].index)
@@ -198,8 +214,14 @@ def _get_pearson_sample(csv_path):
     return aggregate2_df
 
 
-def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="temp", metric="mIoU"):
-    workdir_pattern = os.path.join(work_dir, pattern) if pattern is not None else os.path.join(workdir, "*")
+def pearson_test_eccv(
+    workdir, pattern=None, dataset=None, backbone=None, name="temp", metric="mIoU"
+):
+    workdir_pattern = (
+        os.path.join(work_dir, pattern)
+        if pattern is not None
+        else os.path.join(workdir, "*")
+    )
     all_workdirs = glob.glob(workdir_pattern)
 
     v1 = []  # imagenet-C
@@ -228,7 +250,11 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
             proxy_miou = df[df.index == "eproxy"][metric]
             clean_miou = df[df.index == "aclean"][metric]
 
-            if len(imagenetc_miou) == 1 and len(proxy_miou) == 1 and len(clean_miou) == 1:
+            if (
+                len(imagenetc_miou) == 1
+                and len(proxy_miou) == 1
+                and len(clean_miou) == 1
+            ):
                 datasets.append(dataset_name)
                 methods.append(method_name)
                 backbones.append(backbone_name)
@@ -257,8 +283,12 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
     slope, intercept, r_value, p_value, std_err = linregress(x, y)
     predicted_y = [(slope * xi) + intercept for xi in x]
     plot_data["yhat_proxy"] = predicted_y
-    plot_data["resid_proxy"] = [observed_y - predicted_yi for observed_y, predicted_yi in zip(y, predicted_y)]
-    plot_data["resid_proxy"] = plot_data["resid_proxy"] / (max(plot_data["proxy_miou"]) - min(plot_data["proxy_miou"]))
+    plot_data["resid_proxy"] = [
+        observed_y - predicted_yi for observed_y, predicted_yi in zip(y, predicted_y)
+    ]
+    plot_data["resid_proxy"] = plot_data["resid_proxy"] / (
+        max(plot_data["proxy_miou"]) - min(plot_data["proxy_miou"])
+    )
 
     # result = smf.ols('proxy_miou ~ imgnetc_miou', plot_data).fit()
     # plot_data['yhat_proxy'] = result.fittedvalues
@@ -274,8 +304,12 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
     slope, intercept, r_value, p_value, std_err = linregress(x, y)
     predicted_y = [(slope * xi) + intercept for xi in x]
     plot_data["yhat_clean"] = predicted_y
-    plot_data["resid_clean"] = [observed_y - predicted_yi for observed_y, predicted_yi in zip(y, predicted_y)]
-    plot_data["resid_clean"] = plot_data["resid_clean"] / (max(plot_data["clean_miou"]) - min(plot_data["clean_miou"]))
+    plot_data["resid_clean"] = [
+        observed_y - predicted_yi for observed_y, predicted_yi in zip(y, predicted_y)
+    ]
+    plot_data["resid_clean"] = plot_data["resid_clean"] / (
+        max(plot_data["clean_miou"]) - min(plot_data["clean_miou"])
+    )
 
     # result = smf.ols('clean_miou ~ imgnetc_miou', plot_data).fit()
     # plot_data['yhat_clean'] = result.fittedvalues
@@ -286,7 +320,9 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
     # backbones_int = dict(zip(x, list(range(1,len(x)+1))))
     # colors = [backbones_int[v] for v in backbones]
     with sns.axes_style("darkgrid"):
-        sns.scatterplot(data=plot_data, x="imgnetc_miou", y="proxy_miou", hue="backbone")
+        sns.scatterplot(
+            data=plot_data, x="imgnetc_miou", y="proxy_miou", hue="backbone"
+        )
         plt.plot(
             plot_data["imgnetc_miou"],
             plot_data["yhat_proxy"],
@@ -308,7 +344,9 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
     plt.close()
 
     with sns.axes_style("darkgrid"):
-        sns.scatterplot(data=plot_data, x="imgnetc_miou", y="resid_proxy", hue="backbone")
+        sns.scatterplot(
+            data=plot_data, x="imgnetc_miou", y="resid_proxy", hue="backbone"
+        )
 
     plt.title("Residual Between Benchmark and Proxy Performance")
     plt.xlabel(f"ImageNet-C {metric.capitalize()}")
@@ -326,7 +364,9 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
 
     # clean
     with sns.axes_style("darkgrid"):
-        sns.scatterplot(data=plot_data, x="imgnetc_miou", y="clean_miou", hue="backbone")
+        sns.scatterplot(
+            data=plot_data, x="imgnetc_miou", y="clean_miou", hue="backbone"
+        )
         plt.plot(
             plot_data["imgnetc_miou"],
             plot_data["yhat_clean"],
@@ -347,7 +387,9 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
     plt.close()
 
     with sns.axes_style("darkgrid"):
-        sns.scatterplot(data=plot_data, x="imgnetc_miou", y="resid_clean", hue="backbone")
+        sns.scatterplot(
+            data=plot_data, x="imgnetc_miou", y="resid_clean", hue="backbone"
+        )
 
     plt.title("Residual Between Benchmark and Clean Performance")
     plt.xlabel(f"ImageNet-C {metric.capitalize()}")
@@ -367,7 +409,11 @@ def pearson_test_eccv(workdir, pattern=None, dataset=None, backbone=None, name="
 
 
 def generate_latex_rows_from_workdir(workdir: str, pattern: str = None):
-    workdir_pattern = os.path.join(workdir, pattern) if pattern is not None else os.path.join(workdir, "*")
+    workdir_pattern = (
+        os.path.join(workdir, pattern)
+        if pattern is not None
+        else os.path.join(workdir, "*")
+    )
     all_workdirs = glob.glob(workdir_pattern)
 
     for w in sorted(all_workdirs):
@@ -560,7 +606,9 @@ def plot_scaling_laws_data_from_csv(workdir: str, pattern: str = None):
                 x_values.remove(i)
                 continue
 
-            aggregate_results_df = generate_latex_table_contents_from_csv(results_csv_path)
+            aggregate_results_df = generate_latex_table_contents_from_csv(
+                results_csv_path
+            )
 
             clean_miou.append(aggregate_results_df.iloc[0]["mIoU_a_clean"])
             single_perturb_miou.append(aggregate_results_df.iloc[0]["mIoU_b_seen"])
@@ -581,7 +629,9 @@ def plot_scaling_laws_data_from_csv(workdir: str, pattern: str = None):
     print("missing test: ", missing_test)
 
 
-def plot_scaling_laws_data_from_realworld(workdir: str, dataset="acdc", pattern: str = None):
+def plot_scaling_laws_data_from_realworld(
+    workdir: str, dataset="acdc", pattern: str = None
+):
     _methods = [
         "ours",
         "none",
@@ -677,8 +727,12 @@ def eval_results_to_csv(eval_results_path: str, savepath=None):
         savepath = os.path.join(eval_results_path, "eval_results.csv")
 
     header_logged = False
-    subdirs = glob.glob(os.path.join(eval_results_path, "*"))  # eval_results_path/eval_ptype=...
-    perturbations = [os.path.basename(x).replace("eval_", "") for x in subdirs]  # ptype=..._level=...
+    subdirs = glob.glob(
+        os.path.join(eval_results_path, "*")
+    )  # eval_results_path/eval_ptype=...
+    perturbations = [
+        os.path.basename(x).replace("eval_", "") for x in subdirs
+    ]  # ptype=..._level=...
 
     with open(savepath, "w+") as f:
         for i, subdir in enumerate(subdirs):
@@ -691,7 +745,9 @@ def eval_results_to_csv(eval_results_path: str, savepath=None):
                     json_data = json.loads(json_text)
 
                 if header_logged == False:  # log header
-                    column_names = ["perturbation"] + [str(x) for x in list(json_data.keys())]
+                    column_names = ["perturbation"] + [
+                        str(x) for x in list(json_data.keys())
+                    ]
                     f.write(",".join(column_names) + "\n")
                     header_logged = True
 

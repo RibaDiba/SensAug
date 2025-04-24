@@ -32,7 +32,7 @@ from sensaug.loops import (
 from sensaug.dataset.datasets import ACDCDataset
 from sensaug.hooks import AugSegVisualizationHook
 from sensaug.visualizer import BPSegLocalVisualizer
-from sensaug.dataset.idbh import IDBHTransform # noqa:F401
+from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 
 
 def main():
@@ -89,8 +89,7 @@ def parse_args():
         "--save-vis",
         action="store_true",
         default=False,
-        help="If specified, visualization will be automatically saved "
-        "to the work_dir",
+        help="If specified, visualization will be automatically saved to the work_dir",
     )
     parser.add_argument(
         "--wait-time", type=float, default=2, help="the interval of show (s)"
@@ -227,22 +226,25 @@ def test_robust(cfg, args, sa_results_file="sensaug/testing/test_levels.json"):
         for i, level in enumerate(levels):
             results_file_list = glob.glob(
                 os.path.join(
-                    original_work_dir, f"eval_ptype={p_type}_level={i+1}", "*", "*.json"
+                    original_work_dir,
+                    f"eval_ptype={p_type}_level={i + 1}",
+                    "*",
+                    "*.json",
                 )
             )
 
             if len(results_file_list) > 0:
                 print_log(
-                    f"Skipping {p_type} level {i+1} because it already exists",
+                    f"Skipping {p_type} level {i + 1} because it already exists",
                     logger="current",
                 )
                 continue
 
-            print_log(f"{p_type} Evaluation at level {i+1}.. ", logger="current")
+            print_log(f"{p_type} Evaluation at level {i + 1}.. ", logger="current")
             cfg = cfg_switch_work_dir(
                 cfg,
                 args,
-                os.path.join(original_work_dir, f"eval_ptype={p_type}_level={i+1}"),
+                os.path.join(original_work_dir, f"eval_ptype={p_type}_level={i + 1}"),
             )
             runner = Runner.from_cfg(cfg)
 

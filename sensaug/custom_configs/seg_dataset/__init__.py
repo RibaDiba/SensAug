@@ -1,4 +1,2 @@
-
 from mmseg.datasets import *
-from acdc import ACDCDataset 
-
+from acdc import ACDCDataset

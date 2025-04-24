@@ -12,93 +12,107 @@ from mmengine.visualization import Visualizer
 import sensaug.dataset.datasets as datasets
 from sensaug.hooks import *
 from sensaug.visualizer import BPSegLocalVisualizer
-from sensaug.dataset.idbh import IDBHTransform # noqa:F401
+from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 
 from SEG_CONFIG import DATA_ROOT_LOOKUP
 
 PROXY_ALPHAS = {
-    "voc12": [0.6245, 0.6056, 0.6558, [0.2058, 1.8083], 0.0009], 
-    "cityscapes": [0.5984, 0.6247, 0.5537, [0.9921, 0.3702], 0.0057], 
-    "potsdam": [0.5320, 0.4758, 0.4792, [2.8966, 0.2955], 0.0066], 
-    "cub" : [-0.3199, 0.4667, 0.6306, [0.4772, 0.2014], 0.0005], 
-    "loveda" : [0.5193, 0.4332, 0.3107, [0.7910, 0.6551], 0.0004]
+    "voc12": [0.6245, 0.6056, 0.6558, [0.2058, 1.8083], 0.0009],
+    "cityscapes": [0.5984, 0.6247, 0.5537, [0.9921, 0.3702], 0.0057],
+    "potsdam": [0.5320, 0.4758, 0.4792, [2.8966, 0.2955], 0.0066],
+    "cub": [-0.3199, 0.4667, 0.6306, [0.4772, 0.2014], 0.0005],
+    "loveda": [0.5193, 0.4332, 0.3107, [0.7910, 0.6551], 0.0004],
 }
 
+
 def apply_dark_zurich_eval(cfg, args, original_work_dir):
-    cfg.dataset_type = 'DarkZurichDataset'
-    cfg.data_root = '/fs/nexus-projects/robustness_datasets/segmentation/dark_zurich_val'
-    cfg.val_dataloader.dataset.type = cfg.dataset_type 
-    cfg.val_dataloader.dataset.data_root = cfg.data_root 
+    cfg.dataset_type = "DarkZurichDataset"
+    cfg.data_root = (
+        "/fs/nexus-projects/robustness_datasets/segmentation/dark_zurich_val"
+    )
+    cfg.val_dataloader.dataset.type = cfg.dataset_type
+    cfg.val_dataloader.dataset.data_root = cfg.data_root
     cfg.val_dataloader.dataset.data_prefix = dict(
-                                                img_path='rgb_anon/val/night/GOPR0356', 
-                                                seg_map_path='gt/val/night/GOPR0356'
-                                            )
-    
+        img_path="rgb_anon/val/night/GOPR0356", seg_map_path="gt/val/night/GOPR0356"
+    )
+
     cfg.test_dataloader = cfg.val_dataloader
 
     cfg = cfg_switch_work_dir(cfg, args, os.path.join(original_work_dir, "dark_zurich"))
 
     return cfg
 
+
 def apply_nighttime_driving_eval(cfg, args, original_work_dir):
-    cfg.dataset_type = 'NightDrivingDataset'
-    cfg.data_root = '/fs/nexus-projects/robustness_datasets/segmentation/NighttimeDrivingTest'
-    cfg.val_dataloader.dataset.type = cfg.dataset_type 
-    cfg.val_dataloader.dataset.data_root = cfg.data_root 
+    cfg.dataset_type = "NightDrivingDataset"
+    cfg.data_root = (
+        "/fs/nexus-projects/robustness_datasets/segmentation/NighttimeDrivingTest"
+    )
+    cfg.val_dataloader.dataset.type = cfg.dataset_type
+    cfg.val_dataloader.dataset.data_root = cfg.data_root
     cfg.val_dataloader.dataset.data_prefix = dict(
-                                                img_path='leftImg8bit/test/night', 
-                                                seg_map_path='gtCoarse_daytime_trainvaltest/test/night'
-                                            )
-    
+        img_path="leftImg8bit/test/night",
+        seg_map_path="gtCoarse_daytime_trainvaltest/test/night",
+    )
+
     cfg.test_dataloader = cfg.val_dataloader
 
-    cfg = cfg_switch_work_dir(cfg, args, os.path.join(original_work_dir, "nightdriving"))
+    cfg = cfg_switch_work_dir(
+        cfg, args, os.path.join(original_work_dir, "nightdriving")
+    )
 
     return cfg
 
+
 def apply_acdc_eval(cfg, args, original_work_dir, split="all"):
-    cfg.dataset_type = 'ACDCDataset'
+    cfg.dataset_type = "ACDCDataset"
     cfg.data_root = DATA_ROOT_LOOKUP["acdc"]
-    cfg.val_dataloader.dataset.type = cfg.dataset_type 
-    cfg.val_dataloader.dataset.data_root = cfg.data_root 
+    cfg.val_dataloader.dataset.type = cfg.dataset_type
+    cfg.val_dataloader.dataset.data_root = cfg.data_root
 
     if split == "all":
         split = ""
     else:
-        split = "_"+split
+        split = "_" + split
 
-    cfg.val_dataloader.dataset.data_prefix = dict(img_path=f'rgb_anno{split}/test', 
-                                   seg_map_path=f'gt{split}/test')
+    cfg.val_dataloader.dataset.data_prefix = dict(
+        img_path=f"rgb_anno{split}/test", seg_map_path=f"gt{split}/test"
+    )
     cfg.test_dataloader = cfg.val_dataloader
-    cfg = cfg_switch_work_dir(cfg, args, os.path.join(original_work_dir, f"acdc{split}"))
+    cfg = cfg_switch_work_dir(
+        cfg, args, os.path.join(original_work_dir, f"acdc{split}")
+    )
 
     return cfg
 
+
 def apply_idd_eval(cfg, args, original_work_dir):
-    cfg.dataset_type = 'IDDDataset'
+    cfg.dataset_type = "IDDDataset"
     cfg.data_root = DATA_ROOT_LOOKUP["idd"]
-    cfg.val_dataloader.dataset.type = cfg.dataset_type 
-    cfg.val_dataloader.dataset.data_root = cfg.data_root 
-    cfg.val_dataloader.dataset.data_prefix = dict(img_path='leftImg8bit/val', 
-                                   seg_map_path='gtFine/val')
+    cfg.val_dataloader.dataset.type = cfg.dataset_type
+    cfg.val_dataloader.dataset.data_root = cfg.data_root
+    cfg.val_dataloader.dataset.data_prefix = dict(
+        img_path="leftImg8bit/val", seg_map_path="gtFine/val"
+    )
     cfg.test_dataloader = cfg.val_dataloader
-    
+
     cfg = cfg_switch_work_dir(cfg, args, os.path.join(original_work_dir, "idd"))
 
     return cfg
 
+
 def cfg_switch_work_dir(cfg, args, path):
-    
     cfg.work_dir = path
 
     if args.show or args.save_vis:
         cfg = trigger_visualization_hook(cfg, args)
-    
+
     if args.out is not None:
         cfg.test_evaluator["output_dir"] = os.path.join(path, args.out)
         cfg.test_evaluator["keep_results"] = True
 
     return cfg
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MMSeg test (and eval) a model")
@@ -111,8 +125,7 @@ def parse_args():
     parser.add_argument(
         "--work-dir",
         help=(
-            "if specified, the evaluation metric results will be dumped"
-            "into the directory as json"
+            "if specified, the evaluation metric results will be dumpedinto the directory as json"
         ),
     )
     parser.add_argument(
@@ -142,8 +155,7 @@ def parse_args():
     parser.add_argument(
         "--exp_name",
         help=(
-            "if specified, the evaluation metric results will be dumped"
-            "into the directory as json"
+            "if specified, the evaluation metric results will be dumpedinto the directory as json"
         ),
     )
     parser.add_argument(
@@ -159,10 +171,9 @@ def parse_args():
     parser.add_argument("--show", action="store_true", help="show prediction results")
     parser.add_argument(
         "--save-vis",
-        action="store_true", 
+        action="store_true",
         default=False,
-        help="If specified, visualization will be automatically saved "
-        "to the work_dir"
+        help="If specified, visualization will be automatically saved to the work_dir",
     )
     parser.add_argument(
         "--wait-time", type=float, default=2, help="the interval of show (s)"
@@ -197,18 +208,20 @@ def parse_args():
 
 
 def trigger_visualization_hook(cfg, args):
-    cfg['visualizer']= dict(type='BPSegLocalVisualizer', 
-                            alpha=0.4,
-                            vis_backends=[dict(type='LocalVisBackend')], 
-                                                             name='visualizer')
-    
+    cfg["visualizer"] = dict(
+        type="BPSegLocalVisualizer",
+        alpha=0.4,
+        vis_backends=[dict(type="LocalVisBackend")],
+        name="visualizer",
+    )
+
     default_hooks = cfg.default_hooks
 
     if "visualization" in default_hooks:
-        default_hooks.pop("visualization") # remove visualization default hook
+        default_hooks.pop("visualization")  # remove visualization default hook
 
         # Turn on visualization
-        visualization_hook = dict(type='AugSegVisualizationHook')
+        visualization_hook = dict(type="AugSegVisualizationHook")
         visualization_hook["draw"] = True
         visualization_hook["interval"] = 2
         if args.show:
@@ -224,58 +237,59 @@ def trigger_visualization_hook(cfg, args):
             "refer to usage "
             "\"visualization=dict(type='VisualizationHook')\""
         )
-    
+
     cfg.default_hooks["visualization"] = visualization_hook
     return cfg
 
 
 def main():
     args = parse_args()
-    
+
     workdir_list = glob.glob(os.path.join(args.work_dir, "*/"))
 
     if args.test_all:
-        for workdir in workdir_list: 
-
-            if "eval" not in workdir and "loveda" in workdir and os.path.isdir(workdir[:-1] + "_eval"): 
-                
-                args.work_dir = workdir 
+        for workdir in workdir_list:
+            if (
+                "eval" not in workdir
+                and "loveda" in workdir
+                and os.path.isdir(workdir[:-1] + "_eval")
+            ):
+                args.work_dir = workdir
                 print("testing on workdir: ", workdir)
 
                 try:
                     test_once(args)
-                except Exception as e: 
+                except Exception as e:
                     print("test failed for: ", workdir)
                     print("Error msg: ")
                     print(e)
                     pass
 
-    else: 
+    else:
         print("testing on workdir: ", args.work_dir)
         test_once(args)
 
-def test_once(args):
 
+def test_once(args):
     cfg, original_work_dir = build_cfg(args)
 
-    if args.test_data is None: 
-
+    if args.test_data is None:
         print(f"Testing on data specified by config: {cfg.dataset_type}")
         runner = Runner.from_cfg(cfg)
         runner.test()
         runner.visualizer.__class__._instance_dict.clear()
         Visualizer._instance_dict.clear()
         print(f"Testing done! Workdir: {cfg.work_dir}")
-    
+
     elif args.test_data == "zurich":
         print("Testing on dark zurich.. ")
-        cfg = apply_dark_zurich_eval(cfg, args, cfg.work_dir)    
+        cfg = apply_dark_zurich_eval(cfg, args, cfg.work_dir)
         runner = Runner.from_cfg(cfg)
         runner.test()
         runner.visualizer.__class__._instance_dict.clear()
         Visualizer._instance_dict.clear()
         print(f"Dark Zurich testing done! Workdir: {cfg.work_dir}")
-    
+
     elif args.test_data == "night":
         print("Testing on nighttime driving.. ")
         cfg = apply_nighttime_driving_eval(cfg, args, cfg.work_dir)
@@ -284,9 +298,8 @@ def test_once(args):
         runner.visualizer.__class__._instance_dict.clear()
         Visualizer._instance_dict.clear()
         print(f"Nighttime Driving testing done! Workdir: {cfg.work_dir}")
-    
-    elif args.test_data == "acdc": 
 
+    elif args.test_data == "acdc":
         splits = ["all", "fog", "night", "rain", "snow"]
 
         original_work_dir = cfg.work_dir
@@ -299,9 +312,8 @@ def test_once(args):
             runner.visualizer.__class__._instance_dict.clear()
             Visualizer._instance_dict.clear()
             print(f"ACDC testing done for split: {s}! Workdir: {cfg.work_dir}")
-    
-    elif args.test_data == "idd": 
 
+    elif args.test_data == "idd":
         print("Testing on IDD.. ")
         cfg = apply_idd_eval(cfg, args, cfg.work_dir)
         runner = Runner.from_cfg(cfg)
@@ -310,55 +322,57 @@ def test_once(args):
         Visualizer._instance_dict.clear()
         print(f"IDD testing done! Workdir: {cfg.work_dir}")
 
+
 def build_cfg(args):
     work_dir_exists = os.path.isdir(args.work_dir)
-    if work_dir_exists: 
+    if work_dir_exists:
         config_path = glob.glob(os.path.join(args.work_dir, "*.py"))[0]
         args.config = config_path
         cfg = Config.fromfile(config_path)
     else:
         # load config
         cfg = Config.fromfile(args.config)
-    
+
     original_work_dir = cfg.work_dir
-    cfg.test_cfg = dict(type='TestLoop') # Could be SubsetTestLoop before
+    cfg.test_cfg = dict(type="TestLoop")  # Could be SubsetTestLoop before
     cfg.test_evaluator = cfg.val_evaluator
-    cfg.test_evaluator['collect_device'] = 'gpu'
-    cfg.val_cfg = dict(type='ValLoop') 
+    cfg.test_evaluator["collect_device"] = "gpu"
+    cfg.val_cfg = dict(type="ValLoop")
 
     cfg.launcher = args.launcher
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
-    
+
     if args.checkpoint is not None:
         cfg.load_from = args.checkpoint
         args.pretrained = False
-    
+
     elif work_dir_exists:
-        
-        if args.use_best: # use the best checkpoint
+        if args.use_best:  # use the best checkpoint
             last_checkpoint_path = glob.glob(os.path.join(args.work_dir, "best*.pth"))
             assert len(last_checkpoint_path) > 0, "No best checkpoint found"
             last_checkpoint_path = last_checkpoint_path[0]
-        else: # use latest checkpoint
+        else:  # use latest checkpoint
             last_checkpoint_f = os.path.join(args.work_dir, "last_checkpoint")
 
-            with open(last_checkpoint_f, 'r') as file:
+            with open(last_checkpoint_f, "r") as file:
                 last_checkpoint_path = os.path.basename(file.read().strip())
 
             last_checkpoint_path = os.path.join(args.work_dir, last_checkpoint_path)
-            # cfg.resume = True 
-        
+            # cfg.resume = True
+
         print(f"Loading checkpoint path: {last_checkpoint_path}")
 
         cfg.load_from = last_checkpoint_path
-        args.pretrained = False # pretrained is false no matter what... for now
+        args.pretrained = False  # pretrained is false no matter what... for now
 
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
         basename_dir = os.path.basename(os.path.normpath(args.work_dir))
         parent_dir = os.path.dirname(os.path.normpath(args.work_dir)) + "_eval"
-        cfg.work_dir = os.path.join(parent_dir, basename_dir) if work_dir_exists else args.work_dir
+        cfg.work_dir = (
+            os.path.join(parent_dir, basename_dir) if work_dir_exists else args.work_dir
+        )
         print(f"cfg work dir set to: {cfg.work_dir}")
 
     elif cfg.get("work_dir", None) is None:
@@ -394,18 +408,16 @@ def build_cfg(args):
 
     # cfg['visualizer']= dict(type='SegLocalVisualizer', vis_backends=[dict(type='LocalVisBackend'),
     #                     dict(type='TensorboardVisBackend')])
-    
-    
+
     cfg.train_dataloader = None
-    cfg.train_cfg = None 
+    cfg.train_cfg = None
     cfg.optim_wrapper = None
-    cfg.param_scheduler = None 
+    cfg.param_scheduler = None
     cfg.custom_hooks = None
     cfg.resume = False
     cfg.default_hooks.logger.interval = 5
-    
-    return cfg, original_work_dir
 
+    return cfg, original_work_dir
 
 
 if __name__ == "__main__":
