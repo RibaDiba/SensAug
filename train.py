@@ -1,0 +1,515 @@
+import os
+import numpy as np
+import re
+import glob
+import logging
+
+from mmengine.logging import print_log
+import mmseg
+import mmpretrain.models  # noqa:F401
+
+from mmengine import Config
+from mmengine.hooks import EarlyStoppingHook  # noqa:F401
+from mmengine.runner import Runner
+from mmengine.dist import is_main_process
+
+# Check Pytorch installation
+import torch
+
+import sensaug.dataset.datasets as datasets  # noqa:F401
+from sensaug.dataset.augmentations import *  # noqa:F403
+from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
+from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
+from sensaug.hooks import *  # noqa:F403
+from sensaug.loops import *  # noqa:F403
+from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
+
+### CHANGE VARS IN THIS FILE / IMPORT YOUR OWN
+# TO FIT YOUR SYSTEM (data root, mmseg config path, data root lookup)
+from SEG_CONFIG import PRIMARY_METRIC, DATA_ROOT_LOOKUP, SUPPORTED_DATASETS, SUPPORTED_BACKBONES, MMCONFIG_PATH
+###
+
+
+def dist_print(*args, **kwargs):
+    if is_main_process():
+        print(*args, **kwargs)
+
+
+# from torch.utils.data import DataLoader
+dist_print(torch.__version__, torch.cuda.is_available())
+
+# Check MMSegmentation installation
+dist_print(mmseg.__version__)
+
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+
+def trigger_visualization_hook(cfg, args):
+    cfg["visualizer"] = dict(
+        type="BPSegLocalVisualizer",
+        alpha=0.4,
+        vis_backends=[dict(type="TensorboardVisBackend")],
+        name="visualizer",
+    )
+    # dict(type='LocalVisBackend'),
+
+    default_hooks = cfg.default_hooks
+
+    if "visualization" in default_hooks:
+        default_hooks.pop("visualization")  # remove visualization default hook
+
+        # Turn on visualization
+        visualization_hook: dict = dict(type="AugSegVisualizationHook")
+        visualization_hook["draw"] = True
+        if args.show:
+            visualization_hook["show"] = True
+            visualization_hook["wait_time"] = args.wait_time
+        if args.save_vis:
+            visualizer = cfg.visualizer
+            visualizer["save_dir"] = os.path.join(cfg.work_dir)
+            print(f"Save dir changed to: {visualizer['save_dir']}")
+    else:
+        raise RuntimeError(
+            "VisualizationHook must be included in default_hooks."
+            "refer to usage "
+            "\"visualization=dict(type='VisualizationHook')\""
+        )
+
+    cfg.default_hooks["visualization"] = visualization_hook
+
+    return cfg
+
+
+def natural_keys(text):
+    """
+    alist.sort(key=natural_keys) sorts in human order
+    http://nedbatchelder.com/blog/200712/human_sorting.html
+    (See Toothy's implementation in the comments)
+    """
+    return [atoi(c) for c in re.split(r"(\d+)", text)]
+
+
+def apply_acdc_train_eval(cfg, split="all"):
+    cfg.dataset_type = "ACDCDataset"
+    cfg.data_root = DATA_ROOT_LOOKUP["acdc"]
+
+    cfg.train_dataloader.dataset.type = cfg.dataset_type
+    cfg.train_dataloader.dataset.data_root = DATA_ROOT_LOOKUP["acdc"]
+
+    cfg.val_dataloader.dataset.type = cfg.dataset_type
+    cfg.val_dataloader.dataset.data_root = DATA_ROOT_LOOKUP["acdc"]
+
+    if split == "all":
+        split = ""
+    else:
+        split = "_" + split
+
+    cfg.train_dataloader.dataset.data_prefix = dict(img_path=f"rgb_anno{split}/train", seg_map_path=f"gt{split}/train")
+    cfg.val_dataloader.dataset.data_prefix = dict(img_path=f"rgb_anno{split}/test", seg_map_path=f"gt{split}/test")
+    cfg.test_dataloader = cfg.val_dataloader
+
+    return cfg
+
+
+def build_config(args):
+    if args.use_foundation_backbone and args.dataset == "cityscapes":
+        config_path = os.path.dirname(MMCONFIG_PATH)
+        print(f"{config_path}/vitsam_cityscapes_1024.py")
+        cfg = Config.fromfile(f"{config_path}/vitsam_cityscapes_1024.py")
+    else:
+        if "acdc" in args.dataset:  # use cityscapes config for acdc
+            mm_configs = glob.glob(f"{MMCONFIG_PATH}/{args.backbone}/*cityscapes*.py")
+        else:
+            mm_configs = glob.glob(f"{MMCONFIG_PATH}/{args.backbone}/*{args.dataset}*.py")
+        mm_configs.sort(key=natural_keys)  # sorting to use the smallest resnet backbone available
+
+        print("Existing configs found: ", mm_configs)
+        
+        if len(mm_configs) == 0:  # no configs exist for this configuration
+            mm_configs = glob.glob(f"{MMCONFIG_PATH}/{args.backbone}/*.py")  # use any existing config
+            mm_configs.sort(key=natural_keys)
+            config = mm_configs.pop(0)
+
+            while "r101" in config and len(mm_configs) > 0:  # don't use a big model if we don't have to, lol
+                config = mm_configs.pop(0)
+
+            dist_print(f"Using base config: {config}")
+            cfg = Config.fromfile(config)
+
+            # update dataset
+            dataset_name = args.dataset
+            data_cfg = Config.fromfile(f"{MMCONFIG_PATH}/_base_/datasets/{dataset_name}.py").to_dict()
+            cfg.merge_from_dict(data_cfg)
+
+            # update schedule
+            original_optim_wrapper = cfg.get("optim_wrapper", None)
+            schedule_cfg = Config.fromfile(f"{MMCONFIG_PATH}/_base_/schedules/schedule_320k.py").to_dict()
+            cfg.merge_from_dict(schedule_cfg)
+            if original_optim_wrapper is not None:
+                cfg.optim_wrapper = original_optim_wrapper
+                cfg.optimizer = original_optim_wrapper.optimizer
+
+        else:
+            config = mm_configs[0]
+            dist_print(f"Using existing base config: {config}")
+            cfg = Config.fromfile(config)
+
+    cfg.launcher = args.launcher
+    cfg.pretrained = None
+    cfg.model.pretrained = None
+
+    # enable automatic-mixed-precision training
+    if args.amp:
+        optim_wrapper = cfg.optim_wrapper.type
+        if optim_wrapper == "AmpOptimWrapper":
+            print_log(
+                "AMP training is already enabled in your config.",
+                logger="current",
+                level=logging.WARNING,
+            )
+        else:
+            assert optim_wrapper == "OptimWrapper", (
+                f"`--amp` is only supported when the optimizer wrapper type is `OptimWrapper` but got {optim_wrapper}."
+            )
+            cfg.optim_wrapper.type = "AmpOptimWrapper"
+            cfg.optim_wrapper.loss_scale = "dynamic"
+
+    # enable automatically scaling LR
+    if "auto_scale_lr" in cfg and "base_batch_size" in cfg.auto_scale_lr:
+        cfg.auto_scale_lr.enable = True
+
+    cfg.test_dataloader = cfg.val_dataloader
+
+    # Set up working dir to save files and logs.
+    cfg.work_dir = os.path.join(args.work_dir, args.exp_name)
+
+    if args.resume or os.path.isdir(cfg.work_dir) and os.path.isfile(os.path.join(cfg.work_dir, "last_checkpoint")):
+        cfg.resume = True
+        cfg.load_from = None
+
+    cfg.default_hooks.checkpoint.interval = cfg.train_cfg.max_iters // 50
+    cfg.default_hooks.checkpoint.save_best = PRIMARY_METRIC
+    cfg.default_hooks.checkpoint.max_keep_ckpts = 3
+
+    if args.aug_type == "default":  # use default augmentations from config
+        pipeline = cfg.train_dataloader.dataset.pipeline
+    elif args.aug_type == "none":  # use no augmentations
+        excluded_augmentations = [
+            "PhotoMetricDistortion",
+            "RandomFlip",
+            "RandomResize",
+            "PackSegInputs",
+        ]
+        pipeline = [x for x in cfg.train_dataloader.dataset.pipeline if (x["type"] not in excluded_augmentations)]
+        pipeline.append(dict(type="PackSegInputs"))
+
+    else:  # use custom augmentations
+        excluded_augmentations = [
+            "PhotoMetricDistortion",
+            "RandomFlip",
+            "RandomResize",
+            "PackSegInputs",
+            "LoadAnnotations",
+        ]
+        pipeline = [x for x in cfg.train_dataloader.dataset.pipeline if (x["type"] not in excluded_augmentations)]
+
+        augmentation_type = args.aug_type
+        if augmentation_type == "autoaugment":
+            pipeline.append(dict(type="AutoAugmentTransform"))
+        elif augmentation_type == "augmix":
+            pipeline.append(dict(type="AugMixTransform"))
+        elif augmentation_type == "randaugment":
+            pipeline.append(dict(type="RandAugmentTransform"))
+        elif augmentation_type == "trivialaugment":
+            pipeline.append(dict(type="TrivialAugmentWideTransform"))
+        elif augmentation_type == "random" or augmentation_type == "ours":
+            pipeline.append(
+                dict(
+                    type="RandomAlphaTrainTransform",
+                    geometric_only=args.geometric_only,
+                    photometric_only=args.photometric_only,
+                )
+            )
+        elif augmentation_type == "idbh":
+            pipeline.append(dict(type="IDBHTransform", version="cifar10-weak"))
+        elif augmentation_type == "vip":
+            # kernel=2, vital=options['vital'], nonvital=options['nonvital'], dataroot=options['data'], dataroot_c=options['data_c'], num_workers=options['workers'], batch_size=options['batch_size'], _transforms=options['aug'], _eval=options['eval'], fractal_images=options['fractal_path']
+            pipeline.append(
+                dict(
+                    type="VIPAugTransform",
+                    kernel=2,
+                    vital=0.001,
+                    nonvital=0.005,
+                    dataset_name="cityscapes",
+                    fractal_images="./sensaug/dataset/vip_fractals/images_224_tiny/",
+                )
+            )
+
+        pipeline.append(dict(type="PackSegInputs"))
+        pipeline.insert(1, dict(type="LoadAnnotations"))
+
+    cfg.train_pipeline = pipeline
+    cfg.train_dataloader.dataset.pipeline = pipeline
+
+    # Set data root
+    data_root = DATA_ROOT_LOOKUP[args.dataset]
+    dist_print(f"Setting data root: {data_root}")
+    cfg.train_dataloader.dataset.data_root = data_root
+    cfg.test_dataloader.dataset.data_root = data_root
+    cfg.val_dataloader.dataset.data_root = data_root
+
+    # set up visualizer
+    cfg.randomness = dict(seed=0)
+    np.random.seed(0)
+    cfg.visualizer = dict(type="Visualizer", vis_backends=[dict(type="TensorboardVisBackend")])
+
+    N_ROUNDS = 20
+
+    round_interval = args.round_interval if args.round_interval is not None else cfg.train_cfg.max_iters // N_ROUNDS
+    cfg.train_cfg.val_interval = round_interval
+
+    # if "acdc" not in args.dataset.lower():
+    #     cfg.train_cfg.max_iters = (
+    #         cfg.train_cfg.max_iters * 2
+    #     )  # NOTE: since we have early stopping, we just increase this.
+
+    cfg.default_hooks.logger.interval = 200
+    cfg.default_hooks.checkpoint.interval = cfg.train_cfg.max_iters // 20
+    cfg.default_hooks.checkpoint.save_best = "mIoU"
+    cfg.default_hooks.checkpoint.max_keep_ckpts = 3
+
+    # for i in range(len(cfg.param_scheduler)):
+    #     cfg.param_scheduler[i].begin *= 2
+    #     cfg.param_scheduler[i].end *= 2
+
+    cfg.test_evaluator = cfg.val_evaluator
+
+    args.save_vis = True
+    args.show = False
+
+    if args.aug_type == "ours":
+        eval_ratio = 0.25 if "acdc" not in args.dataset.lower() else 1.0
+        cfg.val_cfg.type = "RobustValLoop"
+        cfg.val_cfg.ratio = eval_ratio
+        cfg.val_cfg.sa_curve_path = "sensaug/testing/test_levels_voc.json"
+        cfg.val_cfg.uniform = args.uniform
+        # cfg.val_cfg.uniform = False
+        cfg.val_cfg.descending_MA = args.descending_MA  # defaults to False
+        # cfg.val_cfg.descending_MA = False # NOTE: False --> severe augmentations prioritized in pdf
+        cfg.val_cfg.remove_H = args.no_inv_aug
+        cfg.val_cfg.warmup_rounds = 0 if args.no_warmup else 4
+        cfg.val_cfg.random_aug = args.random_aug
+        cfg.val_cfg.geometric_only = args.geometric_only
+        cfg.val_cfg.photometric_only = args.photometric_only
+        cfg.val_cfg.weighted_augs = args.weighted_augs
+        # cfg.val_cfg.remove_H = False
+        cfg.test_cfg.type = "SubsetTestLoop"
+        cfg.test_cfg.ratio = eval_ratio
+        cfg.train_cfg.type = "RobustIterBasedTrainLoop"
+        cfg.train_cfg.init_sa = True if (cfg.resume or args.no_warmup) else False
+
+        # NOTE: LoveDA doesn't converge very well on default lr; we should reduce it by 1 order mag
+        if "loveda" in args.dataset.lower():
+            cfg.optimizer.lr *= 0.1
+
+    if args.adamw:
+        lr = cfg.optimizer.lr
+        cfg.optimizer = dict(type="AdamW", lr=lr, weight_decay=0.0005)
+        cfg.optim_wrapper.optimizer = cfg.optimizer
+
+    if args.freeze_early_layers:  # freeze first 8 layers of 12 total
+        cfg.model.backbone.frozen_stages = 8  # type: ignore
+
+    cfg.geometric_only = args.geometric_only
+    cfg.photometric_only = args.photometric_only
+
+    cfg.randomness = dict(seed=0, diff_rank_seed=False)
+
+    # Let's have a look at the final config used for training
+    dist_print(f"Config:\n{cfg.pretty_text}")
+    return cfg
+
+
+def set_manual_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+
+
+def train(args):
+    cfg = build_config(args)
+    runner = Runner.from_cfg(cfg)
+    set_manual_seed(0)  # set seed
+    runner.val_loop  # initialize val loop
+    runner.test_loop
+    runner.train()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="main")
+    parser.add_argument(
+        "--work_dir",
+        required=True,
+        type=str,
+        help="work directory where all experiments live",
+    )
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default=None,
+        help="experiment name to create output directory in work dir",
+    )
+    parser.add_argument(
+        "--aug-type",
+        type=str,
+        default="none",
+        help="augmentation type to use",
+        choices=[
+            "none",
+            "ours",
+            "default",
+            "random",
+            "autoaugment",
+            "augmix",
+            "randaugment",
+            "trivialaugment",
+            "idbh",
+            "vip",
+        ],
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="pspnet",
+        help="backbone to use",
+        choices=SUPPORTED_BACKBONES,
+    )
+    parser.add_argument(
+        "--use-foundation-backbone",
+        action="store_true",
+        default=False,
+        help="use foundation model backbone (dinov2)",
+    )
+    parser.add_argument(
+        "--geometric-only",
+        action="store_true",
+        default=False,
+        help="use geometric transforms only",
+    )
+    parser.add_argument(
+        "--photometric-only",
+        action="store_true",
+        default=False,
+        help="use photometric transforms only",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        default=False,
+        help="no clean training warmup",
+    )
+    parser.add_argument(
+        "--random-aug",
+        action="store_true",
+        default=False,
+        help="random augmentation with our method",
+    )
+    parser.add_argument(
+        "--weighted-augs",
+        action="store_true",
+        default=False,
+        help="augs are not treated equally",
+    )
+    parser.add_argument(
+        "--freeze-early-layers",
+        action="store_true",
+        default=False,
+        help="whether or not to freeze early layers",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cityscapes",
+        help="dataset to train on",
+        choices=SUPPORTED_DATASETS,
+    )
+    parser.add_argument(
+        "--sa_interval",
+        type=int,
+        default=None,
+        help="interval of iterations to re-compute sa",
+    )
+    parser.add_argument(
+        "--round_interval",
+        type=int,
+        default=None,
+        help="interval of iterations to re-evaluate perturbation robustness. sa_interval mod round_interval must equal 0.",
+    )
+    parser.add_argument(
+        "--descending-MA",
+        action="store_true",
+        default=False,
+        help="whether to prioritize less severe augmentations",
+    )
+    parser.add_argument("--uniform", action="store_true", default=False, help="use uniform augmentation")
+    parser.add_argument(
+        "--adamw",
+        action="store_true",
+        default=False,
+        help="whether to use AdamW optimizer",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="resume from the latest checkpoint in the work_dir automatically",
+    )
+    parser.add_argument(
+        "--no-inv-aug",
+        action="store_true",
+        default=False,
+        help="exclude color augmentations",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        default=False,
+        help="enable automatic-mixed-precision training",
+    )
+    parser.add_argument(
+        "--auto-scale-lr",
+        action="store_true",
+        help="Whether to scale the learning rate automatically. It requires "
+        "`auto_scale_lr` in config, and `base_batch_size` in `auto_scale_lr`",
+    )
+    parser.add_argument(
+        "--launcher",
+        choices=["none", "pytorch", "slurm", "mpi"],
+        default="none",
+        help="job launcher",
+    )
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=0)
+
+    args = parser.parse_args()
+
+    if args.exp_name is None:
+        args.exp_name = f"ours_{args.backbone}_{args.dataset}"
+        # args.exp_name = f"none_{args.backbone}_{args.dataset}" if args.aug_type is None \
+        #                                                     else f"{args.aug_type}_{args.backbone}_{args.dataset}"
+
+    # Set up working dir to save files and logs.
+    if "ours" not in args.exp_name and args.aug_type == "ours":
+        args.exp_name = args.exp_name + "_ours"
+
+    if "LOCAL_RANK" not in os.environ:
+        os.environ["LOCAL_RANK"] = str(args.local_rank)
+
+    torch.cuda.device(args.local_rank)
+
+    train(args)
+
+    dist_print("Done.")

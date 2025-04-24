@@ -1,0 +1,411 @@
+"""Copyright (c) 2023 Ingyun Lee
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE."""
+
+import warnings
+import random
+from PIL import Image
+import os
+import numpy as np
+import sensaug.dataset.vip_augmentations as augmentations
+
+from mmseg.registry import TRANSFORMS
+from mmcv.transforms.base import BaseTransform
+
+warnings.filterwarnings("ignore", category=np.ComplexWarning)
+
+
+@TRANSFORMS.register_module()
+class VIPAugTransform(BaseTransform):
+    def __init__(self, kernel, vital, nonvital, dataset_name, fractal_images):
+        super().__init__()
+
+        self.fn = VIPAug(kernel, vital, nonvital, dataset_name, fractal_images)
+
+    def transform(self, results: dict) -> dict:
+        results["img"] = self.fn(results["img"])
+
+        return results
+
+
+class VIPAug(object):
+    def __init__(self, kernel, vital, nonvital, dataset_name, fractal_images):
+        self.dataset_name = dataset_name
+        if (self.dataset_name == "cifar10") or (self.dataset_name == "cifar100"):
+            self.vipaugf_prob = 0.15
+            augmentations.IMAGE_SIZE = 32
+        elif self.dataset_name == "cityscapes":
+            self.vipaugf_prob = 0.1
+            augmentations.IMAGE_SIZE = 1024
+        else:
+            self.vipaugf_prob = 0.1
+            augmentations.IMAGE_SIZE = 224
+        self.aug_list = augmentations.augmentations
+        self.kernel = kernel
+        self.nonvital = nonvital
+        self.vital = vital
+
+        fractal_path = fractal_images  # set your own fractal path. Don't forget use different fractal image size depending on the datasets.
+        fractal_list = os.listdir(fractal_path)
+        fractal_list_np = []
+        fractal_list_phase = []
+        for i in fractal_list:
+            fractal = Image.open(fractal_path + i)
+            fractal = fractal.resize(
+                (augmentations.IMAGE_SIZE, augmentations.IMAGE_SIZE), Image.BILINEAR
+            )
+            fractal_array = np.array(fractal)
+            fractal_list_np.append(fractal_array)
+        for k in range(len(fractal_list_np)):
+            a = np.fft.fftn(fractal_list_np[k])
+            a = np.angle(a)
+            fractal_list_phase.append(a)
+        self.fractal_list_phase = fractal_list_phase
+
+    def vipaug_g(self, img):
+        fft = np.fft.fftn(img)
+        absolute = np.abs(fft)
+        noise_phase = np.zeros((np.shape(img)[0], np.shape(img)[1], np.shape(img)[2]))
+        # kernel filter
+        for p in range(3):
+            index_list = []
+            for i in range(len(absolute[:, :, p]) // self.kernel):
+                for j in range(len(absolute[:, :, p]) // self.kernel):
+                    number_list = []
+
+                    for k2 in range(self.kernel):
+                        for k1 in range(self.kernel):
+                            number_list.append(
+                                absolute[:, :, p][
+                                    self.kernel * i + k2, self.kernel * j + k1
+                                ]
+                            )
+
+                    index = number_list.index(max(number_list))
+                    k3 = index // self.kernel
+                    k4 = index % self.kernel
+
+                    # save index
+                    index_x = self.kernel * i + k3
+                    index_y = self.kernel * j + k4
+                    index_list.append(np.array([index_x, index_y]))
+
+            # make ones matrix
+            mask = np.ones((np.shape(img)[0], np.shape(img)[1]))
+            # make masked matrix
+            for i1 in range(len(index_list)):
+                mask[index_list[i1][0], index_list[i1][1]] = 0
+
+            # add gaussian noise at phase
+            mask_vital = mask - np.ones((np.shape(img)[0], np.shape(img)[1]))
+            mask_vital = mask_vital * (-1)
+
+            gaussian_noise_vital = np.random.normal(
+                0, self.vital**0.5, (np.shape(img)[0], np.shape(img)[1])
+            )
+            gaussian_noise = np.random.normal(
+                0, self.nonvital**0.5, (np.shape(img)[0], np.shape(img)[1])
+            )
+            masked_gaussian_noise = mask * gaussian_noise
+
+            masked_gaussian_noise_vital = mask_vital * gaussian_noise_vital
+            noise_phase[:, :, p] = (
+                np.angle(fft[:, :, p])
+                + masked_gaussian_noise
+                + masked_gaussian_noise_vital
+            )
+
+        return noise_phase
+
+    def vipaugf_cifar100(self, img):
+        fft = np.fft.fftn(img)
+        absolute = np.abs(fft)
+        noise_phase = np.zeros((np.shape(img)[0], np.shape(img)[1], np.shape(img)[2]))
+        random_idx = random.randint(0, len(self.fractal_list_phase) - 1)
+        fractal_phase = self.fractal_list_phase[random_idx]
+        # kernel filter
+        for p in range(3):
+            index_list = []
+            for i in range(len(absolute[:, :, p]) // self.kernel):
+                for j in range(len(absolute[:, :, p]) // self.kernel):
+                    number_list = []
+
+                    for k2 in range(self.kernel):
+                        for k1 in range(self.kernel):
+                            number_list.append(
+                                absolute[:, :, p][
+                                    self.kernel * i + k2, self.kernel * j + k1
+                                ]
+                            )
+
+                    index = number_list.index(max(number_list))
+                    k3 = index // self.kernel
+                    k4 = index % self.kernel
+
+                    # save index
+                    index_x = self.kernel * i + k3
+                    index_y = self.kernel * j + k4
+                    index_list.append(np.array([index_x, index_y]))
+
+            # make ones matrix
+            mask = np.ones((np.shape(img)[0], np.shape(img)[1]))
+            # make masked matrix
+            for i1 in range(len(index_list)):
+                mask[index_list[i1][0], index_list[i1][1]] = 0
+
+            mask_vital = mask - np.ones((np.shape(img)[0], np.shape(img)[1]))
+            mask_vital = mask_vital * (-1)
+
+            # fractal phase
+            masked_original_phase = np.angle(fft[:, :, p]) * mask_vital
+            fractal_phase_normal = mask * fractal_phase[:, :, p]
+
+            noise_phase[:, :, p] = masked_original_phase + fractal_phase_normal
+
+        return noise_phase
+
+    def vipaugf_cifar10(self, img):
+        fft = np.fft.fftn(img)
+        absolute = np.abs(fft)
+        noise_phase = np.zeros((np.shape(img)[0], np.shape(img)[1], np.shape(img)[2]))
+        random_idx = random.randint(0, len(self.fractal_list_phase) - 1)
+        fractal_phase = self.fractal_list_phase[random_idx]
+        # kernel filter
+        for p in range(3):
+            index_list = []
+            for i in range(len(absolute[:, :, p]) // self.kernel):
+                for j in range(len(absolute[:, :, p]) // self.kernel):
+                    number_list = []
+                    # modification related to low frequency region
+                    if (
+                        (i < 5 and j < 5)
+                        or (i > 9 and j > 9)
+                        or (i < 5 and j > 9)
+                        or (i > 9 and j < 5)
+                    ):
+                        for k2 in range(self.kernel):
+                            for k1 in range(self.kernel):
+                                number_list.append(
+                                    absolute[:, :, p][
+                                        self.kernel * i + k2, self.kernel * j + k1
+                                    ]
+                                )
+
+                        number_list_sort = number_list.copy()
+                        number_list_sort.sort(reverse=True)
+
+                        index = number_list.index(max(number_list))
+                        k3 = index // self.kernel
+                        k4 = index % self.kernel
+
+                        index_1 = number_list.index(number_list_sort[1])
+                        k5 = index_1 // self.kernel
+                        k6 = index_1 % self.kernel
+
+                        # save index
+                        index_x = self.kernel * i + k3
+                        index_y = self.kernel * j + k4
+                        index_list.append(np.array([index_x, index_y]))
+
+                        index_x_1 = self.kernel * i + k5
+                        index_y_1 = self.kernel * j + k6
+                        index_list.append(np.array([index_x_1, index_y_1]))
+                    else:
+                        for k2 in range(self.kernel):
+                            for k1 in range(self.kernel):
+                                number_list.append(
+                                    absolute[:, :, p][
+                                        self.kernel * i + k2, self.kernel * j + k1
+                                    ]
+                                )
+
+                        index = number_list.index(max(number_list))
+                        k3 = index // self.kernel
+                        k4 = index % self.kernel
+
+                        # save index
+                        index_x = self.kernel * i + k3
+                        index_y = self.kernel * j + k4
+                        index_list.append(np.array([index_x, index_y]))
+
+            # make ones matrix
+            mask = np.ones((np.shape(img)[0], np.shape(img)[1]))
+            # make masked matrix
+            for i1 in range(len(index_list)):
+                mask[index_list[i1][0], index_list[i1][1]] = 0
+
+            mask_vital = mask - np.ones((np.shape(img)[0], np.shape(img)[1]))
+            mask_vital = mask_vital * (-1)
+
+            # fractal phase
+            masked_original_phase = np.angle(fft[:, :, p]) * mask_vital
+            fractal_phase_normal = mask * fractal_phase[:, :, p]
+
+            noise_phase[:, :, p] = masked_original_phase + fractal_phase_normal
+
+        return noise_phase
+
+    def vipaugf_imagenet(self, img):
+        fft = np.fft.fftn(img)
+        absolute = np.abs(fft)
+        noise_phase = np.zeros((np.shape(img)[0], np.shape(img)[1], np.shape(img)[2]))
+        random_idx = random.randint(0, len(self.fractal_list_phase) - 1)
+        fractal_phase = self.fractal_list_phase[random_idx]
+        # kernel filter
+        for p in range(3):
+            index_list = []
+            for i in range(len(absolute[:, :, p]) // self.kernel):
+                for j in range(len(absolute[:, :, p]) // self.kernel):
+                    number_list = []
+                    # modification related to low frequency region
+                    if (
+                        (i < 28 and j < 28)
+                        or (i > 83 and j > 83)
+                        or (i < 28 and j > 83)
+                        or (i > 83 and j < 28)
+                    ):
+                        for k2 in range(self.kernel):
+                            for k1 in range(self.kernel):
+                                number_list.append(
+                                    absolute[:, :, p][
+                                        self.kernel * i + k2, self.kernel * j + k1
+                                    ]
+                                )
+
+                        number_list_sort = number_list.copy()
+                        number_list_sort.sort(reverse=True)
+
+                        index = number_list.index(max(number_list))
+                        k3 = index // self.kernel
+                        k4 = index % self.kernel
+
+                        index_1 = number_list.index(number_list_sort[1])
+                        k5 = index_1 // self.kernel
+                        k6 = index_1 % self.kernel
+
+                        # save index
+                        index_x = self.kernel * i + k3
+                        index_y = self.kernel * j + k4
+                        index_list.append(np.array([index_x, index_y]))
+
+                        index_x_1 = self.kernel * i + k5
+                        index_y_1 = self.kernel * j + k6
+                        index_list.append(np.array([index_x_1, index_y_1]))
+                    else:
+                        for k2 in range(self.kernel):
+                            for k1 in range(self.kernel):
+                                number_list.append(
+                                    absolute[:, :, p][
+                                        self.kernel * i + k2, self.kernel * j + k1
+                                    ]
+                                )
+
+                        index = number_list.index(max(number_list))
+                        k3 = index // self.kernel
+                        k4 = index % self.kernel
+
+                        # save index
+                        index_x = self.kernel * i + k3
+                        index_y = self.kernel * j + k4
+                        index_list.append(np.array([index_x, index_y]))
+
+            # make ones matrix
+            mask = np.ones((np.shape(img)[0], np.shape(img)[1]))
+            # make masked matrix
+            for i1 in range(len(index_list)):
+                mask[index_list[i1][0], index_list[i1][1]] = 0
+
+            mask_vital = mask - np.ones((np.shape(img)[0], np.shape(img)[1]))
+            mask_vital = mask_vital * (-1)
+
+            # fractal phase
+            masked_original_phase = np.angle(fft[:, :, p]) * mask_vital
+            fractal_phase_normal = mask * fractal_phase[:, :, p]
+
+            noise_phase[:, :, p] = masked_original_phase + fractal_phase_normal
+
+        return noise_phase
+
+    def __call__(self, x):
+        """
+        :param img: (PIL Image): Image
+        :return: code img (PIL Image): Image
+        """
+        p = random.uniform(0, 1)
+        if p < self.vipaugf_prob:
+            if self.dataset_name == "cifar10":
+                fractal_angle = self.vipaugf_cifar10(x)
+            elif self.dataset_name == "cifar100":
+                fractal_angle = self.vipaugf_cifar100(x)
+            else:
+                fractal_angle = self.vipaugf_imagenet(x)
+
+            x_fft = np.fft.fftn(x)
+            x = np.abs(x_fft) * np.exp((1j) * fractal_angle)
+            x = np.fft.ifftn(x)
+
+        x = x.astype(np.uint8)
+        x = Image.fromarray(x)
+
+        op = np.random.choice(self.aug_list)
+        x = op(x, 3)
+
+        p = random.uniform(0, 1)
+        if p > 0.5:
+            return np.array(x).astype(np.uint8)
+
+        x_aug = x.copy()
+        op = np.random.choice(self.aug_list)
+        x_aug = op(x_aug, 3)
+
+        x = np.array(x).astype(np.uint8)
+        x_aug = np.array(x_aug).astype(np.uint8)
+
+        fft_1 = np.fft.fftn(x)
+        fft_2 = np.fft.fftn(x_aug)
+
+        p = random.uniform(0, 1)
+        if p > 0.5:  # VIPAug-G probability
+            abs_1, angle_1 = np.abs(fft_1), np.angle(fft_1)
+            abs_2, angle_2 = np.abs(fft_2), np.angle(fft_2)
+
+            fft_1 = abs_1 * np.exp((1j) * angle_2)
+            fft_2 = abs_2 * np.exp((1j) * angle_1)
+
+            p = random.uniform(0, 1)
+
+            if p > 0.5:
+                x = np.fft.ifftn(fft_1)
+            else:
+                x = np.fft.ifftn(fft_2)
+
+        else:
+            p = random.uniform(0, 1)
+            if p > 0.5:
+                angle_2 = self.vipaug_g(x_aug)
+                fft_1 = np.abs(fft_1) * np.exp((1j) * angle_2)
+                x = np.fft.ifftn(fft_1)
+            else:
+                angle_1 = self.vipaug_g(x)
+                fft_2 = np.abs(fft_2) * np.exp((1j) * angle_1)
+                x = np.fft.ifftn(fft_2)
+
+        x = x.astype(np.uint8)
+
+        return x
