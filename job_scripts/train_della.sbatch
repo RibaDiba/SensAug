@@ -23,10 +23,10 @@ WORK_DIR="${WORK_DIR:-./experiments}"
 
 mkdir -p ../logs/${NAME}
 
-cd "$(dirname "$0")/.."
+cd "$SLURM_SUBMIT_DIR/.."
 
 eval "$(conda shell.bash hook)"
-conda activate bp-38
+conda activate sensaug
 
 module load cuda/11.7.0
 
