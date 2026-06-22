@@ -176,8 +176,7 @@ cython_debug/
 .ruff_cache/
 
 # PyPI configuration file
-<<<<<<< HEAD
 .pypirc
-=======
-.pypirc
->>>>>>> 38767161f6ad905ba1c401c4e0544eac00ea3668
+
+# Claude config
+.claude/
