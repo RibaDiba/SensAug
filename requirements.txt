@@ -1,10 +1,12 @@
+ftfy
 kornia
+regex
 matplotlib
-mmcv
+mmcv>=2.0.0,<2.2.0
 mmengine
 mmpretrain
 mmsegmentation
-numpy
+numpy>=1.20,<2.0
 opencv-python
 pandas
 Pillow
