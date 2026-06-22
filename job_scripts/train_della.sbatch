@@ -23,6 +23,8 @@ WORK_DIR="${WORK_DIR:-./experiments}"
 
 mkdir -p ../logs/${NAME}
 
+cd "$(dirname "$0")/.."
+
 eval "$(conda shell.bash hook)"
 conda activate bp-38
 
