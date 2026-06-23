@@ -3,6 +3,9 @@ import numpy as np
 import re
 import glob
 import logging
+import shutil
+
+from sensaug.cluster_config import load_seg_config
 
 from mmengine.logging import print_log
 import mmseg
@@ -23,18 +26,6 @@ from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
 from sensaug.hooks import *  # noqa:F403
 from sensaug.loops import *  # noqa:F403
 from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
-
-### CHANGE VARS IN THIS FILE / IMPORT YOUR OWN
-# TO FIT YOUR SYSTEM (data root, mmseg config path, data root lookup)
-from SEG_CONFIG import (
-    PRIMARY_METRIC,
-    DATA_ROOT_LOOKUP,
-    SUPPORTED_DATASETS,
-    SUPPORTED_BACKBONES,
-    MMCONFIG_PATH,
-)
-###
-
 
 def dist_print(*args, **kwargs):
     if is_main_process():
@@ -380,6 +371,8 @@ def set_manual_seed(seed):
 
 def train(args):
     cfg = build_config(args)
+    os.makedirs(cfg.work_dir, exist_ok=True)
+    shutil.copy(args.cluster_config, os.path.join(cfg.work_dir, "seg_config.yaml"))
     runner = Runner.from_cfg(cfg)
     set_manual_seed(0)  # set seed
     runner.val_loop  # initialize val loop
@@ -390,7 +383,23 @@ def train(args):
 if __name__ == "__main__":
     import argparse
 
+    # Two-stage parse: load cluster config first so SUPPORTED_* are available for choices
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--cluster-config", required=True)
+    _pre_args, _ = _pre.parse_known_args()
+    _seg = load_seg_config(_pre_args.cluster_config)
+    MMCONFIG_PATH       = _seg["MMCONFIG_PATH"]
+    PRIMARY_METRIC      = _seg["PRIMARY_METRIC"]
+    DATA_ROOT_LOOKUP    = _seg["DATA_ROOT_LOOKUP"]
+    SUPPORTED_DATASETS  = _seg["SUPPORTED_DATASETS"]
+    SUPPORTED_BACKBONES = _seg["SUPPORTED_BACKBONES"]
+
     parser = argparse.ArgumentParser(description="main")
+    parser.add_argument(
+        "--cluster-config",
+        required=True,
+        help="path to YAML cluster config (e.g. configs/della.yaml)",
+    )
     parser.add_argument(
         "--work_dir",
         required=True,

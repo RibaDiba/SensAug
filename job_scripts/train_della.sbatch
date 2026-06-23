@@ -20,6 +20,7 @@ BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
 EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
+CONFIG="${CONFIG:-configs/della.yaml}"
 
 mkdir -p ../logs/${NAME}
 
@@ -46,6 +47,7 @@ torchrun \
     --nproc_per_node=$NUM_GPUS \
     --master_port=$PORT \
     train.py \
+    --cluster-config=${CONFIG} \
     --backbone=${BACKBONE} \
     --dataset=${DATASET} \
     --aug-type=${AUG_TYPE} \

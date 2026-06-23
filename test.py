@@ -14,7 +14,9 @@ from sensaug.hooks import *
 from sensaug.visualizer import BPSegLocalVisualizer
 from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 
-from SEG_CONFIG import DATA_ROOT_LOOKUP
+from sensaug.cluster_config import load_seg_config
+
+DATA_ROOT_LOOKUP = {}  # populated at startup from --cluster-config YAML
 
 PROXY_ALPHAS = {
     "voc12": [0.6245, 0.6056, 0.6558, [0.2058, 1.8083], 0.0009],
@@ -116,6 +118,11 @@ def cfg_switch_work_dir(cfg, args, path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MMSeg test (and eval) a model")
+    parser.add_argument(
+        "--cluster-config",
+        required=True,
+        help="path to YAML cluster config (e.g. configs/della.yaml)",
+    )
     parser.add_argument("--config", default=None, help="train config file path")
     parser.add_argument(
         "--checkpoint",
@@ -244,6 +251,10 @@ def trigger_visualization_hook(cfg, args):
 
 def main():
     args = parse_args()
+
+    global DATA_ROOT_LOOKUP
+    _seg = load_seg_config(args.cluster_config)
+    DATA_ROOT_LOOKUP = _seg["DATA_ROOT_LOOKUP"]
 
     workdir_list = glob.glob(os.path.join(args.work_dir, "*/"))
 
