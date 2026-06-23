@@ -1,7 +1,6 @@
 #!/bin/bash
 
 #SBATCH --job-name=sensaug
-#SBATCH --partition=pli
 #SBATCH --account=puchalla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
