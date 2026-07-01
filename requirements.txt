@@ -19,5 +19,7 @@ statsmodels
 torch
 torchmetrics
 torchvision
+torch-fidelity
 tqdm
 Wand
+

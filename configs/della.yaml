@@ -3,14 +3,6 @@ mmconfig_path: /projects/PUCHALLA/LLP2024/tumor/sensaug/custom_configs/mmseg
 primary_metric: mIoU
 datasets:
   cityscapes: cityscapes
-  ade20k: ade/ADEChallengeData2016
-  pascal_voc12: VOCdevkit/VOC2012
-  loveda: loveDA
-  potsdam: potsdam
-  synapse: synapse
-  a2i2haze: a2i2haze
-  acdc: acdc
-  idd: idd
 supported_backbones:
   - pspnet
   - segformer

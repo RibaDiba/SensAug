@@ -58,7 +58,36 @@ Additionally, you can also contact me if you would like a zip file of the post-p
 ## Training a Model 
 To train a model, you can either call the Python training file [```train.py```](train.py) directly or use one of the convenience bash scripts provided in ```job_scripts```. 
 
-There are many command-line arguments in the train.py script, which you can list with ```python train.py --help```. The convenience scripts like [```job_scripts/train_generic.sh```](job_scripts/train_generic.sh) help make training simple and reproducible. 
+There are many command-line arguments in the train.py script, which you can list with ```python train.py --help```. The convenience scripts like [```job_scripts/train_generic.sh```](job_scripts/train_generic.sh) help make training simple and reproducible.
+
+### All `train.py` Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--cluster-config` | str | *(required)* | Path to YAML cluster config (e.g. `configs/della.yaml`) |
+| `--work_dir` | str | *(required)* | Root directory where experiment output folders are saved |
+| `--exp_name` | str | `ours_{backbone}_{dataset}` | Experiment name; creates a subfolder under `work_dir` |
+| `--aug-type` | str | `none` | Augmentation strategy: `none`, `ours`, `default`, `random`, `autoaugment`, `augmix`, `randaugment`, `trivialaugment`, `idbh`, `vip` |
+| `--backbone` | str | `pspnet` | Model backbone (must exist under `sensaug/custom_configs/mmseg/`) |
+| `--dataset` | str | `cityscapes` | Dataset key from cluster config |
+| `--use-foundation-backbone` | flag | False | Use DINOv2 foundation model as backbone |
+| `--geometric-only` | flag | False | Restrict augmentations to geometric transforms only |
+| `--photometric-only` | flag | False | Restrict augmentations to photometric transforms only |
+| `--no-inv-aug` | flag | False | Exclude color/photometric augmentations |
+| `--no-warmup` | flag | False | Skip clean-training warmup rounds |
+| `--random-aug` | flag | False | Sample augmentations randomly (instead of sensitivity-weighted) |
+| `--weighted-augs` | flag | False | Weight augmentations unequally during sampling |
+| `--uniform` | flag | False | Use uniform augmentation distribution |
+| `--descending-MA` | flag | False | Prioritize less severe augmentations (descending moving average) |
+| `--freeze-early-layers` | flag | False | Freeze early backbone layers during training |
+| `--sa_interval` | int | None | Iterations between sensitivity analysis re-computations |
+| `--round_interval` | int | None | Iterations between robustness re-evaluations (`sa_interval % round_interval == 0`) |
+| `--adamw` | flag | False | Use AdamW optimizer instead of default SGD |
+| `--amp` | flag | False | Enable automatic mixed-precision (AMP) training |
+| `--auto-scale-lr` | flag | False | Auto-scale learning rate based on batch size |
+| `--resume` | flag | False | Auto-resume from latest checkpoint in `work_dir` |
+| `--launcher` | str | `none` | Job launcher: `none`, `pytorch`, `slurm`, `mpi` |
+| `--local_rank` | int | 0 | Local rank for distributed training |
 
 To train with the convenience script, simply run 
 
