@@ -341,6 +341,20 @@ def build_config(args):
         cfg.train_cfg.type = "RobustIterBasedTrainLoop"
         cfg.train_cfg.init_sa = True if (cfg.resume or args.no_warmup) else False
 
+        if args.grad_corr:
+            # Gradient-based augmentation cross-correlation (opt-in, additive):
+            # CollectGradientHook probes d loss / d magnitude for the
+            # differentiable ops during training, and
+            # PerturbationSensitivityAnalysisHookWithGradients logs R each round.
+            cfg.custom_hooks = (cfg.get("custom_hooks") or []) + [
+                dict(
+                    type="CollectGradientHook",
+                    probe_interval=50,
+                    log_interval=200,
+                ),
+                dict(type="PerturbationSensitivityAnalysisHookWithGradients"),
+            ]
+
         # NOTE: LoveDA doesn't converge very well on default lr; we should reduce it by 1 order mag
         if "loveda" in args.dataset.lower():
             cfg.optimizer.lr *= 0.1
@@ -506,6 +520,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--uniform", action="store_true", default=False, help="use uniform augmentation"
+    )
+    parser.add_argument(
+        "--grad-corr",
+        action="store_true",
+        default=False,
+        help="collect differentiable-augmentation loss gradients and log their "
+        "cross-correlation matrix each SA round (registers CollectGradientHook "
+        "and PerturbationSensitivityAnalysisHookWithGradients)",
     )
     parser.add_argument(
         "--adamw",

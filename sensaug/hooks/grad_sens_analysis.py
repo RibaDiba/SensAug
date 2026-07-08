@@ -1,127 +1,107 @@
+"""
+Hook that computes the cross-correlation matrix R between the differentiable
+augmentations, from the per-op gradient traces collected by CollectGradientHook.
+
+This is a passive consumer: CollectGradientHook accumulates, every probe, one
+``d loss / d magnitude`` scalar per differentiable op into
+``runner.aug_grad_buffer`` (aligned columns -- all ops measured on the same
+batch). At the end of each RobustValLoop round (``after_val_epoch``, i.e. right
+after that round's sensitivity-analysis sweep), this hook stacks the buffer into
+a matrix D_grad (A x T), computes R = corrcoef(D_grad), logs it, and clears the
+buffer window.
+
+Scope: R covers the differentiable ops only (the ones with gradients); pruning
+based on R is future work -- ``prune_augmentations`` is a stub.
+"""
+
 import os
 import json
-import warnings
-from pprint import pprint
-from copy import deepcopy
-from typing import Optional, Sequence
-from mmengine.visualization import Visualizer
 
-import mmcv
-from mmengine.fileio import get
+import numpy as np
+
 from mmengine.runner import Runner
+from mmengine.logging import print_log
+from mmengine.dist import is_main_process
 from mmseg.registry import HOOKS
 from mmengine.hooks import Hook
-from mmseg.structures import SegDataSample
-from mmseg.engine.hooks.visualization_hook import SegVisualizationHook
 
 # Local imports
-from sensaug.dataset.augmentations import *
-from sensaug.sensitivity_analysis import *
-from sensaug.runner_utils import *
+from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+
 
 @HOOKS.register_module()
-class PerturbationSensitivityAnalysisHookWithGradients(Hook): 
+class PerturbationSensitivityAnalysisHookWithGradients(Hook):
+    """Builds and logs the augmentation gradient cross-correlation matrix R.
 
+    Consumes ``runner.aug_grad_buffer`` (populated by CollectGradientHook); no
+    effect unless that hook is also registered and has accumulated >= 2 probes.
     """
-    custom hook to intigrate the graident calculations into the loop
-    """
 
-    def __init__(self, sa_interval=10000, round_interval=2000) -> None:
-        assert round_interval <= sa_interval, (
-            "round interval cannot be greater than sa interval"
-        )
+    def __init__(self) -> None:
+        self.corr_log_path = None
+        self.names = list(DIFFERENTIABLE_PERTURBATIONS)
 
-        self.sa_interval = sa_interval
-        self.round_interval = round_interval
-        self.sa_curve = None
-        self.sa_log_path = None
-        self.num_rounds = 0
-
-        self.sa_interval_to_rounds = sa_interval // round_interval
-
-    def update_sa_curve(self, runner, val_dataloader_cfg):
-        print("Running sensitivity analysis in before_train_epoch hook...")
-        self.sa_curve = adaptive_sensitivity_analysis_new(
-            val_dataloader_cfg, runner, num_levels=5, tolerance=0.05
-        )
-
-        print("New SA curve computed")
-        print(self.sa_curve)
-
-        sa_curve_str = json.dumps(self.sa_curve)
-        with open(self.sa_log_path, "a") as f:
-            f.write(sa_curve_str + "\n")
-
-    def before_train_iter(
-        self, runner: Runner, batch_idx: int, data_batch=None
-    ) -> None:
-        if self.sa_log_path is None:
-            self.sa_log_path = os.path.join(runner.cfg.work_dir, "sa_curve_log.txt")
-
-        val_dataloader_cfg = deepcopy(runner.cfg.val_dataloader)
-        self.num_rounds = runner.iter // self.round_interval + 1
-
-        if runner.iter % self.round_interval == 0:
-            if (
-                self.sa_curve is None
-                or (self.num_rounds - 1) % self.sa_interval_to_rounds == 0
-            ):
-                self.update_sa_curve(runner, val_dataloader_cfg)
-
-            assert self.sa_curve is not None, "sa curve not computed yet"
-
-            miou_record = {}
-
-            for p_type, levels in self.sa_curve.items():
-                miou_record[p_type] = {}
-
-                for level in levels:
-                    transform_cls, _ = NEW_PERTURBATIONS[p_type]
-                    transform = transform_cls(magnitude=level)
-                    apply_perturbations_dataloader_new(
-                        runner, train=False, transform=transform
-                    )
-                    miou = runner.val()["mIoU"]
-                    miou_record[p_type][level] = miou
-
-            pdf_dict, _ = self.generate_pdf(miou_record)
-
-            apply_random_perturbations_train_dataloader(runner, pdf_dict=pdf_dict)
-            apply_perturbations_dataloader_new(runner, train=False, transform=None)
-
-    def calculate_cross_corelation(self): 
-        """function to compute cross corelation"""
-        pass
-
-    def prune_augmentations(self):
-        """takes a look at the augmentation list and prunes augmnentations that are correlated"""
-        pass
-
-    def generate_pdf(self, miou_record):
-        """this needs to be chanegd """
-        pdf_dict = {}
-        num_perturbations = len(miou_record.keys())
-        perturbation_total_prob = 1.0
-        perturbation_uniform_prob = perturbation_total_prob / num_perturbations
-
-        for perturbation, levels in sorted(miou_record.items()):
-            weight_sum = sum([(100 - miou) ** 2 for _, miou in levels.items()])
-
-            for level, miou in levels.items():
-                weight = (100 - miou) ** 2
-                pdf_dict[(perturbation, level)] = (
-                    weight / weight_sum * perturbation_uniform_prob
-                )
-
-        pdf_dict_perturb_prob = sum(list(pdf_dict.values()))
-
-        pdf_dict[("none", 0)] = 1.0 - pdf_dict_perturb_prob
-
-        print("Perturbation PDF computed:")
-        print(
-            json.dumps(
-                {str(k): v for k, v in pdf_dict.items()}, indent=4, sort_keys=True
+    def after_val_epoch(self, runner: Runner, metrics=None) -> None:
+        if self.corr_log_path is None:
+            self.corr_log_path = os.path.join(
+                runner.cfg.work_dir, "corr_matrix_log.txt"
             )
-        )
 
-        return pdf_dict, None
+        buffer = getattr(runner, "aug_grad_buffer", None)
+        if buffer is None:
+            return
+
+        # Need at least 2 aligned probes per op for a correlation.
+        lengths = [len(buffer[name]) for name in self.names]
+        if min(lengths) < 2:
+            return
+
+        # Only rank 0 holds meaningful probe traces / does the logging. R is a
+        # logged diagnostic for now (no action taken), so no cross-rank reduce.
+        if is_main_process():
+            n = min(lengths)  # truncate so columns align
+            d_grad = np.array([buffer[name][:n] for name in self.names])
+
+            r = self.calculate_cross_corelation(d_grad)
+
+            round_idx = getattr(getattr(runner, "val_loop", None), "n_rounds", None)
+            record = {
+                "round": round_idx,
+                "names": self.names,
+                "R": r.tolist(),
+            }
+            with open(self.corr_log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+            print_log(
+                f"Augmentation gradient cross-correlation matrix computed "
+                f"(round {round_idx}, {n} probes)",
+                logger="current",
+            )
+
+            self.prune_augmentations(r)
+
+        # Clear the window on every rank so each round's R reflects only the
+        # gradients collected since the previous round.
+        for name in buffer:
+            buffer[name].clear()
+
+    def calculate_cross_corelation(self, d_grad: np.ndarray) -> np.ndarray:
+        """Pearson cross-correlation across the augmentation rows of D_grad.
+
+        Args:
+            d_grad (np.ndarray): shape (A, T) -- A differentiable ops x T probes.
+
+        Returns:
+            np.ndarray: symmetric (A, A) correlation matrix in [-1, 1].
+        """
+        return np.corrcoef(d_grad)
+
+    def prune_augmentations(self, r: np.ndarray) -> None:
+        """Prune redundant augmentations given the correlation matrix R.
+
+        Not implemented yet -- the pruning rule is still being researched. For
+        now this hook only computes and logs R; nothing is applied back to the
+        training distribution.
+        """
+        pass
