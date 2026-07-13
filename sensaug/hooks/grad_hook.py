@@ -6,25 +6,33 @@ The differentiable augmentation ops (sensaug.dataset.differentiable_augmentation
 are autograd-compatible but are NOT wired into the training step -- there is no
 persistent magnitude parameter whose ``.grad`` we could read after a real
 ``train_step`` (mmengine's OptimWrapper already ran ``zero_grad`` by the time
-``after_train_iter`` fires). So this hook *produces* the gradient itself: every
-``probe_interval`` iters it takes a clean batch, applies each differentiable op
-at a fixed reference magnitude, runs a forward pass, and reads
-``d loss / d magnitude`` via ``torch.autograd.grad`` (which never populates model
-parameter ``.grad``, so the real training step is untouched).
+``after_train_iter`` fires). So this hook *produces* the gradient itself: it takes
+a clean batch, applies each differentiable op at a fixed reference magnitude, runs
+a forward pass, and reads ``d loss / d magnitude`` via ``torch.autograd.grad``
+(which never populates model parameter ``.grad``, so training is untouched).
 
-The magnitude is a length-B vector -- one delta PER IMAGE -- so a single probe
+The measurement is a FROZEN FRAME. At each training-progress checkpoint the hook
+pauses on one model state and sweeps the ENTIRE clean val set in a single pass,
+so every column of the resulting (A ops x N images) matrix describes the same
+model. The earlier design streamed one batch every ``probe_interval`` train iters
+and pooled them into a window; that spread a window's columns across hundreds of
+model states and revisited the same images at different states, so R mixed
+augmentation redundancy with convergence drift. The sweep is also *cheaper*: the
+streaming probe re-probed the val shard ~10x over a run, where four sweeps cover
+it four times.
+
+The magnitude is a length-B vector -- one delta PER IMAGE -- so a single batch
 yields one sensitivity number per image per op, not one batch-averaged number per
 op. That is what lets PerturbationSensitivityAnalysisHookWithGradients correlate
 augmentations across IMAGES ("do two augs hurt the same images", i.e. redundancy)
-rather than across training time ("do two augs get less sensitive at the same
-moments", i.e. convergence drift, which is what a batch-averaged scalar can only
-ever measure). Per-image independence rests on the probe running in eval() --
-see _probe_gradients.
+rather than across training time. Per-image independence rests on the sweep
+running in eval() -- see _sweep.
 
 The per-op, per-image gradients are accumulated into ``runner.aug_grad_buffer``
-as one (B,) array per probe; the buffer keeps probe boundaries intact (a list of
-arrays, not one flat array) because the correlation hook's cluster bootstrap
-resamples whole probes.
+as one (B,) array per sweep batch; the buffer keeps batch boundaries intact (a
+list of arrays, not one flat array) because the correlation hook's cluster
+bootstrap resamples whole batches -- images in a batch share the batch-mean loss's
+valid-pixel scale factor, so they are not fully independent draws.
 """
 
 import os
@@ -47,24 +55,31 @@ from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBA
 class ProbeError(RuntimeError):
     """A gradient probe produced something structurally wrong (bad shape, NaN).
 
-    Distinct from a transient failure (OOM, dataloader hiccup) so that
-    _probe_gradients can let it propagate instead of degrading it into a
-    silently skipped probe.
+    Distinct from a transient failure (OOM, dataloader hiccup) so that the sweep
+    can let it propagate instead of degrading it into a silently skipped batch.
     """
 
 
 @HOOKS.register_module()
 class CollectGradientHook(Hook):
-    """Probes ``d loss / d magnitude`` for each differentiable augmentation and
+    """Sweeps the whole clean val set on a frozen model at each checkpoint,
+    probing ``d loss / d magnitude`` for every differentiable augmentation, and
     accumulates the per-image gradients into ``runner.aug_grad_buffer``.
 
+    Must run BEFORE PerturbationSensitivityAnalysisHookWithGradients, which
+    consumes the buffer in its own ``after_val_epoch`` and must see the sweep this
+    hook just wrote. Both hooks must be given the SAME ``checkpoints``; register
+    this one at a higher priority (see train.py).
+
     Args:
-        probe_interval (int): Run a probe every this many training iters. Each
-            probe costs one forward/backward per differentiable op, so keep this
-            reasonably large. Defaults to 50.
-        log_interval (int): Flush accumulated probe records to disk every this
-            many iters. This is a flush cadence, NOT a sampling filter -- every
-            probe is logged. Defaults to 200.
+        checkpoints: Fractions of ``max_iters`` at which to sweep. Must match the
+            correlation hook's ``checkpoints``. Each sweep is one frozen model
+            state, which is what makes R a statement about a single model.
+        sweep_batch_size (int): Images per forward during the sweep. Larger is
+            faster (better GPU utilization) but multiplies activation memory --
+            the backward reaches the input, and val images are full resolution.
+            This is also the cluster the downstream bootstrap resamples, so at 1
+            the clusters are singletons (an i.i.d. image bootstrap). Defaults to 1.
         ref_magnitude (float): Magnitude at which every op is probed (the
             "flank", not an extreme). Defaults to 0.5 (eps/2 for the diff
             module's default eps=1.0). NOTE this number is not commensurable
@@ -74,23 +89,23 @@ class CollectGradientHook(Hook):
             Sweep it before trusting cross-op comparisons.
         per_image_delta (bool): If True (default), probe with a length-B delta
             and store one gradient per image. If False, use the old scalar delta
-            and store one batch-averaged number per probe -- kept runnable for
+            and store one batch-averaged number per batch -- kept runnable for
             A/B comparison only; it cannot support a redundancy matrix.
-        probe_seed (int): RNG seed applied inside each probe so that ``noise``
+        probe_seed (int): RNG seed applied before each batch so that ``noise``
             draws the same sample every time. The RNG state is saved and restored
-            around the probe, so the training stream is unaffected. Defaults to 0.
+            around the sweep, so the training stream is unaffected. Defaults to 0.
     """
 
     def __init__(
         self,
-        probe_interval: int = 50,
-        log_interval: int = 200,
+        checkpoints=(0.25, 0.5, 0.75, 1.0),
+        sweep_batch_size: int = 1,
         ref_magnitude: float = 0.5,
         per_image_delta: bool = True,
         probe_seed: int = 0,
     ) -> None:
-        self.probe_interval = probe_interval
-        self.log_interval = log_interval
+        self.checkpoints = tuple(sorted(checkpoints))
+        self.sweep_batch_size = sweep_batch_size
         self.ref_magnitude = ref_magnitude
         self.per_image_delta = per_image_delta
         self.probe_seed = probe_seed
@@ -98,20 +113,20 @@ class CollectGradientHook(Hook):
         self.grad_buffer = None
         self.grad_log_path = None
         self._probe_loader = None
-        self._probe_iter = None
         self._pending_records = []
+        self._next_checkpoint = 0
 
     def before_run(self, runner: Runner) -> None:
         # Shared buffer, stashed on the runner so the correlation hook can read
-        # it. One entry per probe per op, each a (B,) array -- probe boundaries
-        # are load-bearing for the cluster bootstrap, so do NOT flatten.
+        # it. One entry per sweep batch per op, each a (B,) array -- batch
+        # boundaries are load-bearing for the cluster bootstrap, so do NOT flatten.
         self.grad_buffer = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
         runner.aug_grad_buffer = self.grad_buffer
 
         self.grad_log_path = os.path.join(runner.cfg.work_dir, "aug_gradient_log.txt")
         if is_main_process():
             # Append when resuming so a resumed run does not throw away the
-            # probes the previous run already logged (corr_matrix_log.txt is
+            # sweeps the previous run already logged (corr_matrix_log.txt is
             # append-only, and these two need to stay consistent with each other).
             mode = "a" if getattr(runner, "_resume", False) else "w"
             open(self.grad_log_path, mode).close()
@@ -121,51 +136,24 @@ class CollectGradientHook(Hook):
         # with GT labels. Independent of the val_loop dataloader (which
         # apply_perturbations_dataloader mutates in place during SA sweeps).
         dataloader_cfg = deepcopy(runner.cfg.val_dataloader)
+        dataloader_cfg.batch_size = self.sweep_batch_size
         diff_rank_seed = runner._randomness_cfg.get("diff_rank_seed", False)
         self._probe_loader = runner.build_dataloader(
             dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
         )
-        self._probe_iter = iter(self._probe_loader)
 
-    def _next_probe_batch(self):
-        try:
-            return next(self._probe_iter)
-        except StopIteration:
-            self._probe_iter = iter(self._probe_loader)
-            return next(self._probe_iter)
-
-    def after_train_iter(
-        self, runner: Runner, batch_idx: int, data_batch=None, outputs=None
-    ) -> None:
-        # Temporal gate: only probe once the 1st SA loop has developed the
-        # distribution. sa_curve is read purely as a boolean here.
-        val_loop = getattr(runner, "val_loop", None)
-        if getattr(val_loop, "sa_curve", None) is None:
+    def after_val_epoch(self, runner: Runner, metrics=None) -> None:
+        if self._next_checkpoint >= len(self.checkpoints):
             return
 
-        if runner.iter % self.probe_interval != 0:
+        max_iters = getattr(runner, "max_iters", 0) or 0
+        progress = runner.iter / max_iters if max_iters else 0.0
+        if progress < self.checkpoints[self._next_checkpoint]:
             return
 
-        grads = self._probe_gradients(runner)
-        if not grads:
-            return
-
-        for name, value in grads.items():
-            self.grad_buffer[name].append(value)
-
-        if is_main_process():
-            # Log EVERY probe, in full: this makes R recomputable offline from
-            # the log without retraining. .tolist() is required -- np.ndarray and
-            # np.float32 both raise TypeError in json.dumps.
-            self._pending_records.append(
-                {
-                    "iter": int(runner.iter),
-                    "batch_size": int(next(iter(grads.values())).shape[0]),
-                    "grads": {name: value.tolist() for name, value in grads.items()},
-                }
-            )
-            if runner.iter % self.log_interval == 0:
-                self._flush_records()
+        checkpoint = self.checkpoints[self._next_checkpoint]
+        self._next_checkpoint += 1
+        self._sweep(runner, checkpoint)
 
     def after_run(self, runner: Runner) -> None:
         if is_main_process():
@@ -179,10 +167,15 @@ class CollectGradientHook(Hook):
                 f.write(json.dumps(record) + "\n")
         self._pending_records.clear()
 
-    def _probe_gradients(self, runner: Runner) -> dict:
-        """Returns {op_name: (B,) array of d loss / d magnitude, one per image}
-        for all differentiable ops, measured on a single shared clean batch (so
-        columns stay aligned across ops)."""
+    def _sweep(self, runner: Runner, checkpoint: float) -> None:
+        """One frozen-frame pass over the entire probe dataloader.
+
+        The model is not stepped anywhere in here -- ``torch.autograd.grad``
+        computes d loss / d delta without populating parameter ``.grad`` -- so
+        every image is scored against the SAME weights. That is the whole point:
+        a column of D_grad is then attributable to the image, not to whenever
+        during training it happened to be drawn.
+        """
         model = runner.model
         model = model.module if hasattr(model, "module") else model
 
@@ -202,7 +195,7 @@ class CollectGradientHook(Hook):
         # SegDataPreProcessor (pad + normalize) is fine.
         model.eval()
         assert not model.training, (
-            "gradient probe must run in eval mode: train-mode BatchNorm couples "
+            "gradient sweep must run in eval mode: train-mode BatchNorm couples "
             "images through the batch statistics and destroys per-image "
             "independence"
         )
@@ -212,42 +205,46 @@ class CollectGradientHook(Hook):
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         )
 
-        grads = {}
+        n_batches = n_images = 0
         try:
-            # Fix the probe RNG so `noise` draws the SAME sample every probe.
-            # Its gradient is a projection of the pixel gradient onto that
-            # sample, so a fresh draw per probe would turn its column into
-            # measurement noise and attenuate every correlation it appears in.
-            # Restored in `finally`, so the training RNG stream is untouched.
-            torch.manual_seed(self.probe_seed)
+            for data in self._probe_loader:
+                try:
+                    grads = self._probe_batch(model, data)
+                except ProbeError:
+                    # A wrong-shaped or non-finite gradient is a bug in the probe,
+                    # not a transient failure. Fail loudly rather than degrading
+                    # into a silently skipped batch (which is what the blanket
+                    # except below would otherwise do).
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    print_log(
+                        f"CollectGradientHook batch failed during the "
+                        f"{checkpoint:.0%} sweep: {e}",
+                        logger="current",
+                    )
+                    continue
 
-            data = self._next_probe_batch()
-            # data_preprocessor casts to device, bgr->rgb, and normalizes.
-            data = model.data_preprocessor(data, training=True)
-            inputs = data["inputs"]
-            data_samples = data["data_samples"]
+                for name, value in grads.items():
+                    self.grad_buffer[name].append(value)
 
-            # De-normalize to [0, 1] RGB, the diff-aug ops' input contract.
-            mean = model.data_preprocessor.mean.view(1, -1, 1, 1)
-            std = model.data_preprocessor.std.view(1, -1, 1, 1)
-            rgb01 = ((inputs * std + mean) / 255.0).clamp(0.0, 1.0)
+                batch_size = int(next(iter(grads.values())).shape[0])
+                n_batches += 1
+                n_images += batch_size
 
-            for name, op in DIFFERENTIABLE_PERTURBATIONS.items():
-                grads[name] = self._grad_for_op(
-                    name, model, op, rgb01, mean, std, data_samples
-                )
-        except ProbeError:
-            # A wrong-shaped or non-finite gradient is a bug in the probe, not a
-            # transient failure. Fail loudly rather than degrading into a
-            # silently skipped probe (which is what the blanket except below
-            # would otherwise do).
-            raise
-        except Exception as e:  # noqa: BLE001
-            print_log(
-                f"CollectGradientHook probe failed at iter {runner.iter}: {e}",
-                logger="current",
-            )
-            grads = {}
+                if is_main_process():
+                    # Log EVERY batch, in full: this makes R recomputable offline
+                    # from the log without retraining. .tolist() is required --
+                    # np.ndarray and np.float32 both raise TypeError in json.dumps.
+                    self._pending_records.append(
+                        {
+                            "checkpoint": checkpoint,
+                            "iter": int(runner.iter),
+                            "batch_size": batch_size,
+                            "grads": {
+                                name: value.tolist() for name, value in grads.items()
+                            },
+                        }
+                    )
         finally:
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
@@ -255,7 +252,45 @@ class CollectGradientHook(Hook):
             if was_training:
                 model.train()
 
-        return grads
+        if is_main_process():
+            self._flush_records()
+
+        print_log(
+            f"[grad-sweep] checkpoint {checkpoint:.0%} (iter {runner.iter}): swept "
+            f"{n_images} images in {n_batches} batches on this rank",
+            logger="current",
+        )
+
+    def _probe_batch(self, model, data) -> dict:
+        """Returns {op_name: (B,) array of d loss / d magnitude, one per image}
+        for all differentiable ops, measured on a single shared clean batch (so
+        columns stay aligned across ops).
+
+        Assumes the caller has already put the model in eval mode and taken
+        responsibility for restoring the RNG (see _sweep).
+        """
+        # Fix the probe RNG so `noise` draws the SAME sample for every batch. Its
+        # gradient is a projection of the pixel gradient onto that sample, so a
+        # fresh draw per batch would turn its row into measurement noise and
+        # attenuate every correlation it appears in.
+        torch.manual_seed(self.probe_seed)
+
+        # data_preprocessor casts to device, bgr->rgb, and normalizes. It pads but
+        # never crops (stack_batch uses max(size - shape, 0)), so val images stay
+        # at their full resolution here.
+        data = model.data_preprocessor(data, training=True)
+        inputs = data["inputs"]
+        data_samples = data["data_samples"]
+
+        # De-normalize to [0, 1] RGB, the diff-aug ops' input contract.
+        mean = model.data_preprocessor.mean.view(1, -1, 1, 1)
+        std = model.data_preprocessor.std.view(1, -1, 1, 1)
+        rgb01 = ((inputs * std + mean) / 255.0).clamp(0.0, 1.0)
+
+        return {
+            name: self._grad_for_op(name, model, op, rgb01, mean, std, data_samples)
+            for name, op in DIFFERENTIABLE_PERTURBATIONS.items()
+        }
 
     def _grad_for_op(
         self, name, model, op, rgb01, mean, std, data_samples

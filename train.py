@@ -342,17 +342,29 @@ def build_config(args):
         cfg.train_cfg.init_sa = True if (cfg.resume or args.no_warmup) else False
 
         if args.grad_corr:
-            # Gradient-based augmentation cross-correlation (opt-in, additive):
-            # CollectGradientHook probes d loss / d magnitude for the
-            # differentiable ops during training, and
-            # PerturbationSensitivityAnalysisHookWithGradients logs R each round.
+            # Gradient-based augmentation cross-correlation (opt-in, additive).
+            # At each checkpoint CollectGradientHook freezes the model and sweeps
+            # the whole clean val set for d loss / d magnitude, then
+            # PerturbationSensitivityAnalysisHookWithGradients correlates that
+            # sweep into R. Both hooks gate on the SAME checkpoints, so they are
+            # built from one tuple rather than two that could drift apart.
+            #
+            # The priorities are load-bearing, not cosmetic: both hooks act in
+            # after_val_epoch, and the correlation hook must see the sweep the
+            # collector just wrote. NORMAL (50) runs before LOW (70).
+            grad_corr_checkpoints = (0.25, 0.5, 0.75, 1.0)
             cfg.custom_hooks = (cfg.get("custom_hooks") or []) + [
                 dict(
                     type="CollectGradientHook",
-                    probe_interval=50,
-                    log_interval=200,
+                    checkpoints=grad_corr_checkpoints,
+                    sweep_batch_size=1,
+                    priority="NORMAL",
                 ),
-                dict(type="PerturbationSensitivityAnalysisHookWithGradients"),
+                dict(
+                    type="PerturbationSensitivityAnalysisHookWithGradients",
+                    checkpoints=grad_corr_checkpoints,
+                    priority="LOW",
+                ),
             ]
 
         # NOTE: LoveDA doesn't converge very well on default lr; we should reduce it by 1 order mag

@@ -1,4 +1,4 @@
-"""Tests for CollectGradientHook's per-image gradient probe.
+"""Tests for CollectGradientHook's frozen-frame per-image gradient sweep.
 
 Requires the full mmseg/mmengine stack (grad_hook imports the registries), so run
 these in the `sensaug` conda env on a compute node, not on a laptop.
@@ -7,7 +7,6 @@ these in the `sensaug` conda env on a compute node, not on a laptop.
 import json
 import os
 import sys
-import types
 from pathlib import Path
 
 import numpy as np
@@ -57,10 +56,10 @@ class _TinySegModel(torch.nn.Module):
 
 
 class _FakeRunner:
-    def __init__(self, model, iteration=0):
+    def __init__(self, model, iteration=0, max_iters=100):
         self.model = model
         self.iter = iteration
-        self.val_loop = types.SimpleNamespace(sa_curve={"placeholder": [1]})
+        self.max_iters = max_iters
 
 
 @pytest.fixture
@@ -69,10 +68,17 @@ def images():
     return torch.rand(4, 3, 16, 16)
 
 
-def _probe_hook(model, images, **kwargs):
+def _batch(images):
+    return {"inputs": images, "data_samples": None}
+
+
+def _sweep_hook(tmp_path, batches, names=None, **kwargs):
+    """A hook wired to an in-memory probe loader -- `batches` is the list of
+    batches the sweep will iterate, standing in for the val dataloader."""
     hook = CollectGradientHook(**kwargs)
-    hook.grad_buffer = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
-    hook._next_probe_batch = lambda: {"inputs": images, "data_samples": None}
+    hook.grad_buffer = {name: [] for name in (names or DIFFERENTIABLE_PERTURBATIONS)}
+    hook._probe_loader = batches
+    hook.grad_log_path = str(tmp_path / "aug_gradient_log.txt")
     return hook
 
 
@@ -112,8 +118,8 @@ def test_eval_mode_makes_per_image_gradients_independent(images):
 
 
 def test_train_mode_batchnorm_couples_images(images):
-    """The counterexample, which is why model.eval() in _probe_gradients is
-    load-bearing rather than incidental tidiness.
+    """The counterexample, which is why model.eval() in _sweep is load-bearing
+    rather than incidental tidiness.
 
     In train mode BatchNorm normalizes with BATCH statistics, so image 2's delta
     leaks into every other image's gradient and the independence above collapses.
@@ -174,17 +180,111 @@ def test_scalar_mode_still_returns_a_single_batch_averaged_value(images):
     assert grad.shape == (1,)
 
 
-def test_probe_covers_every_op_with_a_per_image_vector(images):
+def test_probe_batch_covers_every_op_with_a_per_image_vector(images):
     model = _TinySegModel()
     model.eval()
-    hook = _probe_hook(model, images)
+    hook = CollectGradientHook()
 
-    grads = hook._probe_gradients(_FakeRunner(model))
+    grads = hook._probe_batch(model, _batch(images))
 
     assert set(grads) == set(DIFFERENTIABLE_PERTURBATIONS)
     for name, value in grads.items():
         assert value.shape == (4,), f"{name} did not return one value per image"
         assert np.isfinite(value).all(), f"{name} returned a non-finite gradient"
+
+
+def test_noise_gradient_is_reproducible_across_batches(images):
+    """`noise`'s gradient is a projection of the pixel gradient onto its random
+    sample. A fresh draw every batch would turn its row into measurement noise
+    and attenuate every correlation it takes part in, so the probe pins the RNG:
+    two probes of the same batch and model must agree exactly."""
+    model = _TinySegModel()
+    model.eval()
+    hook = CollectGradientHook(probe_seed=7)
+
+    first = hook._probe_batch(model, _batch(images))
+    second = hook._probe_batch(model, _batch(images))
+
+    np.testing.assert_allclose(first["noise"], second["noise"])
+
+
+# --- the sweep ---------------------------------------------------------------
+
+
+def test_sweep_visits_every_batch_exactly_once(images, tmp_path):
+    """The frozen frame is only worth anything if it is the WHOLE val set. A
+    sweep that re-read the first batch, or stopped early, would silently shrink N
+    and re-introduce the image-repeat bias the sweep exists to remove."""
+    model = _TinySegModel()
+    model.eval()
+    torch.manual_seed(2)
+    batches = [_batch(torch.rand(4, 3, 16, 16)) for _ in range(3)]
+    hook = _sweep_hook(tmp_path, batches)
+
+    hook._sweep(_FakeRunner(model, iteration=100), checkpoint=1.0)
+
+    for name in DIFFERENTIABLE_PERTURBATIONS:
+        assert len(hook.grad_buffer[name]) == 3, f"{name}: one entry per batch"
+        assert all(entry.shape == (4,) for entry in hook.grad_buffer[name])
+
+    # Each buffered entry must be the gradient of ITS OWN batch, not the first
+    # batch three times.
+    expected = [hook._probe_batch(model, b)["lighter_R"] for b in batches]
+    for got, want in zip(hook.grad_buffer["lighter_R"], expected):
+        np.testing.assert_allclose(got, want)
+
+
+def test_sweep_keeps_all_op_rows_aligned(images, tmp_path):
+    """stack_probe_buffer asserts every op row has the same length. That holds
+    only because a batch is probed all-or-nothing across ops."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(tmp_path, [_batch(images), _batch(images)])
+
+    hook._sweep(_FakeRunner(model), checkpoint=0.5)
+
+    lengths = {
+        np.concatenate(hook.grad_buffer[name]).shape[0]
+        for name in DIFFERENTIABLE_PERTURBATIONS
+    }
+    assert lengths == {8}
+
+
+def test_sweep_leaves_the_model_frozen(images, tmp_path):
+    """"Frozen frame" is the entire claim: every column of D_grad must describe
+    the SAME weights. torch.autograd.grad populates no parameter .grad and the
+    sweep steps no optimizer, so the weights must come out bit-identical."""
+    model = _TinySegModel()
+    model.train()
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    hook = _sweep_hook(tmp_path, [_batch(images), _batch(images)])
+
+    hook._sweep(_FakeRunner(model), checkpoint=0.5)
+
+    after = model.state_dict()
+    for key, value in before.items():
+        assert torch.equal(value, after[key]), f"the sweep moved {key}"
+        # BN running stats included: a train-mode forward would have mutated them.
+    assert all(p.grad is None for p in model.parameters()), (
+        "the sweep populated parameter .grad -- it would pollute the next "
+        "optimizer step"
+    )
+    assert model.training, "the sweep left the model in eval mode"
+
+
+def test_sweep_restores_rng_state(images, tmp_path):
+    """The sweep reseeds the RNG (so `noise` is reproducible). It must put the
+    state back, or it silently perturbs the training stream."""
+    model = _TinySegModel()
+    model.train()
+    hook = _sweep_hook(tmp_path, [_batch(images)], probe_seed=1234)
+
+    rng_before = torch.get_rng_state()
+    hook._sweep(_FakeRunner(model), checkpoint=1.0)
+
+    assert torch.equal(torch.get_rng_state(), rng_before), (
+        "sweep leaked its RNG state into the training stream"
+    )
 
 
 # --- guards ------------------------------------------------------------------
@@ -211,89 +311,91 @@ def test_non_finite_gradient_raises_probe_error(images):
         )
 
 
-def test_probe_error_is_not_swallowed(images, monkeypatch):
-    """_probe_gradients' blanket `except Exception` exists so a TRANSIENT failure
-    (OOM, dataloader hiccup) costs one probe rather than the run. A structurally
-    broken gradient is not that, and must not be quietly downgraded into a skipped
-    probe -- if it were, every guard in the probe would be decorative.
+def test_probe_error_is_not_swallowed(images, tmp_path, monkeypatch):
+    """The sweep's blanket `except Exception` exists so a TRANSIENT failure (OOM,
+    dataloader hiccup) costs one batch rather than the run. A structurally broken
+    gradient is not that, and must not be quietly downgraded into a skipped batch
+    -- if it were, every guard in the probe would be decorative.
     """
     model = _TinySegModel()
-    hook = _probe_hook(model, images)
     monkeypatch.setattr(
         grad_hook, "DIFFERENTIABLE_PERTURBATIONS", {"exploding": _exploding_op}
     )
+    hook = _sweep_hook(tmp_path, [_batch(images)], names=["exploding"])
 
     with pytest.raises(ProbeError):
-        hook._probe_gradients(_FakeRunner(model))
+        hook._sweep(_FakeRunner(model), checkpoint=1.0)
 
 
-def test_transient_failure_is_swallowed_into_a_skipped_probe(images, monkeypatch):
-    def _oom(images, magnitude):
-        raise RuntimeError("CUDA out of memory (simulated)")
+def test_transient_failure_skips_only_that_batch(images, tmp_path, monkeypatch):
+    """A flaky batch must cost that batch, not the whole sweep -- losing the
+    sweep would lose the entire checkpoint's R."""
+    calls = {"n": 0}
+
+    def _flaky(images, magnitude):
+        calls["n"] += 1
+        if calls["n"] == 1:  # first batch's first op blows up
+            raise RuntimeError("CUDA out of memory (simulated)")
+        return images * magnitude.reshape(-1, 1, 1, 1)
 
     model = _TinySegModel()
-    hook = _probe_hook(model, images)
-    monkeypatch.setattr(grad_hook, "DIFFERENTIABLE_PERTURBATIONS", {"flaky": _oom})
+    monkeypatch.setattr(grad_hook, "DIFFERENTIABLE_PERTURBATIONS", {"flaky": _flaky})
+    hook = _sweep_hook(tmp_path, [_batch(images), _batch(images)], names=["flaky"])
 
-    assert hook._probe_gradients(_FakeRunner(model)) == {}
+    hook._sweep(_FakeRunner(model), checkpoint=1.0)
 
-
-def test_probe_restores_rng_state_and_training_mode(images):
-    """The probe reseeds the RNG (so `noise` is reproducible) and flips the model
-    to eval. Both must be put back, or the probe silently perturbs training."""
-    model = _TinySegModel()
-    model.train()
-    hook = _probe_hook(model, images, probe_seed=1234)
-
-    rng_before = torch.get_rng_state()
-    grads = hook._probe_gradients(_FakeRunner(model))
-
-    assert grads, "probe should have succeeded"
-    assert torch.equal(torch.get_rng_state(), rng_before), (
-        "probe leaked its RNG state into the training stream"
+    assert len(hook.grad_buffer["flaky"]) == 1, (
+        "the failed batch should be skipped and the surviving one kept"
     )
-    assert model.training, "probe left the model in eval mode"
 
 
-def test_noise_gradient_is_reproducible_across_probes(images):
-    """`noise`'s gradient is a projection of the pixel gradient onto its random
-    sample. A fresh draw every probe would turn its row into measurement noise
-    and attenuate every correlation it takes part in, so the probe pins the RNG:
-    two probes of the same batch and model must agree exactly."""
+# --- checkpoint gating + logging ---------------------------------------------
+
+
+def test_sweep_only_fires_at_checkpoints(images, tmp_path):
+    """after_val_epoch runs at all 20 SA rounds; the sweep must fire at the 4
+    checkpoints only, or it costs 5x what it should."""
     model = _TinySegModel()
     model.eval()
-    hook = _probe_hook(model, images, probe_seed=7)
-    runner = _FakeRunner(model)
+    hook = _sweep_hook(tmp_path, [_batch(images)], checkpoints=(0.5, 1.0))
+    runner = _FakeRunner(model, max_iters=100)
 
-    first = hook._probe_gradients(runner)
-    second = hook._probe_gradients(runner)
+    runner.iter = 20  # progress 0.2 -- before the first checkpoint
+    hook.after_val_epoch(runner)
+    assert hook.grad_buffer["lighter_R"] == []
 
-    np.testing.assert_allclose(first["noise"], second["noise"])
-
-
-# --- logging -----------------------------------------------------------------
-
-
-def test_after_train_iter_buffers_and_logs_per_image_grads(images, tmp_path):
-    """A (B,) numpy array is not JSON-serializable -- np.ndarray and np.float32
-    both raise TypeError in json.dumps -- and this write happens in
-    after_train_iter, OUTSIDE the probe's try/except, so getting it wrong takes
-    the whole training run down rather than costing one probe."""
-    model = _TinySegModel()
-    model.eval()
-    runner = _FakeRunner(model, iteration=50)
-    hook = _probe_hook(model, images, probe_interval=50, log_interval=50)
-    hook.grad_log_path = str(tmp_path / "aug_gradient_log.txt")
-
-    hook.after_train_iter(runner, batch_idx=0)
-
-    # buffered per probe, as a (B,) array -- probe boundaries stay intact for the
-    # cluster bootstrap downstream
+    runner.iter = 50  # progress 0.5 -- first checkpoint
+    hook.after_val_epoch(runner)
     assert len(hook.grad_buffer["lighter_R"]) == 1
-    assert hook.grad_buffer["lighter_R"][0].shape == (4,)
 
-    record = json.loads(Path(hook.grad_log_path).read_text().strip())
-    assert record["iter"] == 50
-    assert record["batch_size"] == 4
-    assert len(record["grads"]["lighter_R"]) == 4  # per image, not one number
-    assert len(record["grads"]) == len(DIFFERENTIABLE_PERTURBATIONS)
+    runner.iter = 60  # progress 0.6 -- between checkpoints, no sweep
+    hook.after_val_epoch(runner)
+    assert len(hook.grad_buffer["lighter_R"]) == 1
+
+    runner.iter = 100  # progress 1.0 -- final checkpoint
+    hook.after_val_epoch(runner)
+    assert len(hook.grad_buffer["lighter_R"]) == 2
+
+
+def test_sweep_logs_every_batch_per_image(images, tmp_path):
+    """A (B,) numpy array is not JSON-serializable -- np.ndarray and np.float32
+    both raise TypeError in json.dumps -- and this write happens OUTSIDE the
+    probe's try/except, so getting it wrong takes the whole run down rather than
+    costing one batch. The log is also what makes R recomputable offline."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(tmp_path, [_batch(images), _batch(images)])
+
+    hook._sweep(_FakeRunner(model, iteration=40), checkpoint=0.5)
+
+    records = [
+        json.loads(line)
+        for line in Path(hook.grad_log_path).read_text().strip().splitlines()
+    ]
+    assert len(records) == 2  # one per sweep batch
+    for record in records:
+        assert record["checkpoint"] == 0.5
+        assert record["iter"] == 40
+        assert record["batch_size"] == 4
+        assert len(record["grads"]["lighter_R"]) == 4  # per image, not one number
+        assert len(record["grads"]) == len(DIFFERENTIABLE_PERTURBATIONS)
