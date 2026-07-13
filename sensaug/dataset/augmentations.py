@@ -922,14 +922,27 @@ class RandomTrainTransformNew(BaseTransform):
     def __init__(self, pdf_dict: dict):
         self.pdf_dict: dict = pdf_dict
 
+        # keys are (perturbation, level) pairs, so they cannot be passed to
+        # np.random.choice directly -- it only accepts 1-D populations. Sample an
+        # index into the key list instead.
+        self._keys = list(pdf_dict.keys())
+        self._probs = np.asarray(list(pdf_dict.values()), dtype=np.float64)
+
+        total = self._probs.sum()
+        if not np.isclose(total, 1.0, atol=1e-6):
+            raise ValueError(
+                f"RandomTrainTransformNew pdf_dict probabilities sum to {total}, not 1.0"
+            )
+        self._probs /= total
+
     def transform(self, results: dict) -> dict:
         num_transforms = 1
 
         for _ in range(num_transforms):
             # sample perturbation
-            perturbation, level = np.random.choice(
-                list(self.pdf_dict.keys()), size=None, p=list(self.pdf_dict.values())
-            )
+            perturbation, level = self._keys[
+                np.random.choice(len(self._keys), size=None, p=self._probs)
+            ]
 
             if perturbation != "none":
                 # generate some gaussian noise for level

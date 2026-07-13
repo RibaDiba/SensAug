@@ -1,12 +1,126 @@
 from typing import List, Dict
 from copy import deepcopy
 
+import torch
+
 from mmengine.logging import print_log
-from mmengine.runner import Runner, BaseLoop
-from mmengine.dataset.base_dataset import Compose
+from mmengine.runner import Runner
+from mmengine.runner.loops import _InfiniteDataloaderIterator
+from mmseg.registry import DATASETS
 
 # Local imports
 from sensaug.dataset.augmentations import *
+
+
+def _perturbation_transform_cfg(p_type, value):
+    """Map a perturbation name + magnitude onto a registered transform cfg."""
+    if p_type in IMAGENETC_NAME_FN_DICT.keys():  # noqa: F405
+        return "ImageNetCTransform", dict(
+            type="ImageNetCTransform", name=p_type, severity=value
+        )
+    if p_type in NEW_PERTURBATIONS.keys():  # noqa: F405
+        return p_type, dict(type=p_type, magnitude=value)
+    if p_type == "combination":
+        return "CombinationPerturbation", dict(
+            type="CombinationPerturbation", choice=value
+        )
+    raise ValueError(f"transform name doesn't match anything: {p_type}")
+
+
+def _build_perturbed_pipeline(dataloader_cfg, perturb_levels: Dict, train: bool):
+    """Insert perturbation transforms into dataloader_cfg's pipeline, in place.
+
+    Returns the list of transform type names that were inserted.
+    """
+    pipeline = dataloader_cfg.dataset.pipeline
+
+    insert_index = -1
+    if len(perturb_levels) != 0:
+        if not train:
+            for i, aug in enumerate(pipeline):
+                if aug["type"] == "Resize":
+                    pipeline.insert(1, pipeline.pop(i))
+                    break
+
+        for i, aug in enumerate(pipeline):  # put transform after load annotations
+            if aug["type"] == "LoadAnnotations":
+                pipeline.insert(1, pipeline.pop(i))
+                break
+
+    inserted: List[str] = []
+    for p_type, value in perturb_levels.items():
+        transform_name, kwargs = _perturbation_transform_cfg(p_type, value)
+        pipeline.insert(insert_index, kwargs)
+        inserted.append(transform_name)
+
+    return inserted
+
+
+def _assert_transforms_present(dataloader, expected: List[str], tag: str):
+    """Guard: the loader we are about to hand to the workers really carries the
+    perturbations we asked for. Mutating `dataset.pipeline` on an already-running
+    loader does not reach worker processes when persistent_workers=True, so a
+    silently-clean dataloader is the failure mode this catches.
+    """
+    present = [t.__class__.__name__ for t in dataloader.dataset.pipeline.transforms]
+    missing = [name for name in expected if name not in present]
+    if missing:
+        raise RuntimeError(
+            f"{tag} dataloader is missing perturbation transforms {missing} after "
+            f"rebuild; pipeline is {present}. Perturbations would silently not be "
+            f"applied and every perturbed eval would return clean metrics."
+        )
+
+
+def _rebuild_loader(runner: Runner, loop, dataloader_cfg, expected: List[str], tag: str):
+    """Rebuild a loop's dataloader from cfg so fresh workers pick up the pipeline."""
+    diff_rank_seed = runner._randomness_cfg.get("diff_rank_seed", False)
+    new_dataloader = runner.build_dataloader(
+        dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
+    )
+    _assert_transforms_present(new_dataloader, expected, tag)
+    loop.dataloader = new_dataloader
+    return new_dataloader
+
+
+def _rebind_train_iterator(runner: Runner):
+    """IterBasedTrainLoop caches an iterator over the *old* dataloader at __init__
+    time and, with InfiniteSampler, never re-creates it. Swapping
+    train_loop.dataloader alone therefore changes nothing.
+    """
+    loop = runner.train_loop
+    if hasattr(loop, "dataloader_iterator"):
+        loop.dataloader_iterator = _InfiniteDataloaderIterator(loop.dataloader)
+
+
+def verify_perturbation_effective(
+    runner: Runner, p_type: str, magnitude: float = 1.0, sample_idx: int = 0
+):
+    """Functional self-test: at full magnitude, a perturbation must change pixels.
+
+    Cheap (one sample, main process) and run once per SA pass. Uses magnitude=1.0
+    because the adaptive search can select magnitudes small enough to vanish under
+    uint8 rounding, which would make a strict pixel-difference check flaky.
+    """
+    clean_cfg = deepcopy(runner.cfg.val_dataloader)
+    pert_cfg = deepcopy(runner.cfg.val_dataloader)
+    _build_perturbed_pipeline(pert_cfg, {p_type: magnitude}, train=False)
+
+    clean = DATASETS.build(clean_cfg.dataset)[sample_idx]["inputs"]
+    perturbed = DATASETS.build(pert_cfg.dataset)[sample_idx]["inputs"]
+
+    if clean.shape == perturbed.shape and torch.equal(clean, perturbed):
+        raise RuntimeError(
+            f"Perturbation {p_type} at magnitude {magnitude} left the input sample "
+            f"bit-identical to clean. The perturbation pipeline is not taking effect; "
+            f"sensitivity analysis would measure clean performance for every "
+            f"perturbation. Refusing to produce a meaningless SA curve."
+        )
+
+    print_log(
+        f"Perturbation pipeline verified: {p_type}@{magnitude} alters input data",
+        logger="current",
+    )
 
 
 def create_union_test_set_new(runner: Runner, perturb_levels: Dict = {}):
@@ -97,85 +211,32 @@ def apply_perturbations_dataloader(
     """General perturation dataloader utility function.
     Changes the perturbations applied on the dataloader, given an existing runner object.
     Modifies 'runner' directly, returns nothing.
+
+    The dataloader is rebuilt rather than having its dataset.pipeline reassigned:
+    the configs set persistent_workers=True, so worker processes hold their own copy
+    of the dataset and never observe an in-place pipeline swap.
     """
 
-    dataloader_cfg = (
-        deepcopy(runner.cfg.train_dataloader)
-        if train
-        else deepcopy(runner.cfg.val_dataloader)
-    )
-
-    pipeline = dataloader_cfg.dataset.pipeline
-
-    insert_index = -1
-    if len(perturb_levels) != 0:
-        if train == False:
-            for i, aug in enumerate(pipeline):  # put transform after load annotations
-                if aug["type"] == "Resize":
-                    pipeline.insert(1, pipeline.pop(i))
-                    break
-
-        for i, aug in enumerate(pipeline):  # put transform after load annotations
-            if aug["type"] == "LoadAnnotations":
-                pipeline.insert(1, pipeline.pop(i))
-                break
-
-    for p_type, value in perturb_levels.items():
-        transform_name = None
-        kwargs = {}
-
-        if p_type in IMAGENETC_NAME_FN_DICT.keys():  # noqa: F405
-            transform_name = "ImageNetCTransform"
-            kwargs = {"type": transform_name, "name": p_type, "severity": value}
-        elif p_type in NEW_PERTURBATIONS.keys():  # noqa: F405
-            transform_name = p_type
-            kwargs = {"type": transform_name, "magnitude": value}
-        elif p_type == "combination":
-            transform_name = "CombinationPerturbation"
-            kwargs = {"type": transform_name, "choice": value}
-
-        assert transform_name is not None, "transform name doesn't match anything"
-
-        pipeline.insert(
-            insert_index, dict(**kwargs)
-        )  # before load annotations and pack seg inputs
-
-    built_pipeline = Compose(pipeline)
-
     if train:
-        print_log(f"Setting pipeline for train loop: {pipeline}", logger="current")
+        dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
+        inserted = _build_perturbed_pipeline(dataloader_cfg, perturb_levels, train=True)
+        print_log(
+            f"Rebuilding train loop dataloader: {dataloader_cfg.dataset.pipeline}",
+            logger="current",
+        )
+        _rebuild_loader(runner, runner.train_loop, dataloader_cfg, inserted, "train")
+        _rebind_train_iterator(runner)
+        return
 
-        if isinstance(runner._train_loop, BaseLoop):
-            runner.train_loop.dataloader.dataset.pipeline = built_pipeline  # type: ignore
-        else:
-            dataloader_cfg.dataset.pipeline = pipeline
-            diff_rank_seed = runner._randomness_cfg.get("diff_rank_seed", False)
-            new_dataloader = runner.build_dataloader(
-                dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
-            )
-            runner.train_loop.dataloader = new_dataloader  # type: ignore
-    else:
-        print_log(f"Setting pipeline for val loop: {pipeline}", logger="current")
-        if isinstance(runner._val_loop, BaseLoop):
-            runner.val_loop.dataloader.dataset.pipeline = built_pipeline  # type: ignore
-        else:
-            dataloader_cfg.dataset.pipeline = pipeline
-            diff_rank_seed = runner._randomness_cfg.get("diff_rank_seed", False)
-            new_dataloader = runner.build_dataloader(
-                dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
-            )
-            runner.val_loop.dataloader = new_dataloader  # type: ignore
-
-        print_log(f"Setting pipeline for test loop: {pipeline}", logger="current")
-        if isinstance(runner._test_loop, BaseLoop):
-            runner.test_loop.dataloader.dataset.pipeline = built_pipeline  # type: ignore
-        else:
-            dataloader_cfg.dataset.pipeline = pipeline
-            diff_rank_seed = runner._randomness_cfg.get("diff_rank_seed", False)
-            new_dataloader = runner.build_dataloader(
-                dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
-            )
-            runner.test_loop.dataloader = new_dataloader  # type: ignore
+    # val and test loops are both driven off val_dataloader cfg, as before
+    for tag, loop in (("val", runner.val_loop), ("test", runner.test_loop)):
+        dataloader_cfg = deepcopy(runner.cfg.val_dataloader)
+        inserted = _build_perturbed_pipeline(dataloader_cfg, perturb_levels, train=False)
+        print_log(
+            f"Rebuilding {tag} loop dataloader: {dataloader_cfg.dataset.pipeline}",
+            logger="current",
+        )
+        _rebuild_loader(runner, loop, dataloader_cfg, inserted, tag)
 
 
 def apply_random_perturbations_train_dataloader_new(runner: Runner, pdf_dict: Dict):
@@ -197,18 +258,13 @@ def apply_random_perturbations_train_dataloader_new(runner: Runner, pdf_dict: Di
         insert_index, dict(type="RandomTrainTransformNew", pdf_dict=pdf_dict)
     )
 
-    built_pipeline = Compose(pipeline)
+    dataloader_cfg.dataset.pipeline = pipeline
 
-    # dataloader_cfg.dataset.pipeline = pipeline
-    # diff_rank_seed = runner._randomness_cfg.get(
-    #     'diff_rank_seed', False)
-    # new_dataloader = runner.build_dataloader(
-    #     dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed)
-
-    if isinstance(runner._train_loop, BaseLoop):
-        print_log(f"Setting pipeline for train loop: {pipeline}", logger="current")
-        runner.train_loop.dataloader.dataset.pipeline = built_pipeline  # type: ignore
-    # runner.train_loop.dataloader = new_dataloader # type: ignore
+    print_log(f"Rebuilding train loop dataloader: {pipeline}", logger="current")
+    _rebuild_loader(
+        runner, runner.train_loop, dataloader_cfg, ["RandomTrainTransformNew"], "train"
+    )
+    _rebind_train_iterator(runner)
 
 
 def apply_random_alpha_training_augmentations(
@@ -233,17 +289,13 @@ def apply_random_alpha_training_augmentations(
         ),
     )
 
-    # dataloader_cfg.dataset.pipeline = pipeline
-    # diff_rank_seed = runner._randomness_cfg.get(
-    #     'diff_rank_seed', False)
-    # new_dataloader = runner.build_dataloader(
-    #     dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed)
-    new_pipeline = Compose(pipeline)
+    dataloader_cfg.dataset.pipeline = pipeline
 
-    # runner.train_loop.dataloader = new_dataloader # type: ignore
-    if isinstance(runner._train_loop, BaseLoop):
-        print_log(f"Setting pipeline for train loop: {pipeline}", logger="current")
-        runner.train_loop.dataloader.dataset.pipeline = new_pipeline  # type: ignore
+    print_log(f"Rebuilding train loop dataloader: {pipeline}", logger="current")
+    _rebuild_loader(
+        runner, runner.train_loop, dataloader_cfg, ["RandomAlphaTrainTransform"], "train"
+    )
+    _rebind_train_iterator(runner)
 
 
 def apply_random_perturbations_test_dataloader(runner: Runner, pdf_dict: Dict):

@@ -8,3 +8,5 @@ model = dict(
     ),
     auxiliary_head=dict(in_channels=256, channels=64),
 )
+# base_batch_size = 4 GPUs x 2 samples; enables auto LR scaling on fewer GPUs
+auto_scale_lr = dict(base_batch_size=8)

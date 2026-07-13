@@ -23,7 +23,10 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
 from sensaug.dataset.augmentations import *  # PERTURBATIONS, NEW_PERTURBATIONS, GEOMETRIC_TRANSFORMS
-from sensaug.runner_utils import apply_perturbations_dataloader
+from sensaug.runner_utils import (
+    apply_perturbations_dataloader,
+    verify_perturbation_effective,
+)
 
 # Cityscapes dataset (https://www.cityscapes-dataset.com/downloads/):
 # - gtFine_trainvaltest.zip
@@ -60,6 +63,8 @@ def adaptive_sensitivity_analysis_new(cfg, runner, num_levels, tolerance):
 
     if hasattr(cfg, "photometric_only"):
         perturbation_list = NEW_PERTURBATIONS_PHOTOMETRIC.items()
+
+    verify_perturbation_effective(runner, next(iter(perturbation_list))[0], max_level)
 
     for perturbation, _ in perturbation_list:
         error = tolerance * max_level
