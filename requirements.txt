@@ -22,5 +22,6 @@ torchvision
 torch-fidelity
 tqdm
 Wand
+pytest
 
 cityscapesscripts
