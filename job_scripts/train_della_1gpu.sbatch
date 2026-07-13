@@ -1,31 +1,39 @@
 #!/bin/bash
 
-#SBATCH --job-name=sensaug-print-matrix-2-4-gpus
+#SBATCH --job-name=sensaug-gradcorr-1gpu
 #SBATCH --account=puchalla
 #SBATCH --nodes=1
-#SBATCH --ntasks=4
-#SBATCH --mem=120G
+#SBATCH --ntasks=1
+#SBATCH --mem=20G
 #SBATCH --cpus-per-task=4
 #SBATCH --time=08:00:00
-#SBATCH --gres=gpu:4
-# della-l01g[1-12] are MIG-sliced (3g.40gb / 1g.10gb) and match a bare --gres=gpu:4, but
-# several slices share one physical A100. NCCL keys devices by PCI bus id and has no P2P
-# between MIG instances -> "Duplicate GPU detected". nomig keeps us on whole-GPU nodes.
-#SBATCH --constraint=nomig
+#SBATCH --gres=gpu:1
 
 #SBATCH --output=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.out
 #SBATCH --error=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.err
 
 # config (overridable via env vars):
-NAME="${NAME:-sensaug-print-matrix-2-4-gpus}"
+NAME="${NAME:-sensaug-gradcorr-1gpu}"
 AUG_TYPE="${1:-ours}"
 BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
-EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}}"
+# Keep "ours" in the name: train.py appends "_ours" to any exp_name lacking it when
+# --aug-type=ours, which would desync EXP_NAME from the real work_dir (and the guard below).
+# RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
+EXP_NAME="${4:-gradcorr_1gpu_ours${RUN_TAG:+_${RUN_TAG}}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
 cd /projects/PUCHALLA/LLP2024/tumor
+
+# train.py silently resumes when work_dir/last_checkpoint exists -- no --resume needed.
+# Fail loudly instead, so a resubmit never continues a previous run by accident.
+# Set ALLOW_RESUME=1 to intentionally continue an existing experiment.
+if [ -z "${ALLOW_RESUME}" ] && [ -f "${WORK_DIR}/${EXP_NAME}/last_checkpoint" ]; then
+    echo "ERROR: ${WORK_DIR}/${EXP_NAME} already holds a checkpoint; train.py would resume it." >&2
+    echo "Pass a fresh exp name (4th arg) or RUN_TAG=..., or set ALLOW_RESUME=1 to continue it." >&2
+    exit 1
+fi
 
 # conda init in ~/.bashrc is stale (points at a removed micromamba); activate the
 # env directly by putting its bin on PATH so python + torchrun resolve correctly.
@@ -37,7 +45,7 @@ module load cudatoolkit/12.6 2>/dev/null || true
 # Use the GPUs SLURM actually allocated to this job, NOT nvidia-smi (which lists every
 # physical GPU on the node and would over-count on shared multi-GPU nodes, spawning
 # torchrun ranks with no device -> "CUDA error: invalid device ordinal").
-NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
+NUM_GPUS=${SLURM_GPUS_ON_NODE:-1}
 echo "Number of GPUS: $NUM_GPUS"
 
 NNODES=${NNODES:-1}
@@ -45,9 +53,9 @@ NODE_RANK=${NODE_RANK:-0}
 PORT=${PORT:-29500}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-# Let SLURM's CUDA_VISIBLE_DEVICES stand: it already scopes us to the allocated GPUs, and
-# on MIG nodes it holds MIG UUIDs that an integer list would silently clobber.
-OMP_NUM_THREADS=16 \
+# Let SLURM's CUDA_VISIBLE_DEVICES stand: it already scopes us to the allocated GPU, and
+# on MIG nodes it holds a MIG UUID that an integer index would silently clobber.
+OMP_NUM_THREADS=4 \
 torchrun \
     --nnodes=$NNODES \
     --node_rank=$NODE_RANK \

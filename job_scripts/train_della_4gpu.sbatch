@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=sensaug-print-matrix-2-4-gpus
+#SBATCH --job-name=none-compare-2
 #SBATCH --account=puchalla
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
@@ -17,15 +17,27 @@
 #SBATCH --error=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.err
 
 # config (overridable via env vars):
-NAME="${NAME:-sensaug-print-matrix-2-4-gpus}"
-AUG_TYPE="${1:-ours}"
+NAME="${NAME:-none-compare-2}"
+AUG_TYPE="${1:-none}"
 BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
-EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}}"
+# Keep "ours" in the name: train.py appends "_ours" to any exp_name lacking it when
+# --aug-type=ours, which would desync EXP_NAME from the real work_dir (and the guard below).
+# RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
+EXP_NAME="${4:-none_compare_2${RUN_TAG:+_${RUN_TAG}}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
 cd /projects/PUCHALLA/LLP2024/tumor
+
+# train.py silently resumes when work_dir/last_checkpoint exists -- no --resume needed.
+# Fail loudly instead, so a resubmit never continues a previous run by accident.
+# Set ALLOW_RESUME=1 to intentionally continue an existing experiment.
+if [ -z "${ALLOW_RESUME}" ] && [ -f "${WORK_DIR}/${EXP_NAME}/last_checkpoint" ]; then
+    echo "ERROR: ${WORK_DIR}/${EXP_NAME} already holds a checkpoint; train.py would resume it." >&2
+    echo "Pass a fresh exp name (4th arg) or RUN_TAG=..., or set ALLOW_RESUME=1 to continue it." >&2
+    exit 1
+fi
 
 # conda init in ~/.bashrc is stale (points at a removed micromamba); activate the
 # env directly by putting its bin on PATH so python + torchrun resolve correctly.
@@ -64,4 +76,4 @@ torchrun \
     --launcher="pytorch" \
     --no-inv-aug \
     --auto-scale-lr \
-    --grad-corr
+#    --grad-corr
