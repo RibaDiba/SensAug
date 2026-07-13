@@ -13,6 +13,12 @@ Tensor contract (all public functions):
     - value range: [0, 1]
     - channel order: RGB (0=R, 1=G, 2=B)
 
+Magnitude contract: every op takes `delta`/`sigma` as EITHER a scalar (one
+magnitude for the whole batch) OR a length-B tensor (one magnitude per image).
+The per-image form exists so a single autograd pass can measure
+d loss / d magnitude separately for each image (sensaug.hooks.grad_hook); the
+scalar form is unchanged and still exercised by DiffAugment.
+
 This is intentionally a DIFFERENT convention from sensaug.dataset.augmentations
 """
 
@@ -62,8 +68,37 @@ def _as_delta(delta: Union[float, Tensor], reference: Tensor) -> Tensor:
     return torch.as_tensor(float(delta), dtype=reference.dtype, device=reference.device)
 
 
+def _broadcast_delta(delta: Tensor, batch_size: int) -> Tensor:
+    """Reshape a scalar (0-dim) or per-image (B,) delta to (n, 1, 1, 1), n in
+    {1, B}, so it broadcasts against a (B, C, H, W) batch.
+
+    The per-image form is what lets a single probe measure d loss / d delta
+    SEPARATELY for each image (see sensaug.hooks.grad_hook): autograd then
+    returns a length-B gradient instead of one batch-averaged number. A 0-dim
+    delta reshapes to (1, 1, 1, 1) and broadcasts identically to before, so the
+    scalar path is numerically unchanged.
+    """
+    d = delta.reshape(-1, 1, 1, 1)
+    assert d.shape[0] in (1, batch_size), (
+        f"delta must be a scalar or a length-{batch_size} vector (one per "
+        f"image), got shape {tuple(delta.shape)}"
+    )
+    return d
+
+
+def _as_rail(rail: Union[float, Tensor], reference: Tensor) -> Tensor:
+    """Rails are constants (no autograd) but may be per-image tensors -- see
+    hsv_channel's V floor."""
+    if torch.is_tensor(rail):
+        return rail.to(dtype=reference.dtype, device=reference.device)
+    return torch.as_tensor(rail, dtype=reference.dtype, device=reference.device)
+
+
 def _weighted_rail_perturb(
-    channel: Tensor, delta: Tensor, rail_min: float, rail_max: float
+    channel: Tensor,
+    delta: Tensor,
+    rail_min: Union[float, Tensor],
+    rail_max: Union[float, Tensor],
 ) -> Tensor:
     """out = channel * (1 - |delta|) + rail * |delta|, rail = rail_max if
     delta >= 0 else rail_min. Same weighted-average-toward-a-rail-value
@@ -73,9 +108,13 @@ def _weighted_rail_perturb(
     `channel` and in the magnitude of `delta`; the SIGN of delta only selects
     which constant rail is used (a hard, non-differentiable branch), matching
     the existing repo convention.
+
+    `delta` may be scalar or per-image, so the rail is selected elementwise:
+    with a per-image delta the sign can differ across the batch.
     """
-    rail = rail_max if float(delta.detach()) >= 0 else rail_min
-    abs_delta = delta.abs()
+    d = _broadcast_delta(delta, channel.shape[0])
+    rail = torch.where(d >= 0, _as_rail(rail_max, d), _as_rail(rail_min, d))
+    abs_delta = d.abs()
     return channel * (1.0 - abs_delta) + rail * abs_delta
 
 
@@ -115,9 +154,15 @@ def hsv_channel(images: Tensor, channel: int, delta: Union[float, Tensor]) -> Te
     delta_t = _as_delta(delta, images)
     hsv = kornia.color.rgb_to_hsv(images)
     rail_max = _HSV_RAIL_MAX[channel]
-    rail_min = 0.0
-    if channel == V and float(delta_t.detach()) < 0:
-        rail_min = V_DARKEN_FLOOR
+    rail_min: Union[float, Tensor] = 0.0
+    if channel == V:
+        # Darkening V rails toward a nonzero floor, not pure black. With a
+        # per-image delta the sign varies across the batch, so this has to be an
+        # elementwise select rather than a python `if` on the sign.
+        d = _broadcast_delta(delta_t, images.shape[0])
+        rail_min = torch.where(
+            d < 0, torch.full_like(d, V_DARKEN_FLOOR), torch.zeros_like(d)
+        )
     new_value = _weighted_rail_perturb(
         hsv[:, channel : channel + 1], delta_t, rail_min=rail_min, rail_max=rail_max
     )
@@ -126,16 +171,21 @@ def hsv_channel(images: Tensor, channel: int, delta: Union[float, Tensor]) -> Te
 
 
 def _gaussian_kernel2d(kernel_size: Tuple[int, int], sigma: Tensor) -> Tensor:
-    """Hand-built (guaranteed differentiable w.r.t. `sigma`) 2D Gaussian
-    kernel, shape (1, 1, kh, kw). Mirrors the reference repo's own "custom
-    conv2d" blur -- deliberately not kornia.filters.gaussian_blur2d, whose
-    sigma-argument autograd support is version-dependent."""
+    """Hand-built (guaranteed differentiable w.r.t. `sigma`) 2D Gaussian kernel
+    STACK, shape (n, 1, kh, kw) with n = 1 for a scalar sigma and n = B for a
+    per-image sigma. Mirrors the reference repo's own "custom conv2d" blur --
+    deliberately not kornia.filters.gaussian_blur2d, whose sigma-argument
+    autograd support is version-dependent."""
     kh, kw = kernel_size
+    s = sigma.reshape(-1)  # (n,) -- a 0-dim sigma becomes (1,)
     ax_y = torch.arange(kh, dtype=sigma.dtype, device=sigma.device) - (kh - 1) / 2.0
     ax_x = torch.arange(kw, dtype=sigma.dtype, device=sigma.device) - (kw - 1) / 2.0
-    var = 2 * sigma**2 + 1e-12
-    kernel2d = torch.outer(torch.exp(-(ax_y**2) / var), torch.exp(-(ax_x**2) / var))
-    return (kernel2d / kernel2d.sum()).view(1, 1, kh, kw)
+    var = (2 * s**2 + 1e-12).view(-1, 1)  # (n, 1)
+    gauss_y = torch.exp(-(ax_y**2).view(1, -1) / var)  # (n, kh)
+    gauss_x = torch.exp(-(ax_x**2).view(1, -1) / var)  # (n, kw)
+    kernel2d = gauss_y[:, :, None] * gauss_x[:, None, :]  # (n, kh, kw)
+    kernel2d = kernel2d / kernel2d.sum(dim=(1, 2), keepdim=True)
+    return kernel2d.view(-1, 1, kh, kw)
 
 
 def blur(
@@ -145,19 +195,53 @@ def blur(
     direction, param_min = 0.0). kernel_size is a fixed hyperparameter, not
     swept -- matches the reference repo. NOTE: this is NOT numerically
     equivalent to augmentations.py's Blur/GaussianBlurPerturbation, which
-    instead derive kernel_size from magnitude via cv2's implicit sigma."""
+    instead derive kernel_size from magnitude via cv2's implicit sigma.
+
+    `sigma` may be a scalar (one blur for the whole batch) or a length-B vector
+    (a different blur per image)."""
     sigma_t = _as_delta(sigma, images).clamp(min=1e-3)
+    b, c = images.shape[0], images.shape[1]
     kernel = _gaussian_kernel2d(kernel_size, sigma_t).to(images.dtype)
-    kernel = kernel.repeat(images.shape[1], 1, 1, 1)  # depthwise: one copy per channel
     padding = (kernel_size[0] // 2, kernel_size[1] // 2)
-    return F.conv2d(images, kernel, padding=padding, groups=images.shape[1])
+
+    if kernel.shape[0] == 1:
+        # Scalar sigma: one kernel, depthwise over channels.
+        kernel = kernel.repeat(c, 1, 1, 1)
+        return F.conv2d(images, kernel, padding=padding, groups=c)
+
+    assert kernel.shape[0] == b, (
+        f"sigma must be a scalar or a length-{b} vector, got {kernel.shape[0]}"
+    )
+    # Per-image sigma: fold the batch into the channel dim so every image gets
+    # its own kernel, and group by B*C so no kernel sees another image.
+    #
+    # repeat_interleave, NOT repeat: the folded layout is
+    # (b0c0, b0c1, b0c2, b1c0, ...), so image b's kernel must be repeated C
+    # times CONSECUTIVELY. `repeat` tiles instead, which would silently apply
+    # one image's sigma to a different image's channels -- same shapes, no
+    # error, wrong numbers.
+    kernel = kernel.repeat_interleave(c, dim=0)  # (b*c, 1, kh, kw)
+    out = F.conv2d(
+        images.reshape(1, b * c, *images.shape[2:]),
+        kernel,
+        padding=padding,
+        groups=b * c,
+    )
+    return out.reshape(b, c, *out.shape[2:])
 
 
 def gaussian_noise(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Additive Gaussian noise scaled by delta (signed; param_min = -eps)."""
+    """Additive Gaussian noise scaled by delta (signed; param_min = -eps).
+    `delta` may be a scalar or a length-B vector (one scale per image).
+
+    Reparameterized: the gradient flows to the scale, not to the random sample.
+    NOTE the sample is drawn fresh on every call, so two calls with the same
+    delta differ -- callers that need comparability across calls (the gradient
+    probe does) must fix the RNG themselves."""
     delta_t = _as_delta(delta, images)
+    d = _broadcast_delta(delta_t, images.shape[0])
     noise = torch.randn(images.shape, dtype=images.dtype, device=images.device)
-    return torch.clamp(images + noise * delta_t, 0.0, 1.0)
+    return torch.clamp(images + noise * d, 0.0, 1.0)
 
 
 class DiffAugment:
