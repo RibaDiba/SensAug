@@ -91,15 +91,36 @@ python train.py \
 | `--no-inv-aug` | flag | exclude color/photometric augmentations |
 | `--no-warmup` | flag | skip clean-training warmup rounds |
 | `--resume` | flag | auto-resume from last checkpoint in work_dir |
+| `--round_interval` | int (iters) | the **SA pipeline's clock**. Default `max_iters // 20`. Overrides `schedule.round_interval` |
+| `--grad-corr` | flag | enable the **gradient cross-correlation pipeline** (logs the matrix R). Works with ANY `--aug-type`, including `none` |
+| `--corr-interval` | int (iters) | the **correlation pipeline's clock**. Default `max_iters // 4`. Overrides `schedule.corr_interval` |
+| `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is hardcoded to every 6th round in `sensaug/loops.py` |
+
+## The two pipelines (and their two clocks)
+
+Training runs two independent measurements. They share no clock and no hook point — do not couple them.
+
+| Pipeline | Question it answers | Clock | Code |
+|---|---|---|---|
+| Sensitivity analysis (SA) | which perturbations is the model *worst at*? (weights the training aug PDF) | `round_interval` | `sensaug/loops.py` → `RobustValLoop` |
+| Gradient cross-correlation | which perturbations are *redundant with each other*? (the matrix R) | `corr_interval` | `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
+
+- **SA** runs only under `--aug-type=ours`, from the val loop. The SA *curve* is recomputed every 6th round (hardcoded), so its effective cadence is `6 × round_interval`.
+- **Correlation** is opt-in via `--grad-corr` and runs for **any** `--aug-type` — measuring R against an `--aug-type=none` baseline is the control the `ours` number needs. It fires from `after_train_iter`, freezing the model and sweeping the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per aug per image. `CollectGradientHook` (priority NORMAL) sweeps; `PerturbationSensitivityAnalysisHookWithGradients` (priority LOW) correlates the sweep it just wrote — the priority ordering is load-bearing. Both are given the same `interval`; the shared gate is `fires_at()` in `grad_hook.py`.
 
 ## Cluster config: `configs/della.yaml`
 
-Parsed by `sensaug/cluster_config.py`. Controls all paths.
+Parsed by `sensaug/cluster_config.py`. Controls all paths **and both pipeline schedules**.
 
 ```yaml
 data_root: /projects/PUCHALLA/LLP2024/tumor/data
 mmconfig_path: /projects/PUCHALLA/LLP2024/tumor/sensaug/custom_configs/mmseg
 primary_metric: mIoU
+
+schedule:                       # both in ITERATIONS; null → default
+  round_interval: null          # SA pipeline's clock.          null → max_iters // 20
+  corr_interval: null           # correlation pipeline's clock. null → max_iters // 4
+
 datasets:
   cityscapes: cityscapes        # key → subfolder under data_root
 supported_backbones:
@@ -111,6 +132,8 @@ supported_backbones:
   - mae
   - vit
 ```
+
+Schedule precedence is **CLI flag > `schedule:` block > default**, resolved by `resolve_interval()` in `train.py`. The `schedule:` block is optional — configs without it still load (`SCHEDULE` becomes `{}`).
 
 To add a new dataset: add an entry under `datasets:` and follow the 3-step process below.
 
@@ -151,14 +174,27 @@ datasets:
 | `sensaug/cluster_config.py` | Parses the YAML config |
 | `sensaug/dataset/datasets.py` | Custom dataset class registrations |
 | `sensaug/dataset/augmentations.py` | Custom MMSeg transform registrations |
-| `sensaug/hooks.py` | Sensitivity analysis hooks |
-| `sensaug/loops.py` | Custom train/val loops (RobustValLoop, etc.) |
+| `sensaug/dataset/differentiable_augmentations.py` | Autograd-compatible augmentation ops (`DIFFERENTIABLE_PERTURBATIONS`) — what R is computed over |
+| `sensaug/hooks/sensitivity_hooks.py` | Legacy SA hooks (**not registered by train.py** — the SA loop does this now) |
+| `sensaug/hooks/grad_hook.py` | `CollectGradientHook` — the frozen-frame per-image gradient sweep, and the shared `fires_at()` clock |
+| `sensaug/hooks/grad_sens_analysis.py` | `PerturbationSensitivityAnalysisHookWithGradients` — builds the cross-correlation matrix R from the sweep |
+| `sensaug/loops.py` | Custom train/val loops (RobustValLoop, etc.) — **the SA pipeline** |
 | `sensaug/custom_configs/mmseg/` | Per-backbone MMSeg config files |
 | `job_scripts/train_della.sbatch` | Della SLURM job script |
 
 ## Experiments output
 
-Saved to `./experiments/<exp_name>/`. Contains checkpoints, tensorboard logs, and a copy of the cluster config used.
+Saved to `./experiments/<exp_name>/`. Contains checkpoints, tensorboard logs, and a copy of the cluster config used (`seg_config.yaml`).
+
+Per-pipeline logs:
+
+| File | Written by | Contents |
+|---|---|---|
+| `sa_curve_log.txt` | SA pipeline | JSONL, one SA curve per recompute |
+| `perturb_eval.txt` | SA pipeline | JSONL, per-round perturbed eval metrics |
+| `aug_gradient_log.txt` | correlation pipeline | JSONL, one record per sweep batch — every per-image gradient, so R is recomputable offline without retraining |
+| `corr_matrix_log.json` | correlation pipeline | one JSON array, one record per emission: raw + scale-normalized R, dropped ops, shared-image-factor loadings |
+| `corr_bootstrap_log.txt` | correlation pipeline | JSONL, per-cell bootstrap CIs and BH-FDR q-values |
 
 Launch tensorboard:
 ```bash

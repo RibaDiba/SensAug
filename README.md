@@ -27,14 +27,16 @@ This repo contains references to many local paths for purposes of config, datase
 
 Here are the following files which need to be modified to your own system: 
 
-- [SEG_CONFIG.py](SEG_CONFIG.py)
+- The cluster config for your cluster: [configs/nexus.yaml](configs/nexus.yaml) (UMD Nexus) or [configs/della.yaml](configs/della.yaml) (Princeton Della)
 - [All convenience scripts in job_scripts folder](job_scripts)
 
-The code reads the paths from these files throughout training and testing. 
+The code reads the paths from these files throughout training and testing. Every entry point takes `--cluster-config configs/<cluster>.yaml`; the file is parsed by [`sensaug/cluster_config.py`](sensaug/cluster_config.py) and copied to `{work_dir}/seg_config.yaml` at the start of each run for reproducibility.
+
+> The cluster YAMLs replace the old `SEG_CONFIG.py`, which no longer exists.
 
 ## Setting up Supported Datasets 
 
-Currently, this repo supports all backbones provided by MMSegmentation and additionally the datasets in [SEG_CONFIG.py](SEG_CONFIG.py):
+Currently, this repo supports all backbones provided by MMSegmentation and additionally the datasets listed under `datasets:` in the cluster config (see [configs/nexus.yaml](configs/nexus.yaml) for the full set):
 
 Training datasets:
 - Cityscapes
@@ -80,14 +82,57 @@ There are many command-line arguments in the train.py script, which you can list
 | `--uniform` | flag | False | Use uniform augmentation distribution |
 | `--descending-MA` | flag | False | Prioritize less severe augmentations (descending moving average) |
 | `--freeze-early-layers` | flag | False | Freeze early backbone layers during training |
-| `--sa_interval` | int | None | Iterations between sensitivity analysis re-computations |
-| `--round_interval` | int | None | Iterations between robustness re-evaluations (`sa_interval % round_interval == 0`) |
+| `--round_interval` | int | `max_iters // 20` | Iterations between robustness re-evaluations — the **SA pipeline's clock**. Overrides `schedule.round_interval` in the cluster config. See [Scheduling](#scheduling-two-independent-pipelines) |
+| `--grad-corr` | flag | False | Enable the **gradient cross-correlation pipeline**: log the augmentation cross-correlation matrix R. Independent of `--aug-type`, so it also works against an `--aug-type=none` baseline |
+| `--corr-interval` | int | `max_iters // 4` | Iterations between gradient sweeps and R emissions — the **correlation pipeline's clock**. Only meaningful with `--grad-corr`. Overrides `schedule.corr_interval` in the cluster config |
+| `--sa_interval` | int | None | ⚠️ Currently unused — parsed but never read. The SA-curve recompute cadence is hardcoded to every 6th round in `sensaug/loops.py` |
 | `--adamw` | flag | False | Use AdamW optimizer instead of default SGD |
 | `--amp` | flag | False | Enable automatic mixed-precision (AMP) training |
 | `--auto-scale-lr` | flag | False | Auto-scale learning rate based on batch size |
 | `--resume` | flag | False | Auto-resume from latest checkpoint in `work_dir` |
 | `--launcher` | str | `none` | Job launcher: `none`, `pytorch`, `slurm`, `mpi` |
 | `--local_rank` | int | 0 | Local rank for distributed training |
+
+### Scheduling: two independent pipelines
+
+Training runs **two separate measurement pipelines**, on two clocks that have nothing to do with each other. Both are set in iterations, in the `schedule:` block of the cluster config, and both can be overridden on the command line.
+
+| Pipeline | What it measures | Clock | Where it lives |
+|---|---|---|---|
+| **Sensitivity analysis (SA)** | Which perturbations the model is currently *worst at* — used to weight the training augmentation PDF | `schedule.round_interval` / `--round_interval` (default `max_iters // 20`) | `sensaug/loops.py` (`RobustValLoop`) |
+| **Gradient cross-correlation** | Which perturbations are *redundant with each other* — the correlation matrix R | `schedule.corr_interval` / `--corr-interval` (default `max_iters // 4`) | `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
+
+```yaml
+# configs/della.yaml
+schedule:
+  round_interval: 4000    # SA pipeline: a val/SA round every 4000 iters
+  corr_interval: 20000    # correlation pipeline: a gradient sweep + R every 20000 iters
+```
+
+Leave a value `null` (or omit the `schedule:` block entirely) to take the default. Precedence is **CLI flag > cluster config > default**.
+
+Notes on each:
+
+- **SA pipeline.** Runs only under `--aug-type=ours`. Every `round_interval` iterations it re-evaluates perturbation robustness and rebuilds the training sampling PDF. The SA *curve* itself is recomputed every 6th round (hardcoded in `sensaug/loops.py`), so the effective SA-curve cadence is `6 × round_interval`.
+- **Correlation pipeline.** Opt-in via `--grad-corr`, and **independent of `--aug-type`** — it runs for `none`, `default`, `ours`, anything. Every `corr_interval` iterations it freezes the model, sweeps the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per augmentation per image, and correlates that sweep into R. It fires from `after_train_iter`, so it never depends on a val round happening. The final training iteration always fires, so the converged model's R exists even when `max_iters` is not a multiple of `corr_interval`.
+
+Being able to run the correlation pipeline against an `--aug-type=none` baseline is the point of keeping the two independent — R is a claim about the augmentation operators themselves, not about the `ours` training loop:
+
+```bash
+python train.py \
+  --cluster-config=configs/della.yaml \
+  --backbone=pspnet --dataset=cityscapes \
+  --aug-type=none --grad-corr --corr-interval=20000 \
+  --work_dir=./experiments --exp_name=corr_baseline_pspnet_cityscapes
+```
+
+The correlation pipeline writes three files into `{work_dir}`:
+
+| File | Contents |
+|---|---|
+| `aug_gradient_log.txt` | JSONL, one record per sweep batch — every per-image gradient, so R can be recomputed offline without retraining |
+| `corr_matrix_log.json` | A JSON array, one record per emission: the raw and scale-normalized R, the ops dropped for zero variance, and the shared-image-factor loadings |
+| `corr_bootstrap_log.txt` | JSONL, per-cell bootstrap confidence intervals and BH-FDR corrected q-values |
 
 To train with the convenience script, simply run 
 
@@ -101,19 +146,24 @@ or, if you want to submit to a GPU cluster with a SLURM scheduler, you can simpl
 
 [model] options: any model name from subfolders of [```custom_configs/mmseg```](sensaug/custom_configs/mmseg). example: 'pspnet', 'segformer', 'vit', 'swin'. 
 
-[dataset] options: any key from [SEG_CONFIG.py](SEG_CONFIG.py):
+[dataset] options: any key under `datasets:` in your cluster config. Each value is a path relative to `data_root`:
 
+```yaml
+# configs/nexus.yaml
+data_root: /fs/nexus-projects/robustness_datasets/segmentation
+datasets:
+  cityscapes: cityscapes
+  ade20k: ade/ADEChallengeData2016
+  pascal_voc12: VOCdevkit/VOC2012
+  loveda: loveDA
+  potsdam: potsdam
+  synapse: synapse
+  a2i2haze: a2i2haze
+  acdc: acdc
+  idd: idd
 ```
-DATA_ROOT_LOOKUP = {
-    "cityscapes" : f"{DATA_ROOT}/cityscapes",
-    "ade20k" : f"{DATA_ROOT}/ade/ADEChallengeData2016",
-    "pascal_voc12" : f"{DATA_ROOT}/VOCdevkit/VOC2012",
-    "loveda" : f"{DATA_ROOT}/loveDA",
-    "potsdam" : f"{DATA_ROOT}/potsdam",
-    "synapse" : f"{DATA_ROOT}/synapse",
-    "a2i2haze" : f"{DATA_ROOT}/a2i2haze"
-}
-```
+
+Della currently only has Cityscapes set up — see [configs/della.yaml](configs/della.yaml).
 
 NOTE: Our repo supports Tensorboard! You can launch Tensorboard while a model is training like so:
  
@@ -140,10 +190,16 @@ Make sure the config file follows the same naming convention as all other config
 ```pspnet_r18-d8_4xb2-80k_DATASETNAME.py``` 
 Make note of the dataset name for the next step. 
 
-### Step 3: Modify SEG Config 
+### Step 3: Modify the cluster config 
 
-Remember that SEG_CONFIG.py file we keep referencing? Well, it's time to modify that file now. Here's the link for convenience: [SEG_CONFIG.py](SEG_CONFIG.py)
+Remember those cluster config files we keep referencing? It's time to modify them now: [configs/nexus.yaml](configs/nexus.yaml) and [configs/della.yaml](configs/della.yaml).
 
-Simply add the name of the new dataset to the dictionary of supported datasets. Make sure the key matches that of ```DATASETNAME``` that you chose in the last step in the config naming. 
+Add the new dataset under `datasets:`. The **key** is the name you will pass to `--dataset`, and must match the ```DATASETNAME``` you chose in the last step in the config naming. The **value** is the dataset's path relative to `data_root`:
 
-The training script should automatically pull from this config. If all steps go smoothly, then you should be able to run the convenience script with the new dataset, with the ```DATASETNAME``` from the config you chose as the dataset argument. 
+```yaml
+datasets:
+  cityscapes: cityscapes
+  DATASETNAME: path/relative/to/data_root
+```
+
+The training script pulls from this automatically ([`sensaug/cluster_config.py`](sensaug/cluster_config.py) resolves the full path as `{data_root}/{value}`). If all steps go smoothly, then you should be able to run the convenience script with the new dataset, with the ```DATASETNAME``` from the config you chose as the dataset argument. 
