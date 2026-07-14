@@ -79,6 +79,19 @@ def trigger_visualization_hook(cfg, args):
     return cfg
 
 
+def resolve_interval(cli_value, key, default):
+    """Resolve one pipeline's clock: CLI flag > cluster config `schedule:` > default.
+
+    All three are iteration counts. The checks are explicit `is not None` rather
+    than `or`, so a deliberate 0 reaches the hook that validates it and fails
+    loudly, instead of silently falling through to the default.
+    """
+    if cli_value is not None:
+        return cli_value
+    configured = SCHEDULE.get(key)
+    return default if configured is None else configured
+
+
 def natural_keys(text):
     """
     alist.sort(key=natural_keys) sorts in human order
@@ -293,11 +306,17 @@ def build_config(args):
     )
 
     N_ROUNDS = 20
+    N_CORR_EMISSIONS = 4
 
-    round_interval = (
-        args.round_interval
-        if args.round_interval is not None
-        else cfg.train_cfg.max_iters // N_ROUNDS
+    # The two pipelines' clocks, resolved independently of each other. round_interval
+    # drives the SA pipeline (RobustValLoop; its SA-curve recompute is every 6th of
+    # these rounds, in sensaug/loops.py). corr_interval drives the gradient
+    # cross-correlation pipeline. Neither is derived from the other.
+    round_interval = resolve_interval(
+        args.round_interval, "round_interval", cfg.train_cfg.max_iters // N_ROUNDS
+    )
+    corr_interval = resolve_interval(
+        args.corr_interval, "corr_interval", cfg.train_cfg.max_iters // N_CORR_EMISSIONS
     )
     cfg.train_cfg.val_interval = round_interval
 
@@ -341,35 +360,40 @@ def build_config(args):
         cfg.train_cfg.type = "RobustIterBasedTrainLoop"
         cfg.train_cfg.init_sa = True if (cfg.resume or args.no_warmup) else False
 
-        if args.grad_corr:
-            # Gradient-based augmentation cross-correlation (opt-in, additive).
-            # At each checkpoint CollectGradientHook freezes the model and sweeps
-            # the whole clean val set for d loss / d magnitude, then
-            # PerturbationSensitivityAnalysisHookWithGradients correlates that
-            # sweep into R. Both hooks gate on the SAME checkpoints, so they are
-            # built from one tuple rather than two that could drift apart.
-            #
-            # The priorities are load-bearing, not cosmetic: both hooks act in
-            # after_val_epoch, and the correlation hook must see the sweep the
-            # collector just wrote. NORMAL (50) runs before LOW (70).
-            grad_corr_checkpoints = (0.25, 0.5, 0.75, 1.0)
-            cfg.custom_hooks = (cfg.get("custom_hooks") or []) + [
-                dict(
-                    type="CollectGradientHook",
-                    checkpoints=grad_corr_checkpoints,
-                    sweep_batch_size=1,
-                    priority="NORMAL",
-                ),
-                dict(
-                    type="PerturbationSensitivityAnalysisHookWithGradients",
-                    checkpoints=grad_corr_checkpoints,
-                    priority="LOW",
-                ),
-            ]
-
         # NOTE: LoveDA doesn't converge very well on default lr; we should reduce it by 1 order mag
         if "loveda" in args.dataset.lower():
             cfg.optimizer.lr *= 0.1
+
+    if args.grad_corr:
+        # Gradient-based augmentation cross-correlation (opt-in, additive). Every
+        # corr_interval iters CollectGradientHook freezes the model and sweeps the
+        # whole clean val set for d loss / d magnitude, then
+        # PerturbationSensitivityAnalysisHookWithGradients correlates that sweep
+        # into R. Both gate on the SAME interval, so they are built from one
+        # variable rather than two that could drift apart.
+        #
+        # Registered for EVERY aug type, not just `ours`. R is a claim about the
+        # augmentation ops themselves, and it needs to be measurable against an
+        # --aug-type=none baseline; nested inside the `ours` branch it never could
+        # be. This pipeline shares no clock and no hook point with the sensitivity
+        # analysis in sensaug/loops.py.
+        #
+        # The priorities are load-bearing, not cosmetic: both hooks act in
+        # after_train_iter, and the correlation hook must see the sweep the
+        # collector just wrote. NORMAL (50) runs before LOW (70).
+        cfg.custom_hooks = (cfg.get("custom_hooks") or []) + [
+            dict(
+                type="CollectGradientHook",
+                interval=corr_interval,
+                sweep_batch_size=1,
+                priority="NORMAL",
+            ),
+            dict(
+                type="PerturbationSensitivityAnalysisHookWithGradients",
+                interval=corr_interval,
+                priority="LOW",
+            ),
+        ]
 
     if args.adamw:
         lr = cfg.optimizer.lr
@@ -419,6 +443,7 @@ if __name__ == "__main__":
     DATA_ROOT_LOOKUP    = _seg["DATA_ROOT_LOOKUP"]
     SUPPORTED_DATASETS  = _seg["SUPPORTED_DATASETS"]
     SUPPORTED_BACKBONES = _seg["SUPPORTED_BACKBONES"]
+    SCHEDULE            = _seg["SCHEDULE"]
 
     parser = argparse.ArgumentParser(description="main")
     parser.add_argument(
@@ -522,7 +547,9 @@ if __name__ == "__main__":
         "--round_interval",
         type=int,
         default=None,
-        help="interval of iterations to re-evaluate perturbation robustness. sa_interval mod round_interval must equal 0.",
+        help="interval of iterations to re-evaluate perturbation robustness (the SA "
+        "pipeline's clock). Overrides schedule.round_interval in the cluster config. "
+        "Defaults to max_iters // 20.",
     )
     parser.add_argument(
         "--descending-MA",
@@ -538,8 +565,17 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="collect differentiable-augmentation loss gradients and log their "
-        "cross-correlation matrix each SA round (registers CollectGradientHook "
-        "and PerturbationSensitivityAnalysisHookWithGradients)",
+        "cross-correlation matrix on its own iteration clock, independent of the "
+        "SA pipeline and of --aug-type (registers CollectGradientHook and "
+        "PerturbationSensitivityAnalysisHookWithGradients)",
+    )
+    parser.add_argument(
+        "--corr-interval",
+        type=int,
+        default=None,
+        help="interval of iterations between gradient sweeps and cross-correlation "
+        "matrix emissions. Overrides schedule.corr_interval in the cluster config. "
+        "Independent of --round_interval. Defaults to max_iters // 4.",
     )
     parser.add_argument(
         "--adamw",

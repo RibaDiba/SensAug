@@ -34,7 +34,7 @@ def test_load_seg_config_keys(config_file):
     result = load_seg_config(config_file)
     assert set(result.keys()) == {
         "MMCONFIG_PATH", "PRIMARY_METRIC", "DATA_ROOT_LOOKUP",
-        "SUPPORTED_DATASETS", "SUPPORTED_BACKBONES",
+        "SUPPORTED_DATASETS", "SUPPORTED_BACKBONES", "SCHEDULE",
     }
 
 
@@ -78,6 +78,44 @@ def test_primary_metric_default(tmp_path):
     p.write_text(yaml.dump(cfg))
     result = load_seg_config(str(p))
     assert result["PRIMARY_METRIC"] == "mIoU"
+
+
+def test_schedule_is_optional(config_file):
+    # SAMPLE_YAML has no `schedule:` block at all -- the older cluster configs do
+    # not, and they must keep loading. train.py falls back to its defaults.
+    result = load_seg_config(config_file)
+    assert result["SCHEDULE"] == {}
+
+
+def test_schedule_with_all_values_null_is_empty_not_none(tmp_path):
+    """`schedule:` with every value left null parses to None, not {} -- so a plain
+    .get default would hand train.py a None to call .get() on."""
+    cfg = {
+        "data_root": "/d",
+        "mmconfig_path": "/m",
+        "datasets": {"cityscapes": "cityscapes"},
+        "supported_backbones": ["pspnet"],
+        "schedule": None,
+    }
+    p = tmp_path / "null_schedule.yaml"
+    p.write_text(yaml.dump(cfg))
+    result = load_seg_config(str(p))
+    assert result["SCHEDULE"] == {}
+
+
+def test_schedule_carries_the_two_clocks(tmp_path):
+    cfg = {
+        "data_root": "/d",
+        "mmconfig_path": "/m",
+        "datasets": {"cityscapes": "cityscapes"},
+        "supported_backbones": ["pspnet"],
+        "schedule": {"round_interval": 4000, "corr_interval": 20000},
+    }
+    p = tmp_path / "schedule.yaml"
+    p.write_text(yaml.dump(cfg))
+    result = load_seg_config(str(p))
+    assert result["SCHEDULE"]["round_interval"] == 4000
+    assert result["SCHEDULE"]["corr_interval"] == 20000
 
 
 def test_missing_required_key_raises(tmp_path):

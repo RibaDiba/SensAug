@@ -75,6 +75,7 @@ def _batch(images):
 def _sweep_hook(tmp_path, batches, names=None, **kwargs):
     """A hook wired to an in-memory probe loader -- `batches` is the list of
     batches the sweep will iterate, standing in for the val dataloader."""
+    kwargs.setdefault("interval", 1)  # irrelevant to tests that call _sweep directly
     hook = CollectGradientHook(**kwargs)
     hook.grad_buffer = {name: [] for name in (names or DIFFERENTIABLE_PERTURBATIONS)}
     hook._probe_loader = batches
@@ -297,7 +298,7 @@ def _exploding_op(images, magnitude):
 def test_non_finite_gradient_raises_probe_error(images):
     model = _TinySegModel()
     model.eval()
-    hook = CollectGradientHook()
+    hook = CollectGradientHook(interval=1)
 
     with pytest.raises(ProbeError):
         hook._grad_for_op(
@@ -349,32 +350,86 @@ def test_transient_failure_skips_only_that_batch(images, tmp_path, monkeypatch):
     )
 
 
-# --- checkpoint gating + logging ---------------------------------------------
+# --- interval gating + logging -----------------------------------------------
 
 
-def test_sweep_only_fires_at_checkpoints(images, tmp_path):
-    """after_val_epoch runs at all 20 SA rounds; the sweep must fire at the 4
-    checkpoints only, or it costs 5x what it should."""
+def test_sweep_fires_on_its_own_clock_not_on_val_epochs(images, tmp_path):
+    """The property this pipeline exists for.
+
+    The sweep used to fire from ``after_val_epoch``, which under --aug-type=ours is
+    called by RobustValLoop itself: the correlation measurement could only happen on
+    an SA round, and for any other aug type it never happened at all. It now runs
+    from ``after_train_iter`` on its own interval, so it is reachable from neither
+    the val loop nor the SA pipeline.
+    """
     model = _TinySegModel()
     model.eval()
-    hook = _sweep_hook(tmp_path, [_batch(images)], checkpoints=(0.5, 1.0))
+    hook = _sweep_hook(tmp_path, [_batch(images)], interval=50)
     runner = _FakeRunner(model, max_iters=100)
 
-    runner.iter = 20  # progress 0.2 -- before the first checkpoint
+    # A val epoch is no longer a trigger, even standing exactly on a firing
+    # iteration: only the base Hook's no-op after_val_epoch runs, and nothing sweeps.
+    runner.iter = 49
     hook.after_val_epoch(runner)
+    assert hook.grad_buffer["lighter_R"] == [], (
+        "a val epoch must not drive the correlation pipeline any more"
+    )
+
+    # runner.iter is the 0-based index of the iteration that JUST finished, so the
+    # 50th iteration is iter=49.
+    runner.iter = 20
+    hook.after_train_iter(runner, batch_idx=20)
     assert hook.grad_buffer["lighter_R"] == []
 
-    runner.iter = 50  # progress 0.5 -- first checkpoint
-    hook.after_val_epoch(runner)
+    runner.iter = 49  # 50th iteration -- first sweep
+    hook.after_train_iter(runner, batch_idx=49)
     assert len(hook.grad_buffer["lighter_R"]) == 1
 
-    runner.iter = 60  # progress 0.6 -- between checkpoints, no sweep
-    hook.after_val_epoch(runner)
+    runner.iter = 60  # between intervals, no sweep
+    hook.after_train_iter(runner, batch_idx=60)
     assert len(hook.grad_buffer["lighter_R"]) == 1
 
-    runner.iter = 100  # progress 1.0 -- final checkpoint
-    hook.after_val_epoch(runner)
+    # The last iteration satisfies BOTH conditions of the gate (100 % 50 == 0, and
+    # it is the final iteration). It must sweep once, not twice.
+    runner.iter = 99
+    hook.after_train_iter(runner, batch_idx=99)
     assert len(hook.grad_buffer["lighter_R"]) == 2
+
+
+def test_final_iteration_always_sweeps(images, tmp_path):
+    """max_iters is rarely a clean multiple of the interval, and the end-of-training
+    R -- the converged model's -- is the one anybody actually reads."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(tmp_path, [_batch(images)], interval=50)
+    runner = _FakeRunner(model, max_iters=120)  # 120 % 50 != 0
+
+    runner.iter = 119  # 120th and last iteration
+    hook.after_train_iter(runner, batch_idx=119)
+    assert len(hook.grad_buffer["lighter_R"]) == 1
+
+
+def test_a_resumed_run_does_not_re_sweep_passed_intervals(images, tmp_path):
+    """The old gate was a `_next_checkpoint` index into a tuple of progress
+    fractions. It was reconstructed at 0 on resume, so a run resumed at 60% re-fired
+    the 25% and 50% sweeps -- against a model state those checkpoints never saw, and
+    overwriting the R they had already produced. A modulo gate holds no state across
+    the restart, so there is nothing left to get wrong.
+    """
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(tmp_path, [_batch(images)], interval=500)
+    runner = _FakeRunner(model, max_iters=1000)
+
+    runner.iter = 600  # a fresh hook on a run resumed past the first interval
+    hook.after_train_iter(runner, batch_idx=600)
+    assert hook.grad_buffer["lighter_R"] == [], (
+        "a resumed run must not re-sweep an interval it already passed"
+    )
+
+    runner.iter = 999  # the next real firing point
+    hook.after_train_iter(runner, batch_idx=999)
+    assert len(hook.grad_buffer["lighter_R"]) == 1
 
 
 def test_sweep_logs_every_batch_per_image(images, tmp_path):

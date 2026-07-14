@@ -1,6 +1,19 @@
 data_root: /projects/PUCHALLA/LLP2024/tumor/data
 mmconfig_path: /projects/PUCHALLA/LLP2024/tumor/sensaug/custom_configs/mmseg
 primary_metric: mIoU
+
+# The two pipelines run on independent clocks. Both are in ITERATIONS; null takes
+# the default. CLI flags (--round_interval, --corr-interval) override these.
+schedule:
+  # The SA pipeline's clock: iters between val/SA rounds (RobustValLoop).
+  # null -> max_iters // 20. The SA *curve* itself is recomputed every 6th round
+  # (hardcoded in sensaug/loops.py), so the effective SA cadence is 6x this.
+  round_interval: null
+  # The correlation pipeline's clock: iters between one gradient sweep of the val
+  # set and the R emission built from it. null -> max_iters // 4. Nothing about
+  # this is tied to the SA clock above.
+  corr_interval: null
+
 datasets:
   cityscapes: cityscapes
 supported_backbones:

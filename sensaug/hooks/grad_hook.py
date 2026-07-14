@@ -11,15 +11,22 @@ a clean batch, applies each differentiable op at a fixed reference magnitude, ru
 a forward pass, and reads ``d loss / d magnitude`` via ``torch.autograd.grad``
 (which never populates model parameter ``.grad``, so training is untouched).
 
-The measurement is a FROZEN FRAME. At each training-progress checkpoint the hook
-pauses on one model state and sweeps the ENTIRE clean val set in a single pass,
-so every column of the resulting (A ops x N images) matrix describes the same
-model. The earlier design streamed one batch every ``probe_interval`` train iters
-and pooled them into a window; that spread a window's columns across hundreds of
-model states and revisited the same images at different states, so R mixed
-augmentation redundancy with convergence drift. The sweep is also *cheaper*: the
-streaming probe re-probed the val shard ~10x over a run, where four sweeps cover
-it four times.
+The measurement is a FROZEN FRAME. Every ``interval`` train iters the hook pauses
+on one model state and sweeps the ENTIRE clean val set in a single pass, so every
+column of the resulting (A ops x N images) matrix describes the same model. The
+earlier design streamed one batch every ``probe_interval`` train iters and pooled
+them into a window; that spread a window's columns across hundreds of model states
+and revisited the same images at different states, so R mixed augmentation
+redundancy with convergence drift. The sweep is also *cheaper*: the streaming probe
+re-probed the val shard ~10x over a run, where four sweeps cover it four times.
+
+The sweep runs from ``after_train_iter`` on its OWN iteration clock, deliberately
+independent of the sensitivity-analysis pipeline in sensaug/loops.py. It used to
+fire from ``after_val_epoch``, which under ``--aug-type=ours`` is called by
+RobustValLoop itself -- so the correlation measurement was nested inside the SA
+measurement, could only happen on an SA round, and did not exist at all for any
+other aug type. They answer different questions and now keep different clocks; R
+can be measured against an ``--aug-type=none`` baseline.
 
 The magnitude is a length-B vector -- one delta PER IMAGE -- so a single batch
 yields one sensitivity number per image per op, not one batch-averaged number per
@@ -52,6 +59,48 @@ from mmengine.hooks import Hook
 from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
 
 
+def iteration_count(runner) -> int:
+    """The 1-based count of training iterations completed at an ``after_train_iter``.
+
+    ``runner.iter`` is the 0-based index of the iteration that just finished --
+    IterBasedTrainLoop increments ``_iter`` AFTER this hook point -- so the count is
+    one more than it. (Same convention as mmengine's ``Hook.every_n_train_iters``.)
+    Off by one here and every sweep lands one iteration away from where the config
+    says it does, which nothing would ever catch.
+    """
+    return runner.iter + 1
+
+
+def training_progress(runner) -> float:
+    """Fraction of training completed, in [0, 1]. Logged as the ``checkpoint`` field
+    of both this pipeline's logs, so the two stay labelled consistently."""
+    max_iters = getattr(runner, "max_iters", 0) or 0
+    return iteration_count(runner) / max_iters if max_iters else 0.0
+
+
+def fires_at(runner, interval: int) -> bool:
+    """Whether the correlation pipeline runs at this iteration.
+
+    ONE definition, imported by both halves of the pipeline (the sweep in this
+    module and the R emission in grad_sens_analysis), because they must fire on the
+    same iteration: the analyser correlates the sweep the collector just took, and a
+    gate that disagreed by one iteration would hand it an empty -- or a stale --
+    buffer.
+
+    The final iteration always fires, so the end-of-training R exists even when
+    ``max_iters`` is not a multiple of ``interval``. The two conditions are ORed
+    into one predicate rather than checked separately, so that final iteration fires
+    exactly once in the common case where it satisfies both.
+
+    The predicate is a pure function of ``runner.iter``, which is identical on every
+    rank. That is what makes the analyser's ``all_gather_object`` safe: no rank can
+    skip an emission that the others take, so the collective cannot deadlock.
+    """
+    iteration = iteration_count(runner)
+    max_iters = getattr(runner, "max_iters", 0) or 0
+    return iteration % interval == 0 or iteration == max_iters
+
+
 class ProbeError(RuntimeError):
     """A gradient probe produced something structurally wrong (bad shape, NaN).
 
@@ -62,19 +111,19 @@ class ProbeError(RuntimeError):
 
 @HOOKS.register_module()
 class CollectGradientHook(Hook):
-    """Sweeps the whole clean val set on a frozen model at each checkpoint,
-    probing ``d loss / d magnitude`` for every differentiable augmentation, and
-    accumulates the per-image gradients into ``runner.aug_grad_buffer``.
+    """Sweeps the whole clean val set on a frozen model every ``interval`` train
+    iters, probing ``d loss / d magnitude`` for every differentiable augmentation,
+    and accumulates the per-image gradients into ``runner.aug_grad_buffer``.
 
     Must run BEFORE PerturbationSensitivityAnalysisHookWithGradients, which
-    consumes the buffer in its own ``after_val_epoch`` and must see the sweep this
-    hook just wrote. Both hooks must be given the SAME ``checkpoints``; register
-    this one at a higher priority (see train.py).
+    consumes the buffer in its own ``after_train_iter`` and must see the sweep this
+    hook just wrote. Both hooks must be given the SAME ``interval``; register this
+    one at a higher priority (see train.py).
 
     Args:
-        checkpoints: Fractions of ``max_iters`` at which to sweep. Must match the
-            correlation hook's ``checkpoints``. Each sweep is one frozen model
-            state, which is what makes R a statement about a single model.
+        interval (int): Train iters between sweeps. Must match the correlation
+            hook's ``interval``. Each sweep is one frozen model state, which is
+            what makes R a statement about a single model.
         sweep_batch_size (int): Images per forward during the sweep. Larger is
             faster (better GPU utilization) but multiplies activation memory --
             the backward reaches the input, and val images are full resolution.
@@ -98,13 +147,15 @@ class CollectGradientHook(Hook):
 
     def __init__(
         self,
-        checkpoints=(0.25, 0.5, 0.75, 1.0),
+        interval: int,
         sweep_batch_size: int = 1,
         ref_magnitude: float = 0.5,
         per_image_delta: bool = True,
         probe_seed: int = 0,
     ) -> None:
-        self.checkpoints = tuple(sorted(checkpoints))
+        if interval < 1:
+            raise ValueError(f"interval must be a positive iteration count, got {interval}")
+        self.interval = interval
         self.sweep_batch_size = sweep_batch_size
         self.ref_magnitude = ref_magnitude
         self.per_image_delta = per_image_delta
@@ -114,7 +165,6 @@ class CollectGradientHook(Hook):
         self.grad_log_path = None
         self._probe_loader = None
         self._pending_records = []
-        self._next_checkpoint = 0
 
     def before_run(self, runner: Runner) -> None:
         # Shared buffer, stashed on the runner so the correlation hook can read
@@ -126,7 +176,7 @@ class CollectGradientHook(Hook):
         self.grad_log_path = os.path.join(runner.cfg.work_dir, "aug_gradient_log.txt")
         if is_main_process():
             # Append when resuming so a resumed run does not throw away the
-            # sweeps the previous run already logged (corr_matrix_log.txt is
+            # sweeps the previous run already logged (corr_matrix_log.json is
             # append-only, and these two need to stay consistent with each other).
             mode = "a" if getattr(runner, "_resume", False) else "w"
             open(self.grad_log_path, mode).close()
@@ -142,18 +192,16 @@ class CollectGradientHook(Hook):
             dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
         )
 
-    def after_val_epoch(self, runner: Runner, metrics=None) -> None:
-        if self._next_checkpoint >= len(self.checkpoints):
+    def after_train_iter(
+        self, runner: Runner, batch_idx: int, data_batch=None, outputs=None
+    ) -> None:
+        if not fires_at(runner, self.interval):
             return
 
-        max_iters = getattr(runner, "max_iters", 0) or 0
-        progress = runner.iter / max_iters if max_iters else 0.0
-        if progress < self.checkpoints[self._next_checkpoint]:
-            return
-
-        checkpoint = self.checkpoints[self._next_checkpoint]
-        self._next_checkpoint += 1
-        self._sweep(runner, checkpoint)
+        # A safe point to probe: train_step already ran backward + step + zero_grad
+        # through the OptimWrapper, so there is no pending gradient for the probe to
+        # clobber -- and torch.autograd.grad populates no parameter .grad anyway.
+        self._sweep(runner, training_progress(runner))
 
     def after_run(self, runner: Runner) -> None:
         if is_main_process():

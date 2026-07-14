@@ -297,7 +297,7 @@ def test_jsonable_writes_nan_as_null():
     assert json.loads(text)["n"] == 4
 
 
-# --- checkpoint bucketing ----------------------------------------------------
+# --- interval gating ----------------------------------------------------------
 
 
 class _FakeRunner:
@@ -309,7 +309,10 @@ class _FakeRunner:
 
 
 def _hook(**kwargs):
-    kwargs.setdefault("checkpoints", (0.5, 1.0))
+    # interval=500 against max_iters=1000 fires at iter 499 and 999 -- runner.iter is
+    # the 0-based index of the iteration that just finished, so those are the 500th
+    # and 1000th, i.e. 50% and 100% through.
+    kwargs.setdefault("interval", 500)
     kwargs.setdefault("bootstrap", False)
     kwargs.setdefault("n_min", 8)
     return PerturbationSensitivityAnalysisHookWithGradients(**kwargs)
@@ -322,30 +325,109 @@ def _fill(buffer, n_probes, batch=4, seed=0):
             buffer[name].append(rng.normal(size=batch))
 
 
-def test_r_is_emitted_only_when_a_checkpoint_is_crossed(tmp_path):
+def test_r_is_emitted_only_when_the_interval_fires(tmp_path):
     buffer = {name: [] for name in NAMES}
     runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
     hook = _hook()
 
-    # 40% through: window still open, nothing emitted, nothing thrown away.
+    # Mid-interval: window still open, nothing emitted, nothing thrown away.
     _fill(buffer, n_probes=3)
     runner.iter = 400
-    hook.after_val_epoch(runner)
-    assert not (tmp_path / "corr_matrix_log.txt").exists()
+    hook.after_train_iter(runner, batch_idx=400)
+    assert not (tmp_path / "corr_matrix_log.json").exists()
     assert len(buffer[NAMES[0]]) == 3, "buffer must keep accumulating mid-window"
 
-    # crossing 50%: emit, then clear so the next window is one model state
+    # The 500th iteration: emit, then clear so the next window is one model state.
     _fill(buffer, n_probes=3, seed=1)
-    runner.iter = 500
-    hook.after_val_epoch(runner)
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
 
-    records = (tmp_path / "corr_matrix_log.txt").read_text().strip().splitlines()
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
     assert len(records) == 1
-    record = json.loads(records[0])
+    record = records[0]
     assert record["checkpoint"] == 0.5
     assert record["n_images"] == 24  # 6 probes x 4 images
     assert record["n_probes"] == 6
-    assert len(buffer[NAMES[0]]) == 0, "window must be cleared at a checkpoint"
+    assert len(buffer[NAMES[0]]) == 0, "window must be cleared at an emission"
+
+
+def test_r_is_not_emitted_by_a_val_epoch(tmp_path):
+    """The property this pipeline exists for.
+
+    R used to be emitted from ``after_val_epoch``, which under --aug-type=ours is
+    called by RobustValLoop itself -- so the correlation matrix was computed inside
+    the SA pipeline's val epoch and could only appear on an SA round. The two
+    measure different things and now keep separate clocks: a val epoch, even one
+    landing exactly on a firing iteration, must produce nothing.
+    """
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    hook = _hook()
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 499  # a firing iteration for after_train_iter
+
+    hook.after_val_epoch(runner)
+    assert not (tmp_path / "corr_matrix_log.json").exists(), (
+        "the SA pipeline's val epoch must not drive R any more"
+    )
+    assert len(buffer[NAMES[0]]) == 6, "and it must not consume the window either"
+
+    # The pipeline's own clock still works, from the same state.
+    hook.after_train_iter(runner, batch_idx=499)
+    assert (tmp_path / "corr_matrix_log.json").exists()
+
+
+def test_both_halves_of_the_pipeline_share_one_clock(tmp_path):
+    """The collector sweeps and the analyser correlates THAT sweep, at the same hook
+    point on the same iteration. If the two gates ever disagreed by even one
+    iteration, the analyser would drain an empty buffer (or, worse, a stale one) and
+    nothing in the output would look wrong. They are literally the same predicate --
+    this is what pins that down.
+    """
+    from sensaug.hooks.grad_hook import CollectGradientHook, fires_at
+
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    collector = CollectGradientHook(interval=300)
+    analyser = _hook(interval=300)
+
+    fired = []
+    for iteration in range(1000):
+        runner.iter = iteration
+        fired.append(
+            (
+                fires_at(runner, collector.interval),
+                fires_at(runner, analyser.interval),
+            )
+        )
+
+    assert all(sweeps == emits for sweeps, emits in fired), (
+        "the sweep and the emission must fire on exactly the same iterations"
+    )
+    # 300, 600, 900 -- plus the last iteration, which always fires so that the
+    # converged model's R exists even though 1000 % 300 != 0.
+    assert [i for i, (sweeps, _) in enumerate(fired) if sweeps] == [299, 599, 899, 999]
+
+
+def test_a_resumed_run_does_not_re_emit_passed_intervals(tmp_path):
+    """The old gate was a `_next_checkpoint` index into a tuple of progress
+    fractions, rebuilt at 0 on resume -- so a run resumed at 60% re-emitted the 25%
+    and 50% R from a model state those checkpoints never saw. A modulo gate keeps no
+    state across the restart."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    hook = _hook()
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 600  # a fresh hook on a run resumed past the first interval
+    hook.after_train_iter(runner, batch_idx=600)
+    assert not (tmp_path / "corr_matrix_log.json").exists()
+
+    runner.iter = 999  # the next real firing point
+    hook.after_train_iter(runner, batch_idx=999)
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["checkpoint"] == 1.0
 
 
 def test_window_below_n_min_is_skipped_and_discarded(tmp_path):
@@ -358,10 +440,10 @@ def test_window_below_n_min_is_skipped_and_discarded(tmp_path):
     hook = _hook(n_min=100)
 
     _fill(buffer, n_probes=2)  # 8 images, well under n_min
-    runner.iter = 500
-    hook.after_val_epoch(runner)
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
 
-    assert not (tmp_path / "corr_matrix_log.txt").exists()
+    assert not (tmp_path / "corr_matrix_log.json").exists()
     assert len(buffer[NAMES[0]]) == 0, "an undersized window is discarded, not carried"
 
 
@@ -371,10 +453,10 @@ def test_record_carries_both_matrices_and_the_confound_diagnostic(tmp_path):
     hook = _hook(normalize_per_image=True)
 
     _fill(buffer, n_probes=6)
-    runner.iter = 500
-    hook.after_val_epoch(runner)
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
 
-    record = json.loads((tmp_path / "corr_matrix_log.txt").read_text().strip())
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
     assert record["names"] == NAMES
     assert np.array(record["R_raw"], dtype=float).shape == (N_OPS, N_OPS)
     assert np.array(record["R_scalenorm"], dtype=float).shape == (N_OPS, N_OPS)
@@ -389,8 +471,8 @@ def test_bootstrap_detail_goes_to_its_own_file(tmp_path):
     hook = _hook(bootstrap=True, bootstrap_reps=50)
 
     _fill(buffer, n_probes=8)
-    runner.iter = 500
-    hook.after_val_epoch(runner)
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
 
     record = json.loads((tmp_path / "corr_bootstrap_log.txt").read_text().strip())
     assert record["cluster_level"] == "probe"
@@ -398,4 +480,54 @@ def test_bootstrap_detail_goes_to_its_own_file(tmp_path):
     cell = record["cells"][0]
     assert {"i", "j", "r", "ci_lo", "ci_hi", "ci_width", "p", "q", "survives_fdr"} <= set(cell)
     # R itself stays in the other file, ungarbled by all of this
-    assert "R_raw" in json.loads((tmp_path / "corr_matrix_log.txt").read_text().strip())
+    (r_record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert "R_raw" in r_record
+
+
+# --- the json envelope -------------------------------------------------------
+
+
+def test_corr_json_accumulates_emissions_as_one_array(tmp_path):
+    """Each emission rewrites the whole file, so the earlier ones have to survive the
+    rewrite -- the append-only JSONL this replaces got that for free."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    hook = _hook()  # interval=500 -> fires at iter 499 and 999
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    _fill(buffer, n_probes=6, seed=1)
+    runner.iter = 999
+    hook.after_train_iter(runner, batch_idx=999)
+
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert [record["checkpoint"] for record in records] == [0.5, 1.0]
+
+
+def test_a_dropped_op_survives_the_json_round_trip_as_null(tmp_path):
+    """A dropped op's row and column of R are NaN, and json.dump writes a bare
+    `NaN` token for those -- not valid JSON. _jsonable maps them to null, and the
+    writer passes allow_nan=False so that a value which slipped past _jsonable
+    fails the write instead of quietly emitting a file that only looks like JSON.
+    Nothing else in this module exercises a NaN, so this is the test holding that
+    contract down."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    hook = _hook()
+
+    _fill(buffer, n_probes=6)
+    # Flatten one op's sensitivity to a constant: zero variance, so correlate()
+    # drops it rather than dividing by a zero std.
+    flat = NAMES[0]
+    buffer[flat] = [np.zeros_like(probe) for probe in buffer[flat]]
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["dropped"] == [flat]
+    assert record["R_raw"][0] == [None] * N_OPS, "the dropped row must be null, not NaN"
+    assert all(row[0] is None for row in record["R_raw"])
+    assert record["R_raw"][1][1] == 1.0, "a kept op still has a real diagonal"
