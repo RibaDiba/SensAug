@@ -17,13 +17,23 @@ The rows also carry a shared per-image scale factor -- hard images have a large
 gradient for EVERY op, and mmseg's ignore_index weighting adds a per-image
 valid-pixel factor on top. Pearson is invariant to a global scale but not to a
 per-column one, so that factor would re-inflate R just as convergence drift did.
-It is divided out (``normalize_per_image``), and its per-op loadings are logged
-every checkpoint so you can see how much of R it was accounting for.
+It is divided out (``normalize_per_image``), and its per-op loadings are logged at
+every emission so you can see how much of R it was accounting for.
 
-R is emitted at training-progress checkpoints from the observations collected
-since the previous checkpoint, never pooled across them: a warmup window and a
-converged window describe different models, and pooling groups with different
-underlying structure manufactures trends neither group has (Simpson's paradox).
+R is emitted every ``interval`` train iters from the observations collected since
+the previous emission, never pooled across them: a warmup window and a converged
+window describe different models, and pooling groups with different underlying
+structure manufactures trends neither group has (Simpson's paradox).
+
+That ``interval`` is the correlation pipeline's OWN clock, shared with
+CollectGradientHook and with nothing else. Both hooks used to fire from
+``after_val_epoch``, which under ``--aug-type=ours`` is called by RobustValLoop
+itself, so R was computed inside the sensitivity-analysis pipeline's val epoch and
+could only be emitted on an SA round. The two measure different things -- SA asks
+which perturbations the model is worst at, R asks which perturbations are
+redundant with each other -- so they now keep separate clocks and neither is
+reachable from the other. See sensaug/loops.py for the SA pipeline, which this
+module deliberately does not touch.
 
 Scope: R covers the differentiable ops only. Pruning based on R is future work --
 ``prune_augmentations`` is a stub, pending sign-off on what "redundant" is allowed
@@ -38,6 +48,9 @@ import warnings
 import numpy as np
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from mmengine.runner import Runner
 from mmengine.logging import print_log
@@ -47,6 +60,7 @@ from mmengine.hooks import Hook
 
 # Local imports
 from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+from sensaug.hooks.grad_hook import fires_at, training_progress
 
 # A row whose sensitivity never varies across the window carries no correlation
 # signal; np.corrcoef would divide by its zero std and emit a silent NaN row.
@@ -271,6 +285,24 @@ def _jsonable(value):
     return value
 
 
+def _write_json_atomic(path, obj):
+    """Rewrite `path` as one JSON document, via a temp file + os.replace.
+
+    A whole-file rewrite can be interrupted halfway and leave a truncated file
+    behind, where the append it replaced could not. os.replace is atomic, so a
+    crash mid-write leaves the previous checkpoint's file fully intact rather than
+    corrupting every checkpoint written so far.
+
+    allow_nan=False so a value that skipped _jsonable raises here instead of
+    writing a bare `NaN` token, which json.dump emits happily and which is not
+    valid JSON (jq and pandas both reject it).
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, allow_nan=False)
+    os.replace(tmp, path)
+
+
 @HOOKS.register_module()
 class PerturbationSensitivityAnalysisHookWithGradients(Hook):
     """Builds and logs the augmentation gradient cross-correlation matrix R.
@@ -279,9 +311,10 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
     effect unless that hook is also registered.
 
     Args:
-        checkpoints: Fractions of ``max_iters`` at which to emit R. Each R uses
-            only the probes collected since the previous checkpoint -- windows are
-            never pooled across checkpoints, because a warmup model and a
+        interval (int): Train iters between emissions of R. Must match
+            CollectGradientHook's ``interval`` -- the two are one pipeline on one
+            clock. Each R uses only the probes collected since the previous
+            emission; windows are never pooled, because a warmup model and a
             converged model are different measurement instruments.
         n_min (int): Minimum images in a window before R is computed at all. At
             n=100 the correlation standard error is ~1/sqrt(n-3) ~ 0.10. The old
@@ -297,7 +330,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
 
     def __init__(
         self,
-        checkpoints=(0.25, 0.5, 0.75, 1.0),
+        interval: int,
         n_min: int = 100,
         normalize_per_image: bool = True,
         bootstrap: bool = True,
@@ -306,7 +339,9 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         fdr_alpha: float = 0.05,
         gather_ranks: bool = True,
     ) -> None:
-        self.checkpoints = tuple(sorted(checkpoints))
+        if interval < 1:
+            raise ValueError(f"interval must be a positive iteration count, got {interval}")
+        self.interval = interval
         self.n_min = n_min
         self.normalize_per_image = normalize_per_image
         self.bootstrap = bootstrap
@@ -318,23 +353,23 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         self.corr_log_path = None
         self.bootstrap_log_path = None
         self.names = list(DIFFERENTIABLE_PERTURBATIONS)
-        self._next_checkpoint = 0
 
-    def after_val_epoch(self, runner: Runner, metrics=None) -> None:
+    def after_train_iter(
+        self, runner: Runner, batch_idx: int, data_batch=None, outputs=None
+    ) -> None:
         buffer = getattr(runner, "aug_grad_buffer", None)
         if buffer is None:
             return
 
-        if self._next_checkpoint >= len(self.checkpoints):
-            return
-
-        max_iters = getattr(runner, "max_iters", 0) or 0
-        progress = runner.iter / max_iters if max_iters else 0.0
-        if progress < self.checkpoints[self._next_checkpoint]:
+        # The SAME gate as CollectGradientHook -- literally the same function -- at
+        # the same hook point. The collector runs first (its NORMAL priority beats
+        # this hook's LOW), so by the time we get here the buffer holds exactly the
+        # sweep it just took: one frozen model state, which is the whole claim R
+        # rests on.
+        if not fires_at(runner, self.interval):
             return  # window still open -- keep accumulating
 
-        checkpoint = self.checkpoints[self._next_checkpoint]
-        self._next_checkpoint += 1
+        checkpoint = training_progress(runner)
 
         # Gather before rank 0 builds R: each rank probed a different shard.
         window = buffer
@@ -345,15 +380,15 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             self._emit(runner, checkpoint, window)
 
         # Clear on EVERY rank (not just rank 0, or the other ranks' buffers grow
-        # without bound), and only at a checkpoint (so a window is one model
-        # state, not a smear across several).
+        # without bound), and only at an emission (so a window is one model state,
+        # not a smear across several).
         for name in buffer:
             buffer[name].clear()
 
     def _emit(self, runner: Runner, checkpoint: float, buffer: dict) -> None:
         if self.corr_log_path is None:
             work_dir = runner.cfg.work_dir
-            self.corr_log_path = os.path.join(work_dir, "corr_matrix_log.txt")
+            self.corr_log_path = os.path.join(work_dir, "corr_matrix_log.json")
             self.bootstrap_log_path = os.path.join(work_dir, "corr_bootstrap_log.txt")
 
         d_grad, probe_ids = stack_probe_buffer(buffer, self.names)
@@ -394,8 +429,16 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             "dropped": dropped_names,
             "shared_factor_loadings": loadings,
         }
-        with open(self.corr_log_path, "a") as f:
-            f.write(json.dumps(_jsonable(record)) + "\n")
+        # Read-modify-write, so the file stays ONE json array across a run's
+        # checkpoints (and across a resume, matching the append-only gradient log
+        # -- see grad_hook.before_run). The array is at most one record per
+        # checkpoint, so rewriting it whole costs nothing.
+        records = []
+        if os.path.exists(self.corr_log_path):
+            with open(self.corr_log_path) as f:
+                records = json.load(f)
+        records.append(_jsonable(record))
+        _write_json_atomic(self.corr_log_path, records)
 
         n_survivors = n_cells = None
         if self.bootstrap:
@@ -414,6 +457,17 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             summary += f" fdr_survivors={n_survivors}/{n_cells}"
         print_log(summary, logger="current")
 
+        self._log_to_tensorboard(
+            runner,
+            step=int(runner.iter),
+            d_grad=d_grad,
+            r_primary=r_primary,
+            loadings=loadings,
+            n_images=n_images,
+            n_survivors=n_survivors,
+            n_cells=n_cells,
+        )
+
         if np.isfinite(max_loading) and max_loading > _LOADING_ALARM:
             print_log(
                 f"[grad-corr] every op loads >{_LOADING_ALARM} on the shared "
@@ -427,7 +481,10 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
 
     def _emit_bootstrap(self, checkpoint, d_grad, probe_ids, dropped):
         """Per-cell CIs + BH-FDR, written to their own file -- 91 cells x several
-        fields per checkpoint would bury R if inlined into corr_matrix_log."""
+        fields per checkpoint would bury R if inlined into corr_matrix_log.json.
+
+        Stays append-only JSONL, unlike corr_matrix_log.json: it is the bulky one,
+        and nothing needs to load it as a single document."""
         keep = np.setdiff1d(np.arange(len(self.names)), dropped)
         if keep.size < 2:
             return 0, 0
@@ -479,6 +536,109 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
 
         upper = np.triu_indices(keep.size, k=1)
         return int(survives[upper].sum()), int(upper[0].size)
+
+    def _log_to_tensorboard(
+        self,
+        runner,
+        step: int,
+        d_grad: np.ndarray,
+        r_primary: np.ndarray,
+        loadings: np.ndarray,
+        n_images: int,
+        n_survivors,
+        n_cells,
+    ) -> None:
+        """Write cross-correlation summary data to TensorBoard.
+
+        Uses mmengine's runner.visualizer, which routes to the
+        TensorboardVisBackend configured in train.py.  All tags live under
+        the ``grad_corr/`` prefix so they form their own section in the
+        TensorBoard UI and do not collide with training or SA metrics.
+        """
+        vis = runner.visualizer
+
+        # --- per-op scalar summaries ---
+        mean_sens = np.abs(d_grad).mean(axis=1)  # (A,)
+        for i, name in enumerate(self.names):
+            tag = name.replace("_", "")
+            vis.add_scalar(
+                f"grad_corr/mean_sensitivity/{tag}", float(mean_sens[i]), step
+            )
+            if np.isfinite(loadings[i]):
+                vis.add_scalar(
+                    f"grad_corr/shared_loading/{tag}", float(loadings[i]), step
+                )
+
+        # --- aggregate scalars ---
+        max_loading = (
+            float(np.nanmax(np.abs(loadings)))
+            if np.isfinite(loadings).any()
+            else 0.0
+        )
+        vis.add_scalar("grad_corr/max_shared_loading", max_loading, step)
+        vis.add_scalar("grad_corr/n_images", n_images, step)
+        if n_survivors is not None and n_cells is not None:
+            vis.add_scalar("grad_corr/fdr_survivors", n_survivors, step)
+            vis.add_scalar("grad_corr/fdr_total_cells", n_cells, step)
+
+        # --- top correlated pairs (off-diagonal of primary R) ---
+        n_ops = r_primary.shape[0]
+        pairs = []
+        for a in range(n_ops):
+            for b in range(a + 1, n_ops):
+                val = r_primary[a, b]
+                if np.isfinite(val):
+                    pairs.append((abs(val), val, a, b))
+        pairs.sort(reverse=True)
+        for _rank, (_, val, a, b) in enumerate(pairs[:5]):
+            tag_a = self.names[a].replace("_", "")
+            tag_b = self.names[b].replace("_", "")
+            vis.add_scalar(
+                f"grad_corr/top_pair/{tag_a}_vs_{tag_b}", float(val), step
+            )
+
+        # --- R heatmap as an image ---
+        self._log_r_heatmap(vis, step, r_primary)
+
+    def _log_r_heatmap(self, vis, step: int, r: np.ndarray) -> None:
+        """Render R as a matplotlib heatmap and log it as a TensorBoard image."""
+        short_names = [
+            n.replace("Transform", "").replace("_", "") for n in self.names
+        ]
+        n = len(short_names)
+
+        fig, ax = plt.subplots(figsize=(max(6, n * 0.6), max(5, n * 0.5)))
+        # Mask NaN for display
+        r_display = np.where(np.isfinite(r), r, 0.0)
+        im = ax.imshow(r_display, cmap="RdBu_r", vmin=-1, vmax=1, aspect="equal")
+
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(short_names, rotation=45, ha="right", fontsize=7)
+        ax.set_yticklabels(short_names, fontsize=7)
+
+        # Annotate cells
+        for i in range(n):
+            for j in range(n):
+                val = r[i, j]
+                if np.isfinite(val):
+                    ax.text(
+                        j, i, f"{val:.2f}",
+                        ha="center", va="center", fontsize=6,
+                        color="white" if abs(val) > 0.5 else "black",
+                    )
+
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title("Augmentation Gradient Cross-Correlation (R)", fontsize=9)
+        fig.tight_layout()
+
+        # Render to numpy array (H, W, 3)
+        fig.canvas.draw()
+        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        plt.close(fig)
+
+        vis.add_image("grad_corr/R_matrix", img, step, dataformats="HWC")
 
     def calculate_cross_corelation(self, d_grad: np.ndarray):
         """Pearson cross-correlation across the augmentation rows of D_grad.
