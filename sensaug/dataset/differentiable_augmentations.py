@@ -25,6 +25,7 @@ This is intentionally a DIFFERENT convention from sensaug.dataset.augmentations
 import math
 from typing import Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import kornia.color
@@ -50,6 +51,8 @@ __all__ = [
     "gaussian_noise",
     "DiffAugment",
     "DIFFERENTIABLE_PERTURBATIONS",
+    "img_to_rgb01",
+    "rgb01_to_img",
     "R",
     "G",
     "B",
@@ -317,3 +320,35 @@ DIFFERENTIABLE_PERTURBATIONS = {
     "blur": lambda images, magnitude: blur(images, sigma=magnitude),
     "noise": lambda images, magnitude: gaussian_noise(images, delta=magnitude),
 }
+
+
+# --- mmseg image <-> tensor conversion ---------------------------------------
+#
+# Used by the pipeline wrappers in sensaug.dataset.augmentations, which is where
+# the registered transform classes and the DIFF_PERTURBATIONS registry live --
+# NOT here. This module stays free of any mmcv/mmseg dependency so the ops and
+# their gradients remain testable without the OpenMMLab stack installed. Only
+# the conversion math lives here, so that it is testable on the same terms.
+
+
+def img_to_rgb01(img: np.ndarray) -> Tensor:
+    """mmseg's HWC uint8 BGR image -> this module's (1, 3, H, W) float32 RGB [0, 1].
+
+    Mirrors what the gradient probe reconstructs in grad_hook._probe_batch (which
+    de-normalizes the data preprocessor's output back to RGB [0, 1]), so the SA
+    pipeline and the probe hand the ops the same tensor for the same image.
+    """
+    rgb = np.ascontiguousarray(img[..., ::-1])  # BGR -> RGB
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(torch.float32)
+    return tensor / 255.0
+
+
+def rgb01_to_img(tensor: Tensor) -> np.ndarray:
+    """Inverse of img_to_rgb01.
+
+    Rounds rather than truncates: `.to(torch.uint8)` truncates, which would bias
+    every channel down by up to one level and make magnitude=0 a visible darkening
+    rather than the exact no-op it must be.
+    """
+    rgb = (tensor.squeeze(0).permute(1, 2, 0) * 255.0).round().clamp(0.0, 255.0)
+    return np.ascontiguousarray(rgb.to(torch.uint8).numpy()[..., ::-1])  # -> BGR

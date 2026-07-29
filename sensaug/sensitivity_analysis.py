@@ -45,7 +45,32 @@ MASKS = "gtFine/val"
 BASE_DATASET = "leftImg8bit/val"
 
 
-def adaptive_sensitivity_analysis_new(cfg, runner, num_levels, tolerance):
+def adaptive_sensitivity_analysis_diff(cfg, runner, num_levels, tolerance):
+    """SA over the DIFFERENTIABLE ops -- the vocabulary the gradient
+    cross-correlation pipeline measures.
+
+    Exists so the SA curve and the matrix R are keyed by the same augmentations.
+    They previously were not: SA ran over NEW_PERTURBATIONS (Brightness/Color/
+    Shear/...) while the probe differentiated DIFFERENTIABLE_PERTURBATIONS
+    (lighter_R/blur/noise/...), two vocabularies with ZERO overlap, so no SA
+    magnitude could ever be looked up for an op R covered.
+
+    Deliberately reuses the "_new" adaptive machinery rather than the legacy
+    `adaptive_sensitivity_analysis`, even though that one iterates the same 14
+    names: the legacy path's levels are in raw units (blur = kernel size in
+    [0, 49], noise = sigma in [0, 50]) which would each need rescaling into the
+    probe's [0, 1], and it hard-requires metrics["kid"]. Here min/max level are
+    already 0.0/1.0 -- the probe's own magnitude units -- and calculate_miou_kid_new
+    tolerates a missing KID.
+    """
+    return adaptive_sensitivity_analysis_new(
+        cfg, runner, num_levels, tolerance, perturbation_set="diff"
+    )
+
+
+def adaptive_sensitivity_analysis_new(
+    cfg, runner, num_levels, tolerance, perturbation_set="new"
+):
     predictor = pchip_interpolator
     perturbation_levels: Dict[str, List[float]] = {}
     apply_perturbations_dataloader(runner, train=False, perturb_levels={})
@@ -56,13 +81,18 @@ def adaptive_sensitivity_analysis_new(cfg, runner, num_levels, tolerance):
     min_level = 0.0
     max_level = 1.0
 
-    perturbation_list = NEW_PERTURBATIONS.items()
+    if perturbation_set == "diff":
+        # Every differentiable op is photometric, so the geometric/photometric
+        # filters below do not apply to this vocabulary.
+        perturbation_list = DIFF_PERTURBATIONS.items()
+    else:
+        perturbation_list = NEW_PERTURBATIONS.items()
 
-    if hasattr(cfg, "geometric_only"):
-        perturbation_list = NEW_PERTURBATIONS_GEOMETRIC.items()
+        if hasattr(cfg, "geometric_only"):
+            perturbation_list = NEW_PERTURBATIONS_GEOMETRIC.items()
 
-    if hasattr(cfg, "photometric_only"):
-        perturbation_list = NEW_PERTURBATIONS_PHOTOMETRIC.items()
+        if hasattr(cfg, "photometric_only"):
+            perturbation_list = NEW_PERTURBATIONS_PHOTOMETRIC.items()
 
     verify_perturbation_effective(runner, next(iter(perturbation_list))[0], max_level)
 

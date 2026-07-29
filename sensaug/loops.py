@@ -21,6 +21,7 @@ from torchmetrics.image.kid import KernelInceptionDistance
 # from sensaug.dataset.augmentations import *
 from sensaug.sensitivity_analysis import *
 from sensaug.runner_utils import *
+from sensaug.corr_magnitudes import conditional_levels, modal_magnitude
 
 
 def dict_mean(dict_list):
@@ -397,6 +398,7 @@ class RobustValLoop(ValLoop):
         geometric_only: bool = False,
         photometric_only: bool = False,
         weighted_augs: bool = False,
+        perturbation_set: str = "new",
         fp16: bool = False,
     ) -> None:
         super().__init__(runner, dataloader, evaluator, fp16)
@@ -424,6 +426,16 @@ class RobustValLoop(ValLoop):
         self.photometric_only = photometric_only
         self.weighted_augs = weighted_augs
 
+        # Which augmentation vocabulary SA measures. "new" is the historical
+        # NEW_PERTURBATIONS set; "diff" is the differentiable ops the gradient
+        # cross-correlation pipeline differentiates, so that the SA curve and the
+        # matrix R are keyed by the SAME augmentations (they previously shared no
+        # names at all, so no SA magnitude could be looked up for any op in R).
+        self.perturbation_set = perturbation_set
+        self.corr_magnitudes_path = os.path.join(
+            runner.cfg.work_dir, "corr_magnitudes.json"
+        )
+
         with open(sa_curve_path, "r") as f:
             sa_curve_str = f.read()
             self.eval_sa_curve = json.loads(sa_curve_str)
@@ -449,7 +461,11 @@ class RobustValLoop(ValLoop):
         print_log("Running sensitivity analysis...", logger="current")
         val_dataloader_cfg = deepcopy(self.runner.cfg.val_dataloader)
         self.sa_curve = adaptive_sensitivity_analysis_new(
-            val_dataloader_cfg, self.runner, num_levels=5, tolerance=0.05
+            val_dataloader_cfg,
+            self.runner,
+            num_levels=5,
+            tolerance=0.05,
+            perturbation_set=self.perturbation_set,
         )
 
         assert self.sa_curve is not None, "SA curve is None after broadcasting"
@@ -531,14 +547,95 @@ class RobustValLoop(ValLoop):
 
         return miou_record, final_metrics
 
+    def publish_corr_magnitudes(self):
+        """Hand this round's per-op magnitude distributions to the gradient
+        cross-correlation probe.
+
+        Only meaningful for the "diff" vocabulary: the probe differentiates
+        DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by NEW_PERTURBATIONS
+        names would match nothing and every op would silently fall back to the
+        fixed reference magnitude. Skipped outright rather than published-and-
+        ignored, so `runner.corr_magnitudes` is never a misleading non-empty dict.
+
+        Published onto the runner (the same handoff channel CollectGradientHook
+        already uses for `runner.aug_grad_buffer`) rather than pushed: the probe
+        fires on its own clock and simply reads whatever is current, which is what
+        makes "use the latest distribution" work when it fires less often than
+        this loop.
+
+        Rank-consistency: every rank runs this loop and mmengine all-reduces the
+        evaluator metrics that produce the pdf, so all ranks derive the same
+        snapshot. Only rank 0 writes the file.
+        """
+        if self.perturbation_set != "diff" or not self.pdf_dict:
+            return
+
+        snapshot = conditional_levels(  # noqa: F405
+            self.pdf_dict, op_names=set(DIFFERENTIABLE_PERTURBATIONS)  # noqa: F405
+        )
+        self.runner.corr_magnitudes = snapshot
+
+        if not is_main_process():
+            return
+
+        record = {
+            "iter": int(self.runner.iter),
+            "round": int(self.n_rounds),
+            "perturbation_set": self.perturbation_set,
+            # The modal level is recorded because it is the probe's default
+            # magnitude; the full distribution is recorded because the sampled
+            # modes need it and because R must be recomputable offline.
+            "magnitudes": {
+                op: dict(entry, mode=modal_magnitude(entry))  # noqa: F405
+                for op, entry in snapshot.items()
+            },
+        }
+        records = []
+        if os.path.exists(self.corr_magnitudes_path):
+            with open(self.corr_magnitudes_path) as f:
+                records = json.load(f)
+        records.append(record)
+        # Whole-file rewrite via a temp file: a plain truncate+write interrupted
+        # midway would destroy every previous round's snapshot, not just this one.
+        tmp = self.corr_magnitudes_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(records, f, indent=2, allow_nan=False)
+        os.replace(tmp, self.corr_magnitudes_path)
+
+        print_log(
+            f"[corr-magnitudes] round {self.n_rounds} (iter {self.runner.iter}): "
+            f"published {len(snapshot)} ops, modal magnitudes "
+            + ", ".join(
+                f"{op}={modal_magnitude(entry):.3f}"  # noqa: F405
+                for op, entry in sorted(snapshot.items())
+            ),
+            logger="current",
+        )
+
+    def _remove_H_perturbations(self, miou_record):
+        """Drop the color/photometric ops from the training pdf (`--no-inv-aug`).
+
+        The op names are vocabulary-specific. For "new" this is Posterize/Solarize,
+        as it has always been. For "diff" those names do not exist, so it is the
+        hue ops themselves -- which is also what the flag's name (remove_H) says.
+        Popping nothing at all would silently ignore --no-inv-aug for the whole
+        diff vocabulary.
+        """
+        if not self.remove_H:
+            return
+        names = (
+            ("lighter_H", "darker_H")
+            if self.perturbation_set == "diff"
+            else ("PosterizeTransform", "SolarizeTransform")
+        )
+        for name in names:
+            miou_record.pop(name, None)
+
     def generate_uniform_pdf(self):
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
-        # remove H perturbations from training
-        if self.remove_H:
-            miou_record.pop("PosterizeTransform", None)
-            miou_record.pop("SolarizeTransform", None)
+        self._remove_H_perturbations(miou_record)
 
         # process miou_record into a probability density function
         pdf_dict = {}
@@ -563,10 +660,7 @@ class RobustValLoop(ValLoop):
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
-        # remove H perturbations from training
-        if self.remove_H:
-            miou_record.pop("PosterizeTransform", None)
-            miou_record.pop("SolarizeTransform", None)
+        self._remove_H_perturbations(miou_record)
 
         # process miou_record into a probability density function
         pdf_dict = {}
@@ -609,10 +703,7 @@ class RobustValLoop(ValLoop):
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
-        # remove H perturbations from training
-        if self.remove_H:
-            miou_record.pop("PosterizeTransform", None)
-            miou_record.pop("SolarizeTransform", None)
+        self._remove_H_perturbations(miou_record)
 
         # process miou_record into a probability density function
         pdf_dict = {}
@@ -701,6 +792,7 @@ class RobustValLoop(ValLoop):
                     self.runner,
                     geometric_only=self.geometric_only,
                     photometric_only=self.photometric_only,
+                    perturbation_set=self.perturbation_set,
                 )
 
             else:
@@ -717,8 +809,11 @@ class RobustValLoop(ValLoop):
                             else self.generate_pdf_new()
                         )
                     )  # update pdf to sample from
+                    self.publish_corr_magnitudes()
                     apply_random_perturbations_train_dataloader_new(  # noqa: F405
-                        self.runner, pdf_dict=self.pdf_dict
+                        self.runner,
+                        pdf_dict=self.pdf_dict,
+                        perturbation_set=self.perturbation_set,
                     )  # type: ignore
 
         # full clean evaluation last

@@ -20,6 +20,16 @@ def _perturbation_transform_cfg(p_type, value):
         )
     if p_type in NEW_PERTURBATIONS.keys():  # noqa: F405
         return p_type, dict(type=p_type, magnitude=value)
+    if p_type in DIFF_PERTURBATIONS.keys():  # noqa: F405
+        # Unlike NEW_PERTURBATIONS, the key is NOT the registered type name here
+        # (`lighter_R` -> `DiffLighterR`), so the class name has to be read off the
+        # registry rather than reused. Returning the key would register a transform
+        # that does not exist and trip _assert_transforms_present, which compares
+        # against `t.__class__.__name__`.
+        transform_cls, _ = DIFF_PERTURBATIONS[p_type]  # noqa: F405
+        return transform_cls.__name__, dict(
+            type=transform_cls.__name__, magnitude=value
+        )
     if p_type == "combination":
         return "CombinationPerturbation", dict(
             type="CombinationPerturbation", choice=value
@@ -239,7 +249,9 @@ def apply_perturbations_dataloader(
         _rebuild_loader(runner, loop, dataloader_cfg, inserted, tag)
 
 
-def apply_random_perturbations_train_dataloader_new(runner: Runner, pdf_dict: Dict):
+def apply_random_perturbations_train_dataloader_new(
+    runner: Runner, pdf_dict: Dict, perturbation_set: str = "new"
+):
     dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
 
     pipeline = [
@@ -255,7 +267,15 @@ def apply_random_perturbations_train_dataloader_new(runner: Runner, pdf_dict: Di
             break
 
     pipeline.insert(
-        insert_index, dict(type="RandomTrainTransformNew", pdf_dict=pdf_dict)
+        insert_index,
+        dict(
+            type="RandomTrainTransformNew",
+            pdf_dict=pdf_dict,
+            # The pdf's op names come from whichever vocabulary SA ran over; the
+            # transform has to look them up in the same one or it KeyErrors on the
+            # first augmented image.
+            perturbation_set=perturbation_set,
+        ),
     )
 
     dataloader_cfg.dataset.pipeline = pipeline
@@ -268,7 +288,10 @@ def apply_random_perturbations_train_dataloader_new(runner: Runner, pdf_dict: Di
 
 
 def apply_random_alpha_training_augmentations(
-    runner: Runner, geometric_only=False, photometric_only=False
+    runner: Runner,
+    geometric_only=False,
+    photometric_only=False,
+    perturbation_set: str = "new",
 ):
     dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
 
@@ -286,6 +309,7 @@ def apply_random_alpha_training_augmentations(
             type="RandomAlphaTrainTransform",
             geometric_only=geometric_only,
             photometric_only=photometric_only,
+            perturbation_set=perturbation_set,
         ),
     )
 
@@ -298,7 +322,9 @@ def apply_random_alpha_training_augmentations(
     _rebind_train_iterator(runner)
 
 
-def apply_random_perturbations_test_dataloader(runner: Runner, pdf_dict: Dict):
+def apply_random_perturbations_test_dataloader(
+    runner: Runner, pdf_dict: Dict, perturbation_set: str = "new"
+):
     """Applies the random perturbation dataloader based on a given PDF dictionary.
     Specifically, applies 'RandomTrainTransform' from bp.robustness.augmentations to the current
     Runner's *test* dataloader.
@@ -316,7 +342,12 @@ def apply_random_perturbations_test_dataloader(runner: Runner, pdf_dict: Dict):
             break
 
     pipeline.insert(
-        insert_index, dict(type="RandomTrainTransformNew", pdf_dict=pdf_dict)
+        insert_index,
+        dict(
+            type="RandomTrainTransformNew",
+            pdf_dict=pdf_dict,
+            perturbation_set=perturbation_set,
+        ),
     )
 
     dataloader_cfg.dataset.pipeline = pipeline

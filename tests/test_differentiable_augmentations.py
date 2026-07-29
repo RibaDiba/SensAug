@@ -1,6 +1,7 @@
 import os
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,6 +15,8 @@ from sensaug.dataset.differentiable_augmentations import (
     blur,
     color_channel,
     hsv_channel,
+    img_to_rgb01,
+    rgb01_to_img,
 )
 
 LEGACY_PERTURBATION_KEYS = {
@@ -257,3 +260,59 @@ def test_noise_applies_each_images_own_delta(big_batch, monkeypatch):
     expected = torch.clamp(big_batch + fixed * deltas.view(-1, 1, 1, 1), 0.0, 1.0)
     assert torch.allclose(out, expected, atol=1e-6)
     assert torch.allclose(out[0], big_batch[0], atol=1e-6)
+
+
+# --- mmseg image <-> tensor conversion ---------------------------------------
+#
+# These back the DIFF_PERTURBATIONS pipeline wrappers in
+# sensaug.dataset.augmentations, which are how the sensitivity analysis measures
+# these same ops. They live here (not with the wrappers) so they can be tested
+# without the OpenMMLab stack installed.
+
+
+@pytest.fixture
+def bgr_image():
+    """An HWC uint8 BGR image, the form mmseg's LoadImageFromFile produces."""
+    return (np.random.default_rng(0).random((11, 17, 3)) * 255).astype(np.uint8)
+
+
+def test_conversion_round_trip_is_lossless(bgr_image):
+    """Every SA level evaluation pushes the image through this round trip. Any loss
+    here would show up as a fake sensitivity for EVERY op, including at magnitude
+    0, and would be attributed to the augmentation rather than the plumbing."""
+    assert np.array_equal(rgb01_to_img(img_to_rgb01(bgr_image)), bgr_image)
+
+
+def test_conversion_swaps_channel_order(bgr_image):
+    """The ops' contract is RGB; mmseg hands over BGR. If this were a no-op the
+    ops would silently perturb the wrong channel -- lighter_R would brighten blue
+    -- with correct shapes and no error anywhere."""
+    tensor = img_to_rgb01(bgr_image)
+    assert tensor.shape == (1, 3, 11, 17)
+    r_channel = (tensor[0, 0].numpy() * 255).round().astype(np.uint8)
+    assert np.array_equal(r_channel, bgr_image[..., 2])
+
+
+def test_conversion_rounds_rather_than_truncates():
+    """`.to(torch.uint8)` truncates. A value that should land on 200 arriving as
+    199 makes magnitude=0 a visible darkening of the whole image."""
+    img = np.full((2, 2, 3), 200, dtype=np.uint8)
+    assert np.array_equal(rgb01_to_img(img_to_rgb01(img)), img)
+
+
+@pytest.mark.parametrize("name", list(DIFFERENTIABLE_PERTURBATIONS))
+def test_zero_magnitude_is_a_no_op_through_the_round_trip(name, bgr_image):
+    """The SA search evaluates levels near 0. If a zero magnitude did not return
+    the clean image bit-for-bit, the SA curve's low end would measure the round
+    trip instead of the augmentation."""
+    out = DIFFERENTIABLE_PERTURBATIONS[name](img_to_rgb01(bgr_image), 0.0)
+    assert np.array_equal(rgb01_to_img(out), bgr_image)
+
+
+@pytest.mark.parametrize("name", list(DIFFERENTIABLE_PERTURBATIONS))
+def test_every_op_changes_pixels_at_full_magnitude(name, bgr_image):
+    """Mirrors runner_utils.verify_perturbation_effective: an op that leaves the
+    image untouched would give SA a flat curve and be read as 'the model is robust
+    to this', when in fact nothing was applied."""
+    out = rgb01_to_img(DIFFERENTIABLE_PERTURBATIONS[name](img_to_rgb01(bgr_image), 1.0))
+    assert not np.array_equal(out, bgr_image)

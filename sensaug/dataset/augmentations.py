@@ -25,6 +25,11 @@ from sensaug.dataset.utils.non_geometric_transforms import (
 )
 
 from sensaug.dataset.utils.cropping import *
+from sensaug.dataset.differentiable_augmentations import (
+    DIFFERENTIABLE_PERTURBATIONS,
+    img_to_rgb01,
+    rgb01_to_img,
+)
 from sensaug.dataset.parameters import COMBINATION_PARAMETERS
 from sensaug.dataset.imagenet_c import (
     motion_blur,
@@ -876,9 +881,21 @@ class RandomAlphaTrainTransform(BaseTransform):
     Randomly chooses both augmentation class (uniform) and augmentation intensity (uniform).
     """
 
-    def __init__(self, geometric_only: bool = False, photometric_only: bool = False):
+    def __init__(
+        self,
+        geometric_only: bool = False,
+        photometric_only: bool = False,
+        perturbation_set: str = "new",
+    ):
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
+        # "new" -> NEW_PERTURBATIONS, "diff" -> the differentiable ops the gradient
+        # cross-correlation pipeline measures. A string rather than the dict itself
+        # because this goes through an mmengine Config, which cannot serialize
+        # classes. Validated eagerly so a bad value fails at build time, not on the
+        # first sampled image inside a dataloader worker.
+        self.perturbation_set = perturbation_set
+        resolve_perturbation_set(perturbation_set, geometric_only, photometric_only)
 
     def transform(self, results: dict) -> dict:
         results["img"] = np.ascontiguousarray(results["img"].copy())
@@ -888,16 +905,10 @@ class RandomAlphaTrainTransform(BaseTransform):
 
         num_transforms = 1
 
-        perturbation_list = (
-            NEW_PERTURBATIONS_GEOMETRIC
-            if self.geometric_only
-            else (
-                NEW_PERTURBATIONS_PHOTOMETRIC
-                if self.photometric_only
-                else NEW_PERTURBATIONS
-            )
+        perturbations = resolve_perturbation_set(
+            self.perturbation_set, self.geometric_only, self.photometric_only
         )
-        perturbation_list = list(perturbation_list.keys()) + ["none"]
+        perturbation_list = list(perturbations.keys()) + ["none"]
 
         for _ in range(num_transforms):
             # sample perturbation
@@ -905,7 +916,7 @@ class RandomAlphaTrainTransform(BaseTransform):
             perturbation_level = np.random.uniform(low=0, high=1, size=None)
 
             if perturbation_type != "none":
-                transform_cls, _ = NEW_PERTURBATIONS[perturbation_type]
+                transform_cls, _ = perturbations[perturbation_type]
                 transform = transform_cls(magnitude=perturbation_level)
                 results = transform(results)
 
@@ -919,8 +930,14 @@ class RandomTrainTransformNew(BaseTransform):
     Then, uses a beta distribution to mix the perturbed image with the original image.
     """
 
-    def __init__(self, pdf_dict: dict):
+    def __init__(self, pdf_dict: dict, perturbation_set: str = "new"):
         self.pdf_dict: dict = pdf_dict
+        # Which registry the pdf's op names are drawn from -- "new" for
+        # NEW_PERTURBATIONS, "diff" for the differentiable ops. The two share no
+        # names, so a mismatch is a KeyError on the first augmented image rather
+        # than anything subtle. See resolve_perturbation_set.
+        self.perturbation_set = perturbation_set
+        self._perturbations = resolve_perturbation_set(perturbation_set)
 
         # keys are (perturbation, level) pairs, so they cannot be passed to
         # np.random.choice directly -- it only accepts 1-D populations. Sample an
@@ -950,7 +967,7 @@ class RandomTrainTransformNew(BaseTransform):
                     level + np.random.normal(0, scale=0.1), a_min=0, a_max=1
                 )
 
-                transform_cls, _ = NEW_PERTURBATIONS[perturbation]
+                transform_cls, _ = self._perturbations[perturbation]
                 transform = transform_cls(magnitude=level)
                 results = transform(results)
 
@@ -1421,6 +1438,117 @@ NEW_PERTURBATIONS_GEOMETRIC = {
 }
 
 NEW_PERTURBATIONS = NEW_PERTURBATIONS_PHOTOMETRIC | NEW_PERTURBATIONS_GEOMETRIC
+
+
+# --- differentiable-op pipeline wrappers -------------------------------------
+#
+# The sensitivity analysis can only measure an augmentation that exists as a
+# registered pipeline transform: it works by inserting one into the val
+# dataloader and re-evaluating (loops.RobustValLoop.test_perturbed_new ->
+# runner_utils.apply_perturbations_dataloader). The ops in
+# sensaug.dataset.differentiable_augmentations are plain torch functions, so SA
+# structurally could not see them -- which is why the SA curve was keyed by an
+# entirely disjoint vocabulary (NEW_PERTURBATIONS above) from the one the
+# gradient probe differentiates, and `sa_curve["lighter_R"]` never existed.
+#
+# These wrappers close that gap. SA and the probe now score the SAME function,
+# not two implementations that share a name, and the SA levels land natively in
+# the probe's magnitude units ([0, 1]) with no rescaling -- unlike the legacy
+# PERTURBATIONS vocabulary, whose blur level is a kernel size in [0, 49] and
+# whose noise level is a sigma in [0, 50].
+
+
+class _DiffAugTransform(BaseTransform):
+    """Base for the generated per-op wrappers. Subclasses set ``OP_NAME``.
+
+    Takes ``magnitude`` (not ``delta``/``sigma``) so the constructor signature
+    matches NEW_PERTURBATIONS' classes -- that is what lets RandomTrainTransformNew
+    and the SA loop swap registries with a lookup change instead of a special case.
+
+    These ops do not change image shape, so ``ori_shape`` is deliberately left
+    alone (unlike Blur/Noise above, which rewrite it redundantly).
+    """
+
+    OP_NAME: str = ""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = float(magnitude)
+        self.op = DIFFERENTIABLE_PERTURBATIONS[self.OP_NAME]
+
+    def transform(self, results: dict) -> dict:
+        # no_grad: inside a dataloader worker there is nothing to differentiate,
+        # and the graph would otherwise be built and discarded per sample.
+        with torch.no_grad():
+            perturbed = self.op(img_to_rgb01(results["img"]), self.magnitude)
+        results["img"] = rgb01_to_img(perturbed)
+        return results
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(magnitude={self.magnitude})"
+
+
+def _make_diff_transform(name: str):
+    """Generate + register one wrapper class for `name`.
+
+    Generated rather than hand-written because 14 near-identical classes would
+    drift. The class is bound into module globals under its generated name so
+    pickle can find it: dataloader workers started with `spawn` (rather than
+    Linux's default `fork`) pickle the dataset, and a class unreachable by
+    qualified name would fail there and nowhere else.
+    """
+    cls_name = "Diff" + "".join(part.capitalize() for part in name.split("_"))
+    cls = type(
+        cls_name,
+        (_DiffAugTransform,),
+        {
+            "OP_NAME": name,
+            "__doc__": f"MMSeg pipeline wrapper for the differentiable `{name}` op.",
+        },
+    )
+    globals()[cls_name] = cls
+    return TRANSFORMS.register_module()(cls)
+
+
+# Mirrors NEW_PERTURBATIONS' {name: (transform_cls, bool)} shape. The trailing
+# flag is unused there too (every read site does `transform_cls, _ = ...`); it is
+# carried so the two registries are interchangeable at every lookup site.
+DIFF_PERTURBATIONS = {
+    name: (_make_diff_transform(name), True) for name in DIFFERENTIABLE_PERTURBATIONS
+}
+
+
+def resolve_perturbation_set(
+    name: str, geometric_only: bool = False, photometric_only: bool = False
+) -> dict:
+    """Select a perturbation registry by name, honouring the geometric/photometric
+    filters. Both registries share the {op_name: (transform_cls, bool)} shape, so
+    callers need only swap the lookup.
+
+    Called at runtime (not at import) because DIFF_PERTURBATIONS is defined below
+    the transforms that use it.
+    """
+    if name == "new":
+        if geometric_only:
+            return NEW_PERTURBATIONS_GEOMETRIC
+        if photometric_only:
+            return NEW_PERTURBATIONS_PHOTOMETRIC
+        return NEW_PERTURBATIONS
+
+    if name == "diff":
+        if geometric_only:
+            # Every differentiable op is photometric -- there is no differentiable
+            # shear/translate/rotate. Falling through to "all of them" would hand
+            # back a photometric-only set under a geometric-only flag, which is a
+            # silently wrong experiment rather than an error.
+            raise ValueError(
+                "geometric_only is not available for the 'diff' perturbation set: "
+                f"none of {sorted(DIFF_PERTURBATIONS)} are geometric"
+            )
+        return DIFF_PERTURBATIONS
+
+    raise ValueError(
+        f"unknown perturbation_set {name!r}, expected 'new' or 'diff'"
+    )
 
 # @TRANSFORMS.register_module()
 # class PackSegInputs(BaseTransform):
