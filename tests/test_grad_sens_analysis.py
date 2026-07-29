@@ -13,8 +13,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytest.importorskip("mmengine")
+pytest.importorskip("mmseg")
+pytestmark = pytest.mark.requires_mmseg
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+
 from sensaug.hooks.grad_sens_analysis import (
     PerturbationSensitivityAnalysisHookWithGradients,
     _jsonable,

@@ -7,9 +7,21 @@ are autograd-compatible but are NOT wired into the training step -- there is no
 persistent magnitude parameter whose ``.grad`` we could read after a real
 ``train_step`` (mmengine's OptimWrapper already ran ``zero_grad`` by the time
 ``after_train_iter`` fires). So this hook *produces* the gradient itself: it takes
-a clean batch, applies each differentiable op at a fixed reference magnitude, runs
-a forward pass, and reads ``d loss / d magnitude`` via ``torch.autograd.grad``
-(which never populates model parameter ``.grad``, so training is untouched).
+a clean batch, applies each differentiable op at a chosen magnitude, runs a forward
+pass, and reads ``d loss / d magnitude`` via ``torch.autograd.grad`` (which never
+populates model parameter ``.grad``, so training is untouched).
+
+WHERE THE MAGNITUDE COMES FROM. It used to be one hardcoded constant (0.5) for
+every op, which is not commensurable across them: at 0.5, ``blur`` moves a pixel by
+at most 78/255 while ``noise`` moves it by 251/255, so R correlated ops held at
+arbitrary relative strengths. The magnitude is now taken from the per-op
+distribution the SA loop publishes to ``runner.corr_magnitudes`` (see
+sensaug/corr_magnitudes.py for the modes, sensaug/loops.py for the publisher).
+The snapshot is read ONCE per sweep, so one R is always one magnitude regime, and
+falls back to ``ref_magnitude`` whenever no snapshot exists -- before the first
+post-warmup SA round, and for the whole run when the SA loop is disabled. Every
+emission is labelled with which of the two it was, because matrices measured under
+the two are not comparable.
 
 The measurement is a FROZEN FRAME. Every ``interval`` train iters the hook pauses
 on one model state and sweeps the ENTIRE clean val set in a single pass, so every
@@ -57,6 +69,12 @@ from mmengine.hooks import Hook
 
 # Local imports
 from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+from sensaug.corr_magnitudes import (
+    MAGNITUDE_MODES,
+    MODE_FIXED,
+    MODE_MODAL,
+    resolve_magnitudes,
+)
 
 
 def iteration_count(runner) -> int:
@@ -129,13 +147,37 @@ class CollectGradientHook(Hook):
             the backward reaches the input, and val images are full resolution.
             This is also the cluster the downstream bootstrap resamples, so at 1
             the clusters are singletons (an i.i.d. image bootstrap). Defaults to 1.
-        ref_magnitude (float): Magnitude at which every op is probed (the
-            "flank", not an extreme). Defaults to 0.5 (eps/2 for the diff
-            module's default eps=1.0). NOTE this number is not commensurable
-            across ops: for the 12 photometric ops it means "halfway to the
-            rail" (large), while for ``blur`` the magnitude IS sigma (so 0.5 is
-            a mild blur) and for ``noise`` it is a std that clamps most pixels.
-            Sweep it before trusting cross-op comparisons.
+        ref_magnitude (float): FALLBACK magnitude, used for any op the SA
+            snapshot does not cover and for every op when there is no snapshot
+            at all (``magnitude_mode="fixed"``, ``--no-corr-sa``, or the rounds
+            before the first SA completes). Defaults to 0.5 (eps/2 for the diff
+            module's default eps=1.0).
+
+            NOTE this number is not commensurable across ops: for the 12
+            photometric ops it means "halfway to the rail" (large), while for
+            ``blur`` the magnitude IS sigma (so 0.5 is a mild blur) and for
+            ``noise`` it is a std that saturates most pixels. Measured on a
+            random image, magnitude 0.5 moves a pixel by at most 78/255 under
+            ``blur`` and 251/255 under ``noise``. That incommensurability is
+            precisely what ``magnitude_mode`` exists to remove -- an R built on
+            this fallback correlates ops held at arbitrary relative strengths.
+        magnitude_mode (str): Where each op's probe magnitude comes from.
+
+            - ``"mode"`` (default): the modal level of that op's SA distribution,
+              constant across the batch. R stays a statement about image
+              variation alone.
+            - ``"sampled_shared"``: drawn per image from the op's distribution
+              the way training draws it, but with one shared quantile and jitter
+              deviate per image across all ops -- common random numbers, so the
+              sampling does not decorrelate the rows.
+            - ``"sampled_independent"``: every op draws on its own. Most faithful
+              to training, but injects row-uncorrelated noise that attenuates
+              every cell of R toward zero by an unknown, pdf-dependent factor,
+              so R stops being comparable across checkpoints.
+            - ``"fixed"``: always ``ref_magnitude``; reproduces the pre-snapshot
+              behaviour exactly.
+
+            Every mode falls back to ``ref_magnitude`` when no snapshot exists.
         per_image_delta (bool): If True (default), probe with a length-B delta
             and store one gradient per image. If False, use the old scalar delta
             and store one batch-averaged number per batch -- kept runnable for
@@ -152,19 +194,77 @@ class CollectGradientHook(Hook):
         ref_magnitude: float = 0.5,
         per_image_delta: bool = True,
         probe_seed: int = 0,
+        magnitude_mode: str = MODE_MODAL,
+        magnitudes_path: str = None,
     ) -> None:
         if interval < 1:
             raise ValueError(f"interval must be a positive iteration count, got {interval}")
+        if magnitude_mode not in MAGNITUDE_MODES:
+            raise ValueError(
+                f"unknown magnitude_mode {magnitude_mode!r}, expected one of "
+                f"{MAGNITUDE_MODES}"
+            )
         self.interval = interval
         self.sweep_batch_size = sweep_batch_size
         self.ref_magnitude = ref_magnitude
         self.per_image_delta = per_image_delta
         self.probe_seed = probe_seed
+        self.magnitude_mode = magnitude_mode
+        self.magnitudes_path = magnitudes_path
+        # Seeded from magnitudes_path in before_run; used only when this run's own
+        # SA loop has not published anything (SA disabled, or pre-first-round).
+        self._seed_snapshot = {}
 
         self.grad_buffer = None
         self.grad_log_path = None
         self._probe_loader = None
         self._pending_records = []
+        # Dedicated Generator rather than the global numpy RNG: magnitude draws
+        # must not consume from (and so perturb) the training data stream. Reseeded
+        # at the start of each sweep so a sweep is reproducible, then allowed to
+        # advance ACROSS batches -- reseeding per batch would hand every batch the
+        # same draw, which at sweep_batch_size=1 collapses the sampled modes to a
+        # single magnitude for the entire val set.
+        self._magnitude_rng = None
+
+    def _load_seed_snapshot(self) -> dict:
+        """Read the LAST snapshot out of a corr_magnitudes.json from a prior run.
+
+        The last one, not the first: it is the most converged model's magnitudes,
+        and the point of this file is to pin a control arm to the same magnitudes
+        the comparison run used.
+
+        Fails loudly on a missing or malformed file rather than degrading to the
+        fixed fallback. Silently probing at 0.5 when you asked for a pinned
+        magnitude produces a control that is not comparable to anything, and
+        nothing downstream would reveal it.
+        """
+        if not self.magnitudes_path:
+            return {}
+
+        with open(self.magnitudes_path) as f:
+            records = json.load(f)
+        if not records:
+            raise ValueError(f"{self.magnitudes_path} holds no snapshots")
+
+        magnitudes = records[-1].get("magnitudes")
+        if not magnitudes:
+            raise ValueError(
+                f"{self.magnitudes_path}: last record has no 'magnitudes' key"
+            )
+
+        # Drop the recorded modal value; it is a derived summary, and keeping it
+        # would shadow whatever magnitude_mode this run asks for.
+        snapshot = {
+            op: {"levels": entry["levels"], "probs": entry["probs"]}
+            for op, entry in magnitudes.items()
+        }
+        print_log(
+            f"[grad-sweep] seeded probe magnitudes for {len(snapshot)} ops from "
+            f"{self.magnitudes_path} (iter {records[-1].get('iter')})",
+            logger="current",
+        )
+        return snapshot
 
     def before_run(self, runner: Runner) -> None:
         # Shared buffer, stashed on the runner so the correlation hook can read
@@ -172,6 +272,8 @@ class CollectGradientHook(Hook):
         # boundaries are load-bearing for the cluster bootstrap, so do NOT flatten.
         self.grad_buffer = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
         runner.aug_grad_buffer = self.grad_buffer
+
+        self._seed_snapshot = self._load_seed_snapshot()
 
         self.grad_log_path = os.path.join(runner.cfg.work_dir, "aug_gradient_log.txt")
         if is_main_process():
@@ -253,11 +355,30 @@ class CollectGradientHook(Hook):
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         )
 
+        # Whatever the SA loop published most recently -- read here, once, so every
+        # batch in this sweep is probed at the SAME magnitudes. Reading it per batch
+        # would let an SA round land mid-sweep and split one R across two magnitude
+        # regimes. Empty until the first post-warmup SA round, and always empty when
+        # the SA loop is disabled; both cases fall back to ref_magnitude.
+        live = getattr(runner, "corr_magnitudes", None) or {}
+        # A live SA snapshot wins over a seeded one: the seed exists to pin a run
+        # that has no SA of its own, not to override one that does.
+        snapshot = live or self._seed_snapshot
+        self._magnitude_rng = np.random.default_rng(self.probe_seed)
+
+        if self.magnitude_mode == MODE_FIXED or not snapshot:
+            source = "fixed"
+        elif live:
+            source = "sa_snapshot"
+        else:
+            source = "seeded_snapshot"
+
         n_batches = n_images = 0
+        swept_magnitudes = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
         try:
             for data in self._probe_loader:
                 try:
-                    grads = self._probe_batch(model, data)
+                    grads, magnitudes = self._probe_batch(model, data, snapshot)
                 except ProbeError:
                     # A wrong-shaped or non-finite gradient is a bug in the probe,
                     # not a transient failure. Fail loudly rather than degrading
@@ -274,6 +395,8 @@ class CollectGradientHook(Hook):
 
                 for name, value in grads.items():
                     self.grad_buffer[name].append(value)
+                for name, value in magnitudes.items():
+                    swept_magnitudes[name].append(value)
 
                 batch_size = int(next(iter(grads.values())).shape[0])
                 n_batches += 1
@@ -283,13 +406,24 @@ class CollectGradientHook(Hook):
                     # Log EVERY batch, in full: this makes R recomputable offline
                     # from the log without retraining. .tolist() is required --
                     # np.ndarray and np.float32 both raise TypeError in json.dumps.
+                    #
+                    # The magnitudes go in alongside the gradients because a
+                    # gradient is only interpretable together with the magnitude it
+                    # was taken at -- without them an offline recompute cannot tell
+                    # a fixed-0.5 sweep from an SA-driven one.
                     self._pending_records.append(
                         {
                             "checkpoint": checkpoint,
                             "iter": int(runner.iter),
                             "batch_size": batch_size,
+                            "magnitude_source": source,
+                            "magnitude_mode": self.magnitude_mode,
                             "grads": {
                                 name: value.tolist() for name, value in grads.items()
+                            },
+                            "magnitudes": {
+                                name: value.tolist()
+                                for name, value in magnitudes.items()
                             },
                         }
                     )
@@ -303,16 +437,36 @@ class CollectGradientHook(Hook):
         if is_main_process():
             self._flush_records()
 
+        # Handed to PerturbationSensitivityAnalysisHookWithGradients, which records
+        # it with R. Without it a fixed-0.5 matrix and an SA-driven matrix are
+        # indistinguishable in the log, and the two are NOT comparable -- the whole
+        # reason for this pipeline is that 0.5 means something different per op.
+        runner.aug_grad_magnitude_info = {
+            "source": source,
+            "mode": self.magnitude_mode,
+            "ref_magnitude": self.ref_magnitude,
+            "per_op": {
+                name: _magnitude_summary(values)
+                for name, values in swept_magnitudes.items()
+                if values
+            },
+        }
+
         print_log(
             f"[grad-sweep] checkpoint {checkpoint:.0%} (iter {runner.iter}): swept "
-            f"{n_images} images in {n_batches} batches on this rank",
+            f"{n_images} images in {n_batches} batches on this rank "
+            f"(magnitudes: {source}/{self.magnitude_mode})",
             logger="current",
         )
 
-    def _probe_batch(self, model, data) -> dict:
-        """Returns {op_name: (B,) array of d loss / d magnitude, one per image}
+    def _probe_batch(self, model, data, snapshot):
+        """Returns ``(grads, magnitudes)``, each ``{op_name: (B,) array}`` -- the
+        per-image ``d loss / d magnitude`` and the magnitude it was taken at --
         for all differentiable ops, measured on a single shared clean batch (so
         columns stay aligned across ops).
+
+        `snapshot` is the SA-published per-op magnitude distribution, or ``{}``
+        for the fixed-magnitude fallback.
 
         Assumes the caller has already put the model in eval mode and taken
         responsibility for restoring the RNG (see _sweep).
@@ -335,22 +489,46 @@ class CollectGradientHook(Hook):
         std = model.data_preprocessor.std.view(1, -1, 1, 1)
         rgb01 = ((inputs * std + mean) / 255.0).clamp(0.0, 1.0)
 
-        return {
-            name: self._grad_for_op(name, model, op, rgb01, mean, std, data_samples)
+        batch_size = int(rgb01.shape[0])
+        if self.per_image_delta:
+            magnitudes = resolve_magnitudes(
+                snapshot,
+                list(DIFFERENTIABLE_PERTURBATIONS),
+                batch_size,
+                self.magnitude_mode,
+                self.ref_magnitude,
+                rng=self._magnitude_rng,
+            )
+        else:
+            # The legacy scalar path has one delta for the whole batch, so it
+            # cannot carry a per-image magnitude. Kept on the fixed reference.
+            magnitudes = {
+                name: np.full(1, self.ref_magnitude, dtype=np.float64)
+                for name in DIFFERENTIABLE_PERTURBATIONS
+            }
+
+        grads = {
+            name: self._grad_for_op(
+                name, model, op, rgb01, mean, std, data_samples, magnitudes[name]
+            )
             for name, op in DIFFERENTIABLE_PERTURBATIONS.items()
         }
+        return grads, magnitudes
 
     def _grad_for_op(
-        self, name, model, op, rgb01, mean, std, data_samples
+        self, name, model, op, rgb01, mean, std, data_samples, magnitude
     ) -> np.ndarray:
         """d loss / d magnitude for one op, as a (B,) array -- one sensitivity
         per image. (In the legacy scalar mode, a (1,) array holding the old
-        batch-averaged number.)"""
+        batch-averaged number.)
+
+        `magnitude` is the (B,) array of probe magnitudes for this op, already
+        resolved from the SA snapshot by the caller.
+        """
         batch_size = rgb01.shape[0]
         if self.per_image_delta:
-            delta = torch.full(
-                (batch_size,),
-                self.ref_magnitude,
+            delta = torch.tensor(
+                magnitude,
                 dtype=rgb01.dtype,
                 device=rgb01.device,
                 requires_grad=True,
@@ -390,6 +568,22 @@ class CollectGradientHook(Hook):
             raise ProbeError(f"op {name!r}: non-finite gradient {grad.tolist()}")
 
         return grad.detach().cpu().numpy().reshape(-1).astype(np.float64)
+
+
+def _magnitude_summary(values) -> dict:
+    """Collapse one op's per-image probe magnitudes over a sweep into a summary.
+
+    Mean/min/max rather than the raw array: the per-image values are already
+    written in full to aug_gradient_log.txt, and repeating 500 of them per op in
+    the correlation record would bury R. For the constant modes (`mode`, `fixed`)
+    min == mean == max, which is itself the check that the mode did what it says.
+    """
+    flat = np.concatenate(values)
+    return {
+        "mean": float(flat.mean()),
+        "min": float(flat.min()),
+        "max": float(flat.max()),
+    }
 
 
 def _sum_loss_value(value):

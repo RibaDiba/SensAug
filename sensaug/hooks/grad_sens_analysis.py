@@ -48,9 +48,6 @@ import warnings
 import numpy as np
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from mmengine.runner import Runner
 from mmengine.logging import print_log
@@ -61,6 +58,12 @@ from mmengine.hooks import Hook
 # Local imports
 from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
 from sensaug.hooks.grad_hook import fires_at, training_progress
+# Imported straight off the submodule, NOT as `from sensaug.hooks import corr_viz`.
+# hooks/__init__.py imports this module, so the package form is a cycle through a
+# half-initialized package -- and the `except ImportError: pass` wrapping that
+# __init__ would swallow the failure silently, leaving both hooks unregistered and
+# the run dying later on an opaque registry miss.
+from sensaug.hooks.corr_viz import markdown_report, render_matrix
 
 # A row whose sensitivity never varies across the window carries no correlation
 # signal; np.corrcoef would divide by its zero std and emit a silent NaN row.
@@ -285,6 +288,63 @@ def _jsonable(value):
     return value
 
 
+def _first_primary(records: list):
+    """The primary R from the earliest record in corr_matrix_log.json, as an
+    (A, A) float array -- the baseline for the drift panel.
+
+    Reads the file rather than caching the first matrix on the hook so that a
+    --resume keeps diffing against the run's true first emission instead of
+    restarting the baseline at whatever the restart happened to measure.
+
+    _jsonable wrote every NaN out as null, so None comes back in and has to be
+    turned into NaN again; np.array(..., dtype=float) does that for None but not
+    for a nested list containing it, hence the explicit conversion.
+    """
+    if not records:
+        return None
+    raw = records[0].get("R_scalenorm") or records[0].get("R_raw")
+    if not raw:
+        return None
+    return np.array(
+        [[np.nan if v is None else float(v) for v in row] for row in raw], dtype=float
+    )
+
+
+def _tb_writer(vis):
+    """The raw torch SummaryWriter under mmengine's Visualizer, or None.
+
+    mmengine's Visualizer only forwards add_scalar and add_image to its backends,
+    so the HISTOGRAMS and TEXT tabs are unreachable through the documented API.
+    The writer itself is one attribute deeper, on the backend.
+
+    Everything here is best-effort and swallows failures: this runs inside
+    after_train_iter, and a TensorBoard nicety must never be able to take a
+    training run down. A None return degrades the pipeline to scalars + images.
+    """
+    try:
+        backends = getattr(vis, "_vis_backends", None) or {}
+        backend = None
+        if hasattr(vis, "get_backend"):
+            backend = vis.get_backend("TensorboardVisBackend")
+        if backend is None:
+            # Don't insist on the class name: the backend is registered under
+            # whatever key train.py's visualizer config gave it.
+            backend = next(
+                (b for b in backends.values() if type(b).__name__.startswith("Tensorboard")),
+                None,
+            )
+        if backend is None:
+            return None
+        writer = backend.experiment
+        # Duck-type rather than isinstance: this only needs to be something that
+        # can take a histogram and a string.
+        if hasattr(writer, "add_histogram") and hasattr(writer, "add_text"):
+            return writer
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _write_json_atomic(path, obj):
     """Rewrite `path` as one JSON document, via a temp file + os.replace.
 
@@ -418,6 +478,12 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         r_primary = r_norm if r_norm is not None else r_raw
 
         dropped_names = [self.names[i] for i in dropped]
+        # Which magnitudes the sweep was taken at, published by CollectGradientHook.
+        # Recorded with R because two matrices measured at different magnitudes are
+        # NOT comparable -- an R built at the fixed 0.5 fallback and one built from
+        # the SA distribution answer different questions, and without this field
+        # they are indistinguishable in the log.
+        magnitude_info = getattr(runner, "aug_grad_magnitude_info", None) or {}
         record = {
             "checkpoint": checkpoint,
             "iter": int(runner.iter),
@@ -428,6 +494,9 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             "R_scalenorm": r_norm,
             "dropped": dropped_names,
             "shared_factor_loadings": loadings,
+            "magnitude_source": magnitude_info.get("source"),
+            "magnitude_mode": magnitude_info.get("mode"),
+            "magnitudes": magnitude_info.get("per_op"),
         }
         # Read-modify-write, so the file stays ONE json array across a run's
         # checkpoints (and across a resume, matching the append-only gradient log
@@ -437,12 +506,17 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         if os.path.exists(self.corr_log_path):
             with open(self.corr_log_path) as f:
                 records = json.load(f)
+        # The run's FIRST R, for the drift panel -- taken from the file rather than
+        # cached on self, so a --resume still diffs against the true first emission
+        # of the run instead of the first one after the restart.
+        first_r = _first_primary(records)
         records.append(_jsonable(record))
         _write_json_atomic(self.corr_log_path, records)
 
         n_survivors = n_cells = None
+        cell_stats = None
         if self.bootstrap:
-            n_survivors, n_cells = self._emit_bootstrap(
+            n_survivors, n_cells, cell_stats = self._emit_bootstrap(
                 checkpoint, d_primary, probe_ids, dropped
             )
 
@@ -451,7 +525,9 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             f"[grad-corr] checkpoint {checkpoint:.0%} (iter {runner.iter}): "
             f"n_images={n_images} n_probes={n_probes} "
             f"dropped={dropped_names or 'none'} "
-            f"max_shared_loading={max_loading:.2f}"
+            f"max_shared_loading={max_loading:.2f} "
+            f"magnitudes={magnitude_info.get('source', 'unknown')}/"
+            f"{magnitude_info.get('mode', 'unknown')}"
         )
         if n_cells:
             summary += f" fdr_survivors={n_survivors}/{n_cells}"
@@ -460,12 +536,19 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         self._log_to_tensorboard(
             runner,
             step=int(runner.iter),
+            checkpoint=checkpoint,
             d_grad=d_grad,
             r_primary=r_primary,
+            r_raw=r_raw,
+            first_r=first_r,
             loadings=loadings,
+            dropped_names=dropped_names,
             n_images=n_images,
+            n_probes=n_probes,
             n_survivors=n_survivors,
             n_cells=n_cells,
+            cell_stats=cell_stats,
+            magnitude_info=magnitude_info,
         )
 
         if np.isfinite(max_loading) and max_loading > _LOADING_ALARM:
@@ -484,10 +567,19 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         fields per checkpoint would bury R if inlined into corr_matrix_log.json.
 
         Stays append-only JSONL, unlike corr_matrix_log.json: it is the bulky one,
-        and nothing needs to load it as a single document."""
+        and nothing needs to load it as a single document.
+
+        Returns ``(n_survivors, n_cells, stats)``, where ``stats`` is a dict of
+        (A, A) arrays -- ci_lo, ci_hi, q, survives -- in the CANONICAL op index
+        space, or None when there was nothing to test. The re-expansion matters:
+        everything below is computed on ``d_keep``, so its indices count kept ops,
+        not ops. Handing those arrays to the figure unexpanded would label every
+        cell correctly right up until the first op is dropped, and then silently
+        mislabel all of them.
+        """
         keep = np.setdiff1d(np.arange(len(self.names)), dropped)
         if keep.size < 2:
-            return 0, 0
+            return 0, 0, None
 
         d_keep = d_grad[keep]
         r, _ = correlate(d_keep)
@@ -535,110 +627,241 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             f.write(json.dumps(_jsonable(record)) + "\n")
 
         upper = np.triu_indices(keep.size, k=1)
-        return int(survives[upper].sum()), int(upper[0].size)
+        return (
+            int(survives[upper].sum()),
+            int(upper[0].size),
+            self._expand_to_ops(keep, ci_lo=ci_lo, ci_hi=ci_hi, q=q, survives=survives),
+        )
+
+    def _expand_to_ops(self, keep: np.ndarray, **arrays) -> dict:
+        """Scatter kept-op-indexed (K, K) arrays back into (A, A) op space.
+
+        Boolean arrays fill with False (a cell that was never tested did not
+        survive), everything else with NaN (it has no value, and NaN is what the
+        rest of this module already uses for "not measured").
+        """
+        n_ops = len(self.names)
+        index = np.ix_(keep, keep)
+        expanded = {}
+        for name, array in arrays.items():
+            if array.dtype == bool:
+                full = np.zeros((n_ops, n_ops), dtype=bool)
+            else:
+                full = np.full((n_ops, n_ops), np.nan)
+            full[index] = array
+            expanded[name] = full
+        return expanded
 
     def _log_to_tensorboard(
         self,
         runner,
         step: int,
+        checkpoint: float,
         d_grad: np.ndarray,
         r_primary: np.ndarray,
+        r_raw: np.ndarray,
+        first_r,
         loadings: np.ndarray,
+        dropped_names,
         n_images: int,
+        n_probes: int,
         n_survivors,
         n_cells,
+        cell_stats=None,
+        magnitude_info=None,
     ) -> None:
-        """Write cross-correlation summary data to TensorBoard.
+        """Write R and its diagnostics to TensorBoard.
 
-        Uses mmengine's runner.visualizer, which routes to the
-        TensorboardVisBackend configured in train.py.  All tags live under
-        the ``grad_corr/`` prefix so they form their own section in the
-        TensorBoard UI and do not collide with training or SA metrics.
+        Scalars and images go through mmengine's ``runner.visualizer``, which
+        forwards to the TensorboardVisBackend configured in train.py. The
+        histogram and the text report go through the raw SummaryWriter underneath
+        it, which mmengine's Visualizer does not expose -- see ``_tb_writer``.
+
+        Every tag lives under ``grad_corr/`` so the pipeline owns its own section
+        of the UI and cannot collide with training or SA metrics.
+
+        TAG STABILITY IS THE POINT. Every tag emitted here is a pure function of
+        the op names, never of this emission's values, so each one is a continuous
+        curve across the run's checkpoints. The previous ``top_pair/<a>_vs_<b>``
+        tags were built from whichever 5 pairs happened to rank highest at that
+        emission, so the tag SET moved between emissions and a four-checkpoint run
+        produced up to twenty one-point series -- nothing that could be compared.
         """
-        vis = runner.visualizer
+        vis = getattr(runner, "visualizer", None)
+        if vis is None:
+            return
 
-        # --- per-op scalar summaries ---
+        magnitude_info = magnitude_info or {}
+        max_loading = (
+            float(np.nanmax(np.abs(loadings))) if np.isfinite(loadings).any() else 0.0
+        )
+
+        # --- per-op scalars ---
+        # Op names go into tags verbatim. The old code stripped underscores, which
+        # bought nothing (TensorBoard tags take them) and would silently merge any
+        # future `color_jitter` into a `colorjitter`.
         mean_sens = np.abs(d_grad).mean(axis=1)  # (A,)
         for i, name in enumerate(self.names):
-            tag = name.replace("_", "")
-            vis.add_scalar(
-                f"grad_corr/mean_sensitivity/{tag}", float(mean_sens[i]), step
-            )
+            vis.add_scalar(f"grad_corr/mean_sensitivity/{name}", float(mean_sens[i]), step)
             if np.isfinite(loadings[i]):
+                vis.add_scalar(f"grad_corr/shared_loading/{name}", float(loadings[i]), step)
+
+        # The magnitude each op was probed at, as its own series. This is what makes
+        # a jump in R readable: a cell moving because the model changed looks the
+        # same as one moving because the SA distribution shifted the magnitude under
+        # it, and only these curves separate the two.
+        for name, summary in magnitude_info.get("per_op", {}).items():
+            vis.add_scalar(f"grad_corr/magnitude/{name}", float(summary["mean"]), step)
+
+        # --- every pair, on a fixed tag ---
+        # All A*(A-1)/2 of them, not a top-N: 91 scalar series is nothing for
+        # TensorBoard, and it means `grad_corr/pair/blur` in the tag filter pulls
+        # every pair involving blur across the whole run.
+        upper = np.triu_indices(len(self.names), k=1)
+        for a, b in zip(*upper):
+            value = r_primary[a, b]
+            if np.isfinite(value):
                 vis.add_scalar(
-                    f"grad_corr/shared_loading/{tag}", float(loadings[i]), step
+                    f"grad_corr/pair/{self.names[a]}__{self.names[b]}",
+                    float(value),
+                    step,
                 )
 
-        # --- aggregate scalars ---
-        max_loading = (
-            float(np.nanmax(np.abs(loadings)))
-            if np.isfinite(loadings).any()
-            else 0.0
-        )
+        # --- aggregates ---
+        offdiag = r_primary[upper]
+        finite = offdiag[np.isfinite(offdiag)]
         vis.add_scalar("grad_corr/max_shared_loading", max_loading, step)
         vis.add_scalar("grad_corr/n_images", n_images, step)
+        vis.add_scalar("grad_corr/summary/n_probes", n_probes, step)
+        vis.add_scalar("grad_corr/summary/n_dropped", len(dropped_names), step)
+        if finite.size:
+            vis.add_scalar(
+                "grad_corr/summary/mean_abs_offdiag", float(np.abs(finite).mean()), step
+            )
+            vis.add_scalar(
+                "grad_corr/summary/max_abs_offdiag", float(np.abs(finite).max()), step
+            )
+            vis.add_scalar(
+                "grad_corr/summary/frac_abs_gt_0p5",
+                float((np.abs(finite) > 0.5).mean()),
+                step,
+            )
         if n_survivors is not None and n_cells is not None:
             vis.add_scalar("grad_corr/fdr_survivors", n_survivors, step)
             vis.add_scalar("grad_corr/fdr_total_cells", n_cells, step)
 
-        # --- top correlated pairs (off-diagonal of primary R) ---
-        n_ops = r_primary.shape[0]
-        pairs = []
-        for a in range(n_ops):
-            for b in range(a + 1, n_ops):
-                val = r_primary[a, b]
-                if np.isfinite(val):
-                    pairs.append((abs(val), val, a, b))
-        pairs.sort(reverse=True)
-        for _rank, (_, val, a, b) in enumerate(pairs[:5]):
-            tag_a = self.names[a].replace("_", "")
-            tag_b = self.names[b].replace("_", "")
-            vis.add_scalar(
-                f"grad_corr/top_pair/{tag_a}_vs_{tag_b}", float(val), step
+        # --- heatmaps ---
+        subtitle = (
+            f"checkpoint {checkpoint:.0%} · iter {step} · {n_images} images / "
+            f"{n_probes} probes · "
+            f"{magnitude_info.get('source', 'unknown')}/"
+            f"{magnitude_info.get('mode', 'unknown')} · "
+            f"max shared loading {max_loading:.2f}"
+        )
+        # A matrix the shared-factor alarm fires on gets the warning stamped ON the
+        # figure. The print_log alarm scrolls away in a SLURM log; a screenshot of
+        # the heatmap does not, and the heatmap is what gets pasted into a slide.
+        warn = (
+            f"max shared-factor loading {max_loading:.2f} > {_LOADING_ALARM} — R is "
+            f"tracking which images are HARD, not which augs are redundant. "
+            f"Do not act on it."
+            if max_loading > _LOADING_ALARM
+            else None
+        )
+        # Only the FDR survivors get a printed number, so the cells you may act on
+        # stop competing with ~180 you may not. Without a bootstrap there is no
+        # survivorship to mark, and nothing is annotated.
+        mark = cell_stats["survives"] if cell_stats else None
+
+        vis.add_image(
+            "grad_corr/R/scalenorm" if self.normalize_per_image else "grad_corr/R/raw",
+            render_matrix(
+                r_primary, self.names,
+                "Augmentation gradient cross-correlation"
+                + (" (scale-normalized)" if self.normalize_per_image else " (raw)"),
+                subtitle=subtitle, mark=mark, warn=warn,
+                cbar_label="Pearson r",
+            ),
+            step,
+        )
+        if self.normalize_per_image:
+            # The un-normalized matrix beside the normalized one is how you see how
+            # much of R was the shared per-image difficulty factor rather than
+            # augmentation redundancy. Skipped when normalization is off, because
+            # then it IS the primary matrix and was just logged above.
+            vis.add_image(
+                "grad_corr/R/raw",
+                render_matrix(
+                    r_raw, self.names,
+                    "Augmentation gradient cross-correlation (raw, confounded)",
+                    subtitle=subtitle + " · NOT de-confounded",
+                    cbar_label="Pearson r",
+                ),
+                step,
             )
 
-        # --- R heatmap as an image ---
-        self._log_r_heatmap(vis, step, r_primary)
+        if first_r is not None and first_r.shape == r_primary.shape:
+            # Drift since the run's first emission. Same fixed +/-1 scale as the
+            # absolute panels, so a faint delta panel means "R barely moved" rather
+            # than "the colours got rescaled".
+            vis.add_image(
+                "grad_corr/R/delta_vs_first",
+                render_matrix(
+                    r_primary - first_r, self.names,
+                    "Drift in R since this run's first emission",
+                    subtitle=subtitle, cbar_label="Δ Pearson r",
+                ),
+                step,
+            )
 
-    def _log_r_heatmap(self, vis, step: int, r: np.ndarray) -> None:
-        """Render R as a matplotlib heatmap and log it as a TensorBoard image."""
-        short_names = [
-            n.replace("Transform", "").replace("_", "") for n in self.names
-        ]
-        n = len(short_names)
+        self._log_tb_extras(
+            vis, step, checkpoint, finite, r_primary, dropped_names,
+            n_images, n_probes, max_loading, cell_stats, magnitude_info,
+        )
 
-        fig, ax = plt.subplots(figsize=(max(6, n * 0.6), max(5, n * 0.5)))
-        # Mask NaN for display
-        r_display = np.where(np.isfinite(r), r, 0.0)
-        im = ax.imshow(r_display, cmap="RdBu_r", vmin=-1, vmax=1, aspect="equal")
+    def _log_tb_extras(
+        self, vis, step, checkpoint, offdiag_finite, r_primary, dropped_names,
+        n_images, n_probes, max_loading, cell_stats, magnitude_info,
+    ) -> None:
+        """The histogram and text tabs, which need the raw SummaryWriter.
 
-        ax.set_xticks(range(n))
-        ax.set_yticks(range(n))
-        ax.set_xticklabels(short_names, rotation=45, ha="right", fontsize=7)
-        ax.set_yticklabels(short_names, fontsize=7)
+        Entirely optional: if the writer is unreachable the scalars and images
+        above have already landed, and this is the part that is allowed to be
+        missing.
+        """
+        writer = _tb_writer(vis)
+        if writer is None:
+            return
 
-        # Annotate cells
-        for i in range(n):
-            for j in range(n):
-                val = r[i, j]
-                if np.isfinite(val):
-                    ax.text(
-                        j, i, f"{val:.2f}",
-                        ha="center", va="center", fontsize=6,
-                        color="white" if abs(val) > 0.5 else "black",
-                    )
-
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title("Augmentation Gradient Cross-Correlation (R)", fontsize=9)
-        fig.tight_layout()
-
-        # Render to numpy array (H, W, 3)
-        fig.canvas.draw()
-        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-        plt.close(fig)
-
-        vis.add_image("grad_corr/R_matrix", img, step, dataformats="HWC")
+        stats = cell_stats or {}
+        try:
+            if offdiag_finite.size:
+                # The whole redundancy DISTRIBUTION per checkpoint. TensorBoard
+                # stacks these into a ridge, so "is the vocabulary getting more
+                # redundant as the model converges" is one view rather than four
+                # heatmaps read side by side.
+                writer.add_histogram("grad_corr/offdiag_r", offdiag_finite, step)
+            writer.add_text(
+                "grad_corr/report",
+                markdown_report(
+                    self.names, r_primary,
+                    checkpoint=checkpoint, iteration=step,
+                    n_images=n_images, n_probes=n_probes,
+                    dropped_names=dropped_names,
+                    magnitude_source=magnitude_info.get("source"),
+                    magnitude_mode=magnitude_info.get("mode"),
+                    max_shared_loading=max_loading,
+                    ci_lo=stats.get("ci_lo"), ci_hi=stats.get("ci_hi"),
+                    q=stats.get("q"), survives=stats.get("survives"),
+                ),
+                step,
+            )
+        except Exception as e:  # noqa: BLE001
+            print_log(
+                f"[grad-corr] histogram/text logging skipped: {e}",
+                logger="current",
+                level=30,  # WARNING
+            )
 
     def calculate_cross_corelation(self, d_grad: np.ndarray):
         """Pearson cross-correlation across the augmentation rows of D_grad.
