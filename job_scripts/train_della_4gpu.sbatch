@@ -75,5 +75,7 @@ torchrun \
     --exp_name=${EXP_NAME} \
     --launcher="pytorch" \
     --no-inv-aug \
-    --auto-scale-lr \
-#    --grad-corr
+    --auto-scale-lr
+# The correlation pipeline is an --aug-type now, not a flag: to enable it here,
+# pass grad_corr as the first positional arg (or set AUG_TYPE), rather than
+# uncommenting a flag.

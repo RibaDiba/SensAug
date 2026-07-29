@@ -18,7 +18,9 @@
 
 # config (overridable via env vars):
 NAME="${NAME:-sensaug-print-matrix-2-4-gpus}"
-AUG_TYPE="${1:-ours}"
+# grad_corr = SA over the differentiable ops + the gradient cross-correlation
+# pipeline. Add --no-corr-sa below for the control arm (no SA, probes at 0.5).
+AUG_TYPE="${1:-grad_corr}"
 BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
 EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}}"
@@ -63,5 +65,4 @@ torchrun \
     --exp_name=${EXP_NAME} \
     --launcher="pytorch" \
     --no-inv-aug \
-    --auto-scale-lr \
-    --grad-corr
+    --auto-scale-lr

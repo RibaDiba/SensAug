@@ -223,9 +223,17 @@ def build_config(args):
     cfg.default_hooks.checkpoint.save_best = PRIMARY_METRIC
     cfg.default_hooks.checkpoint.max_keep_ckpts = 3
 
+    # grad_corr with the SA loop turned off trains exactly like `none`: the
+    # correlation pipeline is a measurement, and with no SA there is nothing to
+    # drive a training augmentation pdf. This is the control arm -- an R measured
+    # against an unaugmented baseline is what the SA-on number gets compared to.
+    plain_pipeline = args.aug_type == "none" or (
+        args.aug_type == "grad_corr" and args.no_corr_sa
+    )
+
     if args.aug_type == "default":  # use default augmentations from config
         pipeline = cfg.train_dataloader.dataset.pipeline
-    elif args.aug_type == "none":  # use no augmentations
+    elif plain_pipeline:  # use no augmentations
         excluded_augmentations = [
             "PhotoMetricDistortion",
             "RandomFlip",
@@ -262,12 +270,18 @@ def build_config(args):
             pipeline.append(dict(type="RandAugmentTransform"))
         elif augmentation_type == "trivialaugment":
             pipeline.append(dict(type="TrivialAugmentWideTransform"))
-        elif augmentation_type == "random" or augmentation_type == "ours":
+        elif augmentation_type in ("random", "ours", "grad_corr"):
             pipeline.append(
                 dict(
                     type="RandomAlphaTrainTransform",
                     geometric_only=args.geometric_only,
                     photometric_only=args.photometric_only,
+                    # grad_corr's SA runs over the differentiable ops, so the warmup
+                    # transform must sample from the same vocabulary the SA curve
+                    # and the matrix R are keyed by.
+                    perturbation_set=(
+                        "diff" if augmentation_type == "grad_corr" else "new"
+                    ),
                 )
             )
         elif augmentation_type == "idbh":
@@ -339,9 +353,20 @@ def build_config(args):
     args.save_vis = True
     args.show = False
 
-    if args.aug_type == "ours":
+    # grad_corr reuses the SA machinery, but over the DIFFERENTIABLE vocabulary so
+    # the SA curve and the matrix R are keyed by the same augmentations. Disabled
+    # with --no-corr-sa, which leaves the stock val loop and probes at the fixed
+    # reference magnitude.
+    sa_loop = args.aug_type == "ours" or (
+        args.aug_type == "grad_corr" and not args.no_corr_sa
+    )
+
+    if sa_loop:
         eval_ratio = 0.25 if "acdc" not in args.dataset.lower() else 1.0
         cfg.val_cfg.type = "RobustValLoop"
+        cfg.val_cfg.perturbation_set = (
+            "diff" if args.aug_type == "grad_corr" else "new"
+        )
         cfg.val_cfg.ratio = eval_ratio
         cfg.val_cfg.sa_curve_path = "sensaug/testing/test_levels_voc.json"
         cfg.val_cfg.uniform = args.uniform
@@ -364,33 +389,42 @@ def build_config(args):
         if "loveda" in args.dataset.lower():
             cfg.optimizer.lr *= 0.1
 
-    if args.grad_corr:
-        # Gradient-based augmentation cross-correlation (opt-in, additive). Every
-        # corr_interval iters CollectGradientHook freezes the model and sweeps the
-        # whole clean val set for d loss / d magnitude, then
+    if args.aug_type == "grad_corr":
+        # Gradient-based augmentation cross-correlation. Every `emit_interval`
+        # iters CollectGradientHook freezes the model and sweeps the whole clean
+        # val set for d loss / d magnitude, then
         # PerturbationSensitivityAnalysisHookWithGradients correlates that sweep
         # into R. Both gate on the SAME interval, so they are built from one
         # variable rather than two that could drift apart.
         #
-        # Registered for EVERY aug type, not just `ours`. R is a claim about the
-        # augmentation ops themselves, and it needs to be measurable against an
-        # --aug-type=none baseline; nested inside the `ours` branch it never could
-        # be. This pipeline shares no clock and no hook point with the sensitivity
-        # analysis in sensaug/loops.py.
+        # --corr-sync-sa just hands them the SA loop's clock instead of their own.
+        # No special gate is needed: fires_at() counts runner.iter + 1, which is the
+        # value IterBasedTrainLoop tests against val_interval right after this hook
+        # point, so passing round_interval lands the sweep on exactly the iterations
+        # that are SA rounds.
         #
+        # ORDERING, and it matters: RobustIterBasedTrainLoop calls val_loop.run()
+        # AFTER run_iter, so a synced sweep fires BEFORE the SA round it is synced
+        # to updates the pdf. It therefore probes at the previous round's
+        # magnitudes -- which is the right semantics (those are the magnitudes that
+        # were in effect over the window being measured) but is not obvious.
+        emit_interval = round_interval if args.corr_sync_sa else corr_interval
+
         # The priorities are load-bearing, not cosmetic: both hooks act in
         # after_train_iter, and the correlation hook must see the sweep the
         # collector just wrote. NORMAL (50) runs before LOW (70).
         cfg.custom_hooks = (cfg.get("custom_hooks") or []) + [
             dict(
                 type="CollectGradientHook",
-                interval=corr_interval,
+                interval=emit_interval,
                 sweep_batch_size=1,
+                magnitude_mode=args.corr_magnitude_mode,
+                magnitudes_path=args.corr_magnitudes,
                 priority="NORMAL",
             ),
             dict(
                 type="PerturbationSensitivityAnalysisHookWithGradients",
-                interval=corr_interval,
+                interval=emit_interval,
                 priority="LOW",
             ),
         ]
@@ -471,6 +505,9 @@ if __name__ == "__main__":
         choices=[
             "none",
             "ours",
+            # SA over the differentiable ops + the gradient cross-correlation
+            # pipeline. See --no-corr-sa for the control arm.
+            "grad_corr",
             "default",
             "random",
             "autoaugment",
@@ -561,13 +598,43 @@ if __name__ == "__main__":
         "--uniform", action="store_true", default=False, help="use uniform augmentation"
     )
     parser.add_argument(
-        "--grad-corr",
+        "--no-corr-sa",
         action="store_true",
         default=False,
-        help="collect differentiable-augmentation loss gradients and log their "
-        "cross-correlation matrix on its own iteration clock, independent of the "
-        "SA pipeline and of --aug-type (registers CollectGradientHook and "
-        "PerturbationSensitivityAnalysisHookWithGradients)",
+        help="under --aug-type=grad_corr, disable the sensitivity-analysis loop. "
+        "Training then runs unaugmented and the gradient probe uses the fixed "
+        "reference magnitude (0.5) for every op instead of the SA-derived "
+        "distribution. This is the control arm for the correlation matrix.",
+    )
+    parser.add_argument(
+        "--corr-magnitude-mode",
+        type=str,
+        default="mode",
+        choices=["mode", "sampled_shared", "sampled_independent", "fixed"],
+        help="how each op's probe magnitude is drawn from its SA distribution. "
+        "'mode' (default) uses the modal level, constant across the batch. "
+        "'sampled_shared' draws per image with one shared quantile across ops. "
+        "'sampled_independent' lets each op draw on its own (attenuates R). "
+        "'fixed' always uses the reference magnitude. Ignored without a snapshot.",
+    )
+    parser.add_argument(
+        "--corr-magnitudes",
+        type=str,
+        default=None,
+        help="path to a corr_magnitudes.json written by an earlier run. Its last "
+        "snapshot seeds the probe magnitudes, so an --no-corr-sa control arm can be "
+        "measured at the SAME magnitudes as the SA-on run it is compared against. "
+        "Without it the control probes at the fixed 0.5 and the two matrices are "
+        "not directly comparable. A live SA snapshot supersedes it.",
+    )
+    parser.add_argument(
+        "--corr-sync-sa",
+        action="store_true",
+        default=False,
+        help="fire the gradient sweep on the SA loop's clock (--round_interval) "
+        "instead of its own --corr-interval. The sweep still runs from "
+        "after_train_iter, which is BEFORE that round's val loop updates the pdf, "
+        "so it probes at the previous round's magnitudes.",
     )
     parser.add_argument(
         "--corr-interval",
@@ -575,7 +642,8 @@ if __name__ == "__main__":
         default=None,
         help="interval of iterations between gradient sweeps and cross-correlation "
         "matrix emissions. Overrides schedule.corr_interval in the cluster config. "
-        "Independent of --round_interval. Defaults to max_iters // 4.",
+        "Independent of --round_interval. Defaults to max_iters // 4. Ignored when "
+        "--corr-sync-sa is set.",
     )
     parser.add_argument(
         "--adamw",
@@ -625,6 +693,14 @@ if __name__ == "__main__":
     # Set up working dir to save files and logs.
     if "ours" not in args.exp_name and args.aug_type == "ours":
         args.exp_name = args.exp_name + "_ours"
+
+    # Same treatment for grad_corr, so the SA-on and SA-off arms can never land in
+    # the same work_dir -- they write the same log files, and a silent collision
+    # would interleave two incomparable sets of R matrices in corr_matrix_log.json.
+    if args.aug_type == "grad_corr":
+        suffix = "gradcorr_nosa" if args.no_corr_sa else "gradcorr"
+        if suffix not in args.exp_name:
+            args.exp_name = args.exp_name + "_" + suffix
 
     if "LOCAL_RANK" not in os.environ:
         os.environ["LOCAL_RANK"] = str(args.local_rank)

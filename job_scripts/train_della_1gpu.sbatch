@@ -14,13 +14,16 @@
 
 # config (overridable via env vars):
 NAME="${NAME:-sensaug-gradcorr-1gpu}"
-AUG_TYPE="${1:-ours}"
+# grad_corr = SA over the differentiable ops + the gradient cross-correlation
+# pipeline. Add --no-corr-sa below for the control arm (no SA, probes at 0.5).
+AUG_TYPE="${1:-grad_corr}"
 BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
-# Keep "ours" in the name: train.py appends "_ours" to any exp_name lacking it when
-# --aug-type=ours, which would desync EXP_NAME from the real work_dir (and the guard below).
+# Keep "gradcorr" in the name: train.py appends "_gradcorr" (or "_gradcorr_nosa")
+# to any exp_name lacking it when --aug-type=grad_corr, which would otherwise
+# desync EXP_NAME from the real work_dir -- and from the resume guard below.
 # RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
-EXP_NAME="${4:-gradcorr_1gpu_ours${RUN_TAG:+_${RUN_TAG}}}"
+EXP_NAME="${4:-gradcorr_1gpu${RUN_TAG:+_${RUN_TAG}}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
@@ -71,5 +74,4 @@ torchrun \
     --exp_name=${EXP_NAME} \
     --launcher="pytorch" \
     --no-inv-aug \
-    --auto-scale-lr \
-    --grad-corr
+    --auto-scale-lr
