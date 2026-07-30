@@ -21,10 +21,13 @@ NAME="${NAME:-none-compare-2}"
 AUG_TYPE="${1:-none}"
 BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
+# Name includes AUG_TYPE so different aug types (or none vs grad_corr) never
+# collide on the same work_dir -- train.py's resume check would otherwise
+# silently continue a previous run's checkpoint under a different config.
 # Keep "ours" in the name: train.py appends "_ours" to any exp_name lacking it when
 # --aug-type=ours, which would desync EXP_NAME from the real work_dir (and the guard below).
 # RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
-EXP_NAME="${4:-none_compare_2${RUN_TAG:+_${RUN_TAG}}}"
+EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}_4gpu${RUN_TAG:+_${RUN_TAG}}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
