@@ -276,12 +276,17 @@ def build_config(args):
                     type="RandomAlphaTrainTransform",
                     geometric_only=args.geometric_only,
                     photometric_only=args.photometric_only,
-                    # grad_corr's SA runs over the differentiable ops, so the warmup
-                    # transform must sample from the same vocabulary the SA curve
-                    # and the matrix R are keyed by.
-                    perturbation_set=(
-                        "diff" if augmentation_type == "grad_corr" else "new"
-                    ),
+                    # grad_corr's SA curve and the correlation matrix R are keyed by
+                    # the differentiable-op vocabulary, but that's a measurement
+                    # concern (fed to CollectGradientHook via runner.corr_magnitudes),
+                    # not a training-augmentation concern. The diff ops are
+                    # GPU-batched-only by design (see differentiable_augmentations.py);
+                    # applying them per-image on CPU here (as this used to) is 40-150x
+                    # slower than the "new" vocabulary every other aug type uses.
+                    # Training just uses "new" like ours/random -- see loops.py's
+                    # RobustValLoop.run(), which must never rebuild this pipeline back
+                    # onto the diff vocabulary for the same reason.
+                    perturbation_set="new",
                 )
             )
         elif augmentation_type == "idbh":
