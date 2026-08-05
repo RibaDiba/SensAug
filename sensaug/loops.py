@@ -788,12 +788,19 @@ class RobustValLoop(ValLoop):
 
         if self.n_rounds >= self.warmup_rounds:
             if self.random_aug:
-                apply_random_alpha_training_augmentations(  # noqa: F405
-                    self.runner,
-                    geometric_only=self.geometric_only,
-                    photometric_only=self.photometric_only,
-                    perturbation_set=self.perturbation_set,
-                )
+                # "diff" (grad_corr) trains on the "new" vocabulary -- see
+                # train.py's pipeline wiring -- so this must never rebuild the
+                # train dataloader onto the diff vocabulary: DIFFERENTIABLE_PERTURBATIONS
+                # ops are GPU-batched-only by design and 40-150x slower per-image
+                # on CPU, and self.perturbation_set here is the SA/probe vocabulary,
+                # not what training should sample from.
+                if self.perturbation_set != "diff":
+                    apply_random_alpha_training_augmentations(  # noqa: F405
+                        self.runner,
+                        geometric_only=self.geometric_only,
+                        photometric_only=self.photometric_only,
+                        perturbation_set=self.perturbation_set,
+                    )
 
             else:
                 if (self.n_rounds - self.warmup_rounds) % 6 == 0:
@@ -810,11 +817,19 @@ class RobustValLoop(ValLoop):
                         )
                     )  # update pdf to sample from
                     self.publish_corr_magnitudes()
-                    apply_random_perturbations_train_dataloader_new(  # noqa: F405
-                        self.runner,
-                        pdf_dict=self.pdf_dict,
-                        perturbation_set=self.perturbation_set,
-                    )  # type: ignore
+                    # Same reasoning as the random_aug branch above: grad_corr
+                    # ("diff") trains on the "new" vocabulary, and this call must
+                    # not rebuild the train dataloader back onto "diff" -- that's
+                    # the per-image CPU path that made grad_corr training 40-150x
+                    # slower. publish_corr_magnitudes() above already handed the
+                    # probe everything it needs; the training pipeline set up in
+                    # train.py (perturbation_set="new") is left untouched.
+                    if self.perturbation_set != "diff":
+                        apply_random_perturbations_train_dataloader_new(  # noqa: F405
+                            self.runner,
+                            pdf_dict=self.pdf_dict,
+                            perturbation_set=self.perturbation_set,
+                        )  # type: ignore
 
         # full clean evaluation last
         apply_perturbations_dataloader(self.runner, train=False, perturb_levels={})
