@@ -1,19 +1,19 @@
 #!/bin/bash
 
-#SBATCH --job-name=sensaug-gradcorr-1gpu
+#SBATCH --job-name=grad_corr_test_3
 #SBATCH --account=puchalla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --mem=20G
 #SBATCH --cpus-per-task=4
-#SBATCH --time=08:00:00
+#SBATCH --time=00:30:00
 #SBATCH --gres=gpu:1
 
 #SBATCH --output=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.out
 #SBATCH --error=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.err
 
 # config (overridable via env vars):
-NAME="${NAME:-sensaug-gradcorr-1gpu}"
+NAME="${NAME:-grad_corr_test_3}"
 # grad_corr = SA over the differentiable ops + the gradient cross-correlation
 # pipeline. Add --no-corr-sa below for the control arm (no SA, probes at 0.5).
 AUG_TYPE="${1:-grad_corr}"
@@ -26,7 +26,7 @@ DATASET="${3:-cityscapes}"
 # to any exp_name lacking it when --aug-type=grad_corr, which would otherwise
 # desync EXP_NAME from the real work_dir -- and from the resume guard below.
 # RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
-EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}_1gpu${RUN_TAG:+_${RUN_TAG}}}"
+EXP_NAME="${4:-${AUG_TYPE}_${NAME}_${BACKBONE}_${DATASET}_1gpu${RUN_TAG:+_${RUN_TAG}}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 

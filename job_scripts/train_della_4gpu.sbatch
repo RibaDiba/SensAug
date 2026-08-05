@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=none-compare-2
+#SBATCH --job-name=grad_corr_3
 #SBATCH --account=puchalla
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
@@ -17,8 +17,8 @@
 #SBATCH --error=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.err
 
 # config (overridable via env vars):
-NAME="${NAME:-none-compare-2}"
-AUG_TYPE="${1:-none}"
+NAME="${NAME:-grad_corr_3}"
+AUG_TYPE="${1:-grad_corr}"
 BACKBONE="${2:-pspnet}"
 DATASET="${3:-cityscapes}"
 # Name includes AUG_TYPE so different aug types (or none vs grad_corr) never
@@ -27,7 +27,7 @@ DATASET="${3:-cityscapes}"
 # Keep "ours" in the name: train.py appends "_ours" to any exp_name lacking it when
 # --aug-type=ours, which would desync EXP_NAME from the real work_dir (and the guard below).
 # RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
-EXP_NAME="${4:-${AUG_TYPE}_${BACKBONE}_${DATASET}_4gpu${RUN_TAG:+_${RUN_TAG}}}"
+EXP_NAME="${4:-${AUG_TYPE}_${NAME}_${BACKBONE}_${DATASET}_4gpu${RUN_TAG:+_${RUN_TAG}}}"
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
