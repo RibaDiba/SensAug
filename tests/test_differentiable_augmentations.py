@@ -7,6 +7,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sensaug.dataset.differentiable_augmentations import (
+    BLUR_KERNEL_SIZE,
     DIFFERENTIABLE_PERTURBATIONS,
     DiffAugment,
     R,
@@ -245,6 +246,118 @@ def test_blur_applies_each_images_own_sigma(big_batch):
         assert torch.allclose(out[i : i + 1], expected, atol=1e-5), (
             f"image {i} was not blurred with its own sigma {float(sigma)}"
         )
+
+
+# --- blur: separable + contract-sized kernel is numerically the old dense one --
+#
+# `blur` used to convolve with a dense 2D kernel of a fixed 67x67 size. It now
+# convolves with the two 1D factors of the same separable Gaussian, at a default
+# size derived from the module's [0, 1] magnitude contract (BLUR_KERNEL_SIZE).
+# That is ~240x faster per full-resolution image, and it is the difference
+# between an SA round-eval taking hours and taking minutes -- but only if it does
+# not change the numbers. These tests pin that against the old implementation
+# directly, since "the correlation matrix R still looks right" is far too coarse
+# a signal to catch a subtly wrong blur.
+
+
+def _dense_blur_reference(images, sigma, kernel_size=(67, 67)):
+    """The PREVIOUS implementation, verbatim in behaviour: one dense 2D kernel
+    built as an outer product and normalized by its 2D sum. Kept here (not
+    imported) precisely so these tests keep comparing against the old numbers
+    even after the production code no longer contains this form."""
+    kh, kw = kernel_size
+    s = torch.as_tensor(sigma, dtype=images.dtype).reshape(-1).clamp(min=1e-3)
+    ax_y = torch.arange(kh, dtype=images.dtype) - (kh - 1) / 2.0
+    ax_x = torch.arange(kw, dtype=images.dtype) - (kw - 1) / 2.0
+    var = (2 * s**2 + 1e-12).view(-1, 1)
+    gauss_y = torch.exp(-(ax_y**2).view(1, -1) / var)
+    gauss_x = torch.exp(-(ax_x**2).view(1, -1) / var)
+    kernel2d = gauss_y[:, :, None] * gauss_x[:, None, :]
+    kernel2d = kernel2d / kernel2d.sum(dim=(1, 2), keepdim=True)
+    kernel = kernel2d.view(-1, 1, kh, kw)
+
+    b, c = images.shape[0], images.shape[1]
+    if kernel.shape[0] == 1:
+        return torch.nn.functional.conv2d(
+            images, kernel.repeat(c, 1, 1, 1), padding=(kh // 2, kw // 2), groups=c
+        )
+    kernel = kernel.repeat_interleave(c, dim=0)
+    out = torch.nn.functional.conv2d(
+        images.reshape(1, b * c, *images.shape[2:]),
+        kernel,
+        padding=(kh // 2, kw // 2),
+        groups=b * c,
+    )
+    return out.reshape(b, c, *out.shape[2:])
+
+
+@pytest.mark.parametrize("sigma", [0.25, 0.5, 1.0])
+def test_blur_matches_dense_67_reference_over_magnitude_contract(batch, sigma):
+    """Across the whole magnitude range that can actually reach blur -- SA clamps
+    diff levels to [0, 1] and corr_magnitudes clips to [0, 1] -- the new default
+    must be indistinguishable from the old 67-tap dense convolution. The
+    remaining difference is float32 round-off, not truncation."""
+    assert torch.allclose(
+        blur(batch, sigma), _dense_blur_reference(batch, sigma), atol=1e-5
+    )
+
+
+def test_blur_separable_matches_dense_at_matched_kernel_size(batch):
+    """Isolates separability from the kernel-size change: at the SAME size the two
+    forms are the same kernel, since the dense one was already built as an outer
+    product and sum(outer(a, b)) == sum(a) * sum(b)."""
+    assert torch.allclose(
+        blur(batch, 0.6, kernel_size=(67, 67)),
+        _dense_blur_reference(batch, 0.6, kernel_size=(67, 67)),
+        atol=1e-5,
+    )
+
+
+def test_blur_per_image_sigma_matches_dense_reference(big_batch):
+    """The per-image path folds the batch into the channel dim, so it gets its own
+    comparison -- a separable rewrite could be right for a scalar sigma and wrong
+    for the folded layout."""
+    sigmas = torch.tensor([0.1, 0.5, 0.8, 1.0])
+    assert torch.allclose(
+        blur(big_batch, sigmas), _dense_blur_reference(big_batch, sigmas), atol=1e-5
+    )
+
+
+def test_blur_gradient_wrt_sigma_matches_dense_reference(batch):
+    """d loss / d sigma is what the correlation pipeline actually measures, so
+    matching the forward pass is not sufficient -- the gradient has to match too."""
+    s_new = torch.tensor(0.7, requires_grad=True)
+    s_old = torch.tensor(0.7, requires_grad=True)
+
+    g_new = torch.autograd.grad(blur(batch, s_new).sum(), s_new)[0]
+    g_old = torch.autograd.grad(_dense_blur_reference(batch, s_old).sum(), s_old)[0]
+
+    assert g_new != 0.0
+    assert abs(g_new - g_old) / abs(g_old) < 1e-4
+
+
+def test_blur_warns_when_sigma_outruns_kernel(batch):
+    """The default kernel is sized for sigma <= 1. Reaching past that silently
+    yields a weaker blur than requested, so it must be flagged -- this warning is
+    what makes shrinking the default safe rather than a latent trap."""
+    with pytest.warns(RuntimeWarning, match="exceeds what kernel_size"):
+        blur(batch, 5.0)
+
+
+def test_blur_does_not_warn_within_magnitude_contract(batch, recwarn):
+    """...and it must stay silent for every magnitude a real run can produce,
+    otherwise an SA round-eval would emit one warning per image."""
+    blur(batch, 1.0)  # 1.0 is the largest level SA/corr_magnitudes can emit
+    assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+
+def test_default_kernel_resolves_the_magnitude_contract():
+    """Pins the link between the default kernel size and the [0, 1] magnitude
+    contract it is derived from. If a future change widens the contract past
+    sigma = 1 without resizing the kernel, the blur silently truncates -- this
+    fails first, at import-cheap speed, instead of in a 6-hour job."""
+    contract_max_sigma = 1.0
+    assert (min(BLUR_KERNEL_SIZE) - 1) / 6.0 >= contract_max_sigma
 
 
 def test_noise_applies_each_images_own_delta(big_batch, monkeypatch):

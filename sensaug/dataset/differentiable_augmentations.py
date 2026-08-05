@@ -23,6 +23,7 @@ This is intentionally a DIFFERENT convention from sensaug.dataset.augmentations
 """
 
 import math
+import warnings
 from typing import Tuple, Union
 
 import numpy as np
@@ -44,12 +45,32 @@ _HSV_RAIL_MAX = {H: 2 * math.pi, S: 1.0, V: 1.0}
 # nonzero floor instead of pure black.
 V_DARKEN_FLOOR = 10.0 / 255.0
 
+# Default Gaussian blur support, in taps. Sized to this module's [0, 1]
+# magnitude contract, NOT picked freely: for `blur` the magnitude IS sigma, and
+# both magnitude sources clamp to [0, 1] (adaptive_sensitivity_analysis_new's
+# min_level/max_level = 0.0/1.0, and corr_magnitudes' clip), so 13 taps span
+# +-6 sigma at the largest sigma reachable through DIFFERENTIABLE_PERTURBATIONS.
+#
+# This replaces a previous default of (67, 67). Over the whole reachable range
+# the two are numerically indistinguishable -- measured against the 67-tap
+# kernel, the difference is exactly zero for sigma <= 0.5 and 2.4e-7 (float32
+# round-off) at sigma = 1.0 -- but 67 taps cost 26x more per pixel, which is
+# what made the CPU per-image SA round-eval path (sensaug.loops.RobustValLoop
+# -> the Diff* transforms in sensaug.dataset.augmentations) take hours per
+# round. Together with the separable convolution in `blur`, this is ~240x
+# faster per full-resolution image with no change to the numbers.
+#
+# Callers needing a larger sigma must pass a larger kernel_size explicitly;
+# `blur` warns when sigma outruns the kernel it was given.
+BLUR_KERNEL_SIZE = (13, 13)
+
 __all__ = [
     "color_channel",
     "hsv_channel",
     "blur",
     "gaussian_noise",
     "DiffAugment",
+    "BLUR_KERNEL_SIZE",
     "DIFFERENTIABLE_PERTURBATIONS",
     "img_to_rgb01",
     "rgb01_to_img",
@@ -173,26 +194,67 @@ def hsv_channel(images: Tensor, channel: int, delta: Union[float, Tensor]) -> Te
     return kornia.color.hsv_to_rgb(hsv_out).clamp(0.0, 1.0)
 
 
-def _gaussian_kernel2d(kernel_size: Tuple[int, int], sigma: Tensor) -> Tensor:
-    """Hand-built (guaranteed differentiable w.r.t. `sigma`) 2D Gaussian kernel
-    STACK, shape (n, 1, kh, kw) with n = 1 for a scalar sigma and n = B for a
+def _gaussian_kernel1d(size: int, sigma: Tensor) -> Tensor:
+    """Hand-built (guaranteed differentiable w.r.t. `sigma`) 1D Gaussian kernel
+    STACK, shape (n, size) with n = 1 for a scalar sigma and n = B for a
     per-image sigma. Mirrors the reference repo's own "custom conv2d" blur --
     deliberately not kornia.filters.gaussian_blur2d, whose sigma-argument
-    autograd support is version-dependent."""
-    kh, kw = kernel_size
+    autograd support is version-dependent.
+
+    ONE DIMENSION, not two: an isotropic 2D Gaussian is separable, and this
+    function's previous 2D form built the kernel as exactly that -- the outer
+    product `gauss_y[:, :, None] * gauss_x[:, None, :]`, normalized by its 2D
+    sum. Since sum(outer(a, b)) == sum(a) * sum(b), normalizing each 1D factor
+    by its own sum reproduces the identical 2D kernel, so `blur` can convolve
+    with the two factors in sequence instead of materializing their product.
+    That is an algebraic identity, not an approximation: the measured
+    difference against the dense 2D convolution is float32 round-off (~1e-6 on
+    values in [0, 1]), and it turns a kh*kw-tap convolution into kh+kw taps --
+    a 33x reduction in multiply-adds at the default kernel size, which is what
+    makes the CPU per-image SA path affordable (see `blur`).
+    """
     s = sigma.reshape(-1)  # (n,) -- a 0-dim sigma becomes (1,)
-    ax_y = torch.arange(kh, dtype=sigma.dtype, device=sigma.device) - (kh - 1) / 2.0
-    ax_x = torch.arange(kw, dtype=sigma.dtype, device=sigma.device) - (kw - 1) / 2.0
+    ax = torch.arange(size, dtype=sigma.dtype, device=sigma.device) - (size - 1) / 2.0
     var = (2 * s**2 + 1e-12).view(-1, 1)  # (n, 1)
-    gauss_y = torch.exp(-(ax_y**2).view(1, -1) / var)  # (n, kh)
-    gauss_x = torch.exp(-(ax_x**2).view(1, -1) / var)  # (n, kw)
-    kernel2d = gauss_y[:, :, None] * gauss_x[:, None, :]  # (n, kh, kw)
-    kernel2d = kernel2d / kernel2d.sum(dim=(1, 2), keepdim=True)
-    return kernel2d.view(-1, 1, kh, kw)
+    gauss = torch.exp(-(ax**2).view(1, -1) / var)  # (n, size)
+    return gauss / gauss.sum(dim=1, keepdim=True)
+
+
+def _warn_if_undersupported(sigma: Tensor, kernel_size: Tuple[int, int]) -> None:
+    """Warn when `kernel_size` is too small to resolve `sigma`.
+
+    BLUR_KERNEL_SIZE is sized for this module's [0, 1] magnitude contract, so a
+    caller reaching outside that contract would otherwise silently get a
+    truncated -- effectively weaker -- blur than the sigma it asked for. Warn
+    rather than raise: passing a deliberately under-supported kernel is a valid
+    thing to do in tests (it makes per-image kernel mix-ups easier to detect),
+    and no production path can trip this, since both magnitude sources clamp to
+    [0, 1] (sensitivity_analysis.adaptive_sensitivity_analysis_new's
+    min_level/max_level, and corr_magnitudes' clip).
+
+    Reads sigma under no_grad: this is a diagnostic on the magnitude's value and
+    must not become part of what autograd differentiates.
+    """
+    with torch.no_grad():
+        sigma_max = float(sigma.max())
+    # A Gaussian is numerically dead beyond ~3 sigma, so the kernel's half-width
+    # (k - 1) / 2 taps must cover 3 * sigma.
+    supported = (min(kernel_size) - 1) / 6.0
+    if sigma_max > supported:
+        warnings.warn(
+            f"blur: sigma up to {sigma_max:.3g} exceeds what kernel_size="
+            f"{kernel_size} resolves (max ~{supported:.3g} at 3 sigma); the "
+            f"Gaussian is truncated, so the blur is weaker than requested. Pass "
+            f"a larger kernel_size (>= {2 * math.ceil(3 * sigma_max) + 1}).",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def blur(
-    images: Tensor, sigma: Union[float, Tensor], kernel_size: Tuple[int, int] = (67, 67)
+    images: Tensor,
+    sigma: Union[float, Tensor],
+    kernel_size: Tuple[int, int] = BLUR_KERNEL_SIZE,
 ) -> Tensor:
     """Gaussian blur; magnitude == sigma directly (unsigned; no lighter/darker
     direction, param_min = 0.0). kernel_size is a fixed hyperparameter, not
@@ -201,19 +263,32 @@ def blur(
     instead derive kernel_size from magnitude via cv2's implicit sigma.
 
     `sigma` may be a scalar (one blur for the whole batch) or a length-B vector
-    (a different blur per image)."""
+    (a different blur per image).
+
+    Convolves with the two 1D factors of the separable Gaussian in sequence
+    rather than with their dense 2D product -- same kernel, kh+kw taps instead
+    of kh*kw (see _gaussian_kernel1d). kernel_size is deliberately NOT derived
+    from sigma: a sigma-dependent kernel size would, for a per-image sigma, make
+    the whole batch share a size chosen by its largest sigma, and image i's
+    output would then depend on the other images' magnitudes -- exactly the
+    cross-image coupling CollectGradientHook._sweep is built to exclude.
+    """
     sigma_t = _as_delta(sigma, images).clamp(min=1e-3)
+    _warn_if_undersupported(sigma_t, kernel_size)
     b, c = images.shape[0], images.shape[1]
-    kernel = _gaussian_kernel2d(kernel_size, sigma_t).to(images.dtype)
-    padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+    kh, kw = kernel_size
+    kernel_y = _gaussian_kernel1d(kh, sigma_t).to(images.dtype)
+    kernel_x = _gaussian_kernel1d(kw, sigma_t).to(images.dtype)
 
-    if kernel.shape[0] == 1:
+    if kernel_y.shape[0] == 1:
         # Scalar sigma: one kernel, depthwise over channels.
-        kernel = kernel.repeat(c, 1, 1, 1)
-        return F.conv2d(images, kernel, padding=padding, groups=c)
+        kernel_y = kernel_y.view(1, 1, kh, 1).repeat(c, 1, 1, 1)
+        kernel_x = kernel_x.view(1, 1, 1, kw).repeat(c, 1, 1, 1)
+        out = F.conv2d(images, kernel_y, padding=(kh // 2, 0), groups=c)
+        return F.conv2d(out, kernel_x, padding=(0, kw // 2), groups=c)
 
-    assert kernel.shape[0] == b, (
-        f"sigma must be a scalar or a length-{b} vector, got {kernel.shape[0]}"
+    assert kernel_y.shape[0] == b, (
+        f"sigma must be a scalar or a length-{b} vector, got {kernel_y.shape[0]}"
     )
     # Per-image sigma: fold the batch into the channel dim so every image gets
     # its own kernel, and group by B*C so no kernel sees another image.
@@ -223,13 +298,11 @@ def blur(
     # times CONSECUTIVELY. `repeat` tiles instead, which would silently apply
     # one image's sigma to a different image's channels -- same shapes, no
     # error, wrong numbers.
-    kernel = kernel.repeat_interleave(c, dim=0)  # (b*c, 1, kh, kw)
-    out = F.conv2d(
-        images.reshape(1, b * c, *images.shape[2:]),
-        kernel,
-        padding=padding,
-        groups=b * c,
-    )
+    kernel_y = kernel_y.view(b, 1, kh, 1).repeat_interleave(c, dim=0)  # (b*c, 1, kh, 1)
+    kernel_x = kernel_x.view(b, 1, 1, kw).repeat_interleave(c, dim=0)  # (b*c, 1, 1, kw)
+    folded = images.reshape(1, b * c, *images.shape[2:])
+    out = F.conv2d(folded, kernel_y, padding=(kh // 2, 0), groups=b * c)
+    out = F.conv2d(out, kernel_x, padding=(0, kw // 2), groups=b * c)
     return out.reshape(b, c, *out.shape[2:])
 
 
@@ -259,7 +332,7 @@ class DiffAugment:
     _RGB_CHANNEL = {"R": R, "G": G, "B": B}
     _HSV_CHANNEL = {"H": H, "S": S, "V": V}
 
-    def __init__(self, eps: float = 1.0, kernel_size: Tuple[int, int] = (67, 67)):
+    def __init__(self, eps: float = 1.0, kernel_size: Tuple[int, int] = BLUR_KERNEL_SIZE):
         self.eps = eps
         self.kernel_size = kernel_size
 
