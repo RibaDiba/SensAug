@@ -26,9 +26,17 @@ from sensaug.dataset.utils.non_geometric_transforms import (
 
 from sensaug.dataset.utils.cropping import *
 from sensaug.dataset.differentiable_augmentations import (
-    DIFFERENTIABLE_PERTURBATIONS,
     img_to_rgb01,
     rgb01_to_img,
+)
+
+# The merged 32-op vocabulary, aliased to the old name: DIFF_PERTURBATIONS below
+# generates one registered pipeline transform per key, so this is what makes the
+# whole "diff" perturbation set -- and therefore --aug-type=grad_corr -- cover
+# the AutoAugment-family ops too.
+from sensaug.dataset.differentiable_augmentations_aa import (
+    GEOMETRIC_OP_KEYS,
+    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
 )
 from sensaug.dataset.parameters import COMBINATION_PARAMETERS
 from sensaug.dataset.imagenet_c import (
@@ -1094,28 +1102,9 @@ class HSVPerturbation(BaseTransform):
         Returns:
             PIL Image or Tensor: Image with modified red channel
         """
-
-        max_val = 180 if self.channel == 0 else 255
-
-        img = results["img"]
-        img = self.rgb2hsv(img)
-        if self.channel == 2 and self.direction == 0:
-            img[..., self.channel] = (
-                img[..., self.channel]
-                - self.alpha * img[..., self.channel]
-                + 10 * self.alpha
-            )
-        else:
-            img[..., self.channel] = (
-                img[..., self.channel]
-                - self.alpha * img[..., self.channel]
-                + max_val * self.direction * self.alpha
-            )
-        img = self.hsv2rgb(img)
-
-        results["img"] = img.astype(np.uint8)
-
-        return results
+        return perturb_hsv(
+            results, channel=self.channel, alpha=self.alpha, direction=self.direction
+        )
 
     def __repr__(self) -> str:
         return (
@@ -1298,6 +1287,36 @@ def perturb_rgb(results, channel, alpha, direction):
     return results
 
 
+def perturb_hsv(results, channel, alpha, direction):
+    """HSV counterpart of `perturb_rgb`. channel 0/1/2 -> H/S/V, direction 0/1 ->
+    darker/lighter.
+
+    Lifted verbatim out of HSVPerturbation.transform so the two channel-specific
+    special cases live in exactly one place: hue saturates at 180 under cv2's
+    8-bit HSV (not 255), and darkening V rails toward a small positive floor
+    rather than to 0, which would collapse the image to black and make the op
+    indistinguishable from any other V darkening at high magnitude.
+
+    Unlike `perturb_rgb` this does NOT rewrite results["ori_shape"] -- preserving
+    HSVPerturbation's behaviour, which the legacy non-"_new" SA path in
+    sensitivity_analysis.py/gpr_sa.py/bopt_sa.py constructs by name.
+    """
+    max_val = 180 if channel == 0 else 255
+
+    img = cv2.cvtColor(results["img"], cv2.COLOR_BGR2HSV)
+    if channel == 2 and direction == 0:
+        img[..., channel] = img[..., channel] - alpha * img[..., channel] + 10 * alpha
+    else:
+        img[..., channel] = (
+            img[..., channel] - alpha * img[..., channel] + max_val * direction * alpha
+        )
+    img = cv2.cvtColor(img, cv2.COLOR_HSV2BGR)
+
+    results["img"] = img.astype(np.uint8)
+
+    return results
+
+
 @TRANSFORMS.register_module()
 class LighterR(BaseTransform):
     """Applies RGB perturbation to an image."""
@@ -1368,6 +1387,80 @@ class DarkerB(BaseTransform):
     def transform(self, results: dict) -> dict:
         results = perturb_rgb(results, channel=0, alpha=self.magnitude, direction=0)
         return results
+
+
+# The HSV half of the same vocabulary. HSVPerturbation already implemented these
+# six, but keyed by (channel, alpha, direction) -- a signature the pdf-driven
+# samplers cannot call, since RandomTrainTransformNew and _make_diff_transform
+# both construct a transform as `cls(magnitude=level)`. These are the thin
+# magnitude-signature wrappers that make lighter_H..darker_V addressable the same
+# way lighter_R..darker_B already are.
+
+
+@TRANSFORMS.register_module()
+class LighterH(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=0, alpha=self.magnitude, direction=1)
+
+
+@TRANSFORMS.register_module()
+class DarkerH(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=0, alpha=self.magnitude, direction=0)
+
+
+@TRANSFORMS.register_module()
+class LighterS(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=1, alpha=self.magnitude, direction=1)
+
+
+@TRANSFORMS.register_module()
+class DarkerS(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=1, alpha=self.magnitude, direction=0)
+
+
+@TRANSFORMS.register_module()
+class LighterV(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=2, alpha=self.magnitude, direction=1)
+
+
+@TRANSFORMS.register_module()
+class DarkerV(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=2, alpha=self.magnitude, direction=0)
 
 
 @TRANSFORMS.register_module()
@@ -1516,6 +1609,108 @@ DIFF_PERTURBATIONS = {
     name: (_make_diff_transform(name), True) for name in DIFFERENTIABLE_PERTURBATIONS
 }
 
+# Mirrors NEW_PERTURBATIONS' geometric/photometric split. Everything ported from
+# the reference repo is photometric; only the AutoAugment-family rotate/shear/
+# translate ops are geometric, so the split is keyed off that module's own
+# classification rather than re-derived here.
+DIFF_PERTURBATIONS_GEOMETRIC = {
+    name: value for name, value in DIFF_PERTURBATIONS.items() if name in GEOMETRIC_OP_KEYS
+}
+DIFF_PERTURBATIONS_PHOTOMETRIC = {
+    name: value
+    for name, value in DIFF_PERTURBATIONS.items()
+    if name not in GEOMETRIC_OP_KEYS
+}
+
+
+# --- the aligned vocabulary ---------------------------------------------------
+#
+# The same 32 ops the gradient probe differentiates, but played through the plain
+# CPU transform classes above instead of the DIFF_PERTURBATIONS wrappers around
+# the torch ops.
+#
+# Why it exists: the correlation matrix R is indexed by DIFFERENTIABLE_PERTURBATIONS
+# names while the training pdf is indexed by whatever `perturbation_set` resolves
+# to, and those were disjoint -- "new" is 20 PascalCase names, R's axes are 32
+# snake_case ones, zero overlap. Anything that wants to act on R per-op (weighting
+# the training pdf by a redundancy score, say) needs one vocabulary on both sides.
+# Going through "diff" instead would satisfy that, but DIFFERENTIABLE_PERTURBATIONS
+# ops are GPU-batched-only by design and 40-150x slower applied per-image on CPU,
+# which is what the pipeline and the SA round-eval both do.
+#
+# The 1:1 name correspondence is not a coincidence to be re-derived: the
+# differentiable registries were written to mirror these classes (see
+# differentiable_augmentations.py's DIFFERENTIABLE_PERTURBATIONS comment and
+# differentiable_augmentations_aa.py's registry comment). The parity assertion
+# below is what keeps them from drifting.
+#
+# NOT the same magnitude scale as the differentiable op of the same name -- the
+# two registries agree on WHICH op each name denotes, never on what magnitude 0.5
+# of it means (blur is the starkest: cv2's kernel-size-derived implicit sigma here
+# vs. sigma directly there). A per-op score read off R transfers; a magnitude does
+# not.
+#
+# Posterize/Solarize are absent: they are in NEW_PERTURBATIONS but have no
+# differentiable counterpart, so R cannot see them, so they do not belong in the
+# vocabulary R is meant to govern.
+ALIGNED_PERTURBATIONS = {
+    # base 14 -- Shu et al.'s RGB/HSV/blur/noise ops
+    "lighter_R": (LighterR, True),
+    "darker_R": (DarkerR, True),
+    "lighter_G": (LighterG, True),
+    "darker_G": (DarkerG, True),
+    "lighter_B": (LighterB, True),
+    "darker_B": (DarkerB, True),
+    "lighter_H": (LighterH, True),
+    "darker_H": (DarkerH, True),
+    "lighter_S": (LighterS, True),
+    "darker_S": (DarkerS, True),
+    "lighter_V": (LighterV, True),
+    "darker_V": (DarkerV, True),
+    "blur": (Blur, True),
+    "noise": (Noise, True),
+    # AutoAugment family -- these 18 ARE the NEW_PERTURBATIONS classes, reached
+    # under their differentiable-registry names.
+    "rotate_pos": (Rotate, True),
+    "rotate_neg": (NegativeRotate, True),
+    "shear_x_pos": (ShearX, True),
+    "shear_x_neg": (NegativeShearX, True),
+    "shear_y_pos": (ShearY, True),
+    "shear_y_neg": (NegativeShearY, True),
+    "translate_x_pos": (TranslateX, True),
+    "translate_x_neg": (NegativeTranslateX, True),
+    "translate_y_pos": (TranslateY, True),
+    "translate_y_neg": (NegativeTranslateY, True),
+    "brightness_pos": (BrightnessTransform, True),
+    "brightness_neg": (NegativeBrightnessTransform, True),
+    "contrast_pos": (ContrastTransform, True),
+    "contrast_neg": (NegativeContrastTransform, True),
+    "sharpness_pos": (SharpnessTransform, True),
+    "sharpness_neg": (NegativeSharpnessTransform, True),
+    "color_pos": (ColorTransform, True),
+    "color_neg": (NegativeColorTransform, True),
+}
+
+# Index-compatibility with R's axes is the entire premise; an op added to one
+# registry and not the other would silently drop out of every per-op score
+# (missing name -> no redundancy signal) rather than fail. Fail at import instead.
+assert set(ALIGNED_PERTURBATIONS) == set(DIFFERENTIABLE_PERTURBATIONS), (
+    "ALIGNED_PERTURBATIONS and DIFFERENTIABLE_PERTURBATIONS have diverged: "
+    f"only in aligned={sorted(set(ALIGNED_PERTURBATIONS) - set(DIFFERENTIABLE_PERTURBATIONS))}, "
+    f"only in differentiable={sorted(set(DIFFERENTIABLE_PERTURBATIONS) - set(ALIGNED_PERTURBATIONS))}"
+)
+
+ALIGNED_PERTURBATIONS_GEOMETRIC = {
+    name: value
+    for name, value in ALIGNED_PERTURBATIONS.items()
+    if name in GEOMETRIC_OP_KEYS
+}
+ALIGNED_PERTURBATIONS_PHOTOMETRIC = {
+    name: value
+    for name, value in ALIGNED_PERTURBATIONS.items()
+    if name not in GEOMETRIC_OP_KEYS
+}
+
 
 def resolve_perturbation_set(
     name: str, geometric_only: bool = False, photometric_only: bool = False
@@ -1535,19 +1730,24 @@ def resolve_perturbation_set(
         return NEW_PERTURBATIONS
 
     if name == "diff":
+        # This used to raise on geometric_only, on the grounds that every
+        # differentiable op was photometric. That stopped being true when the
+        # AutoAugment-family rotate/shear/translate ops joined the vocabulary.
         if geometric_only:
-            # Every differentiable op is photometric -- there is no differentiable
-            # shear/translate/rotate. Falling through to "all of them" would hand
-            # back a photometric-only set under a geometric-only flag, which is a
-            # silently wrong experiment rather than an error.
-            raise ValueError(
-                "geometric_only is not available for the 'diff' perturbation set: "
-                f"none of {sorted(DIFF_PERTURBATIONS)} are geometric"
-            )
+            return DIFF_PERTURBATIONS_GEOMETRIC
+        if photometric_only:
+            return DIFF_PERTURBATIONS_PHOTOMETRIC
         return DIFF_PERTURBATIONS
 
+    if name == "aligned":
+        if geometric_only:
+            return ALIGNED_PERTURBATIONS_GEOMETRIC
+        if photometric_only:
+            return ALIGNED_PERTURBATIONS_PHOTOMETRIC
+        return ALIGNED_PERTURBATIONS
+
     raise ValueError(
-        f"unknown perturbation_set {name!r}, expected 'new' or 'diff'"
+        f"unknown perturbation_set {name!r}, expected 'new', 'diff' or 'aligned'"
     )
 
 # @TRANSFORMS.register_module()
