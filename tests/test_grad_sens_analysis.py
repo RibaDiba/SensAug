@@ -18,7 +18,12 @@ pytest.importorskip("mmseg")
 pytestmark = pytest.mark.requires_mmseg
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+# The merged 32-op vocabulary -- the hook's `self.names`, and therefore the axes
+# of R. Fixtures here are keyed by op name, so they must cover the same set the
+# hook iterates or stack_probe_buffer raises KeyError on the missing ones.
+from sensaug.dataset.differentiable_augmentations_aa import (
+    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+)
 
 from sensaug.hooks.grad_sens_analysis import (
     PerturbationSensitivityAnalysisHookWithGradients,
@@ -536,3 +541,144 @@ def test_a_dropped_op_survives_the_json_round_trip_as_null(tmp_path):
     assert record["R_raw"][0] == [None] * N_OPS, "the dropped row must be null, not NaN"
     assert all(row[0] is None for row in record["R_raw"])
     assert record["R_raw"][1][1] == 1.0, "a kept op still has a real diagonal"
+
+
+# --- the redundancy handoff ---------------------------------------------------
+#
+# prune_augmentations does not prune. It publishes a per-op redundancy score onto
+# the runner for RobustValLoop to reweight the training pdf by. The scoring itself
+# is tested in test_redundancy.py against synthetic input; these cover the handoff
+# -- what gets published, and the three cases where nothing must be.
+
+
+def _redundancy_hook(tmp_path, **kwargs):
+    kwargs.setdefault("interval", 500)
+    kwargs.setdefault("bootstrap", False)
+    kwargs.setdefault("n_min", 8)
+    return _hook(**kwargs)
+
+
+def _emit_once(tmp_path, hook, seed=0, n_probes=6):
+    """Drive one full emission through the interval gate, as training would."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    _fill(buffer, n_probes=n_probes, seed=seed)
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+    return runner
+
+
+def test_an_emission_publishes_a_redundancy_score(tmp_path):
+    """The handoff channel: the hook fires on corr_interval and the SA loop reads
+    on round_interval, so the score is left on the runner for whenever the loop
+    next looks rather than pushed at it."""
+    runner = _emit_once(tmp_path, _redundancy_hook(tmp_path))
+
+    published = runner.corr_redundancy
+    assert published is not None
+    assert set(published["red"]) == set(NAMES)
+    assert published["mode"] == "squared"
+    assert published["checkpoint"] == 0.5
+    assert published["fdr_gated"] is False, "no bootstrap was run"
+    assert all(np.isfinite(v) for v in published["red"].values())
+
+
+def test_the_published_score_is_standardized(tmp_path):
+    """What makes one lambda portable across runs and checkpoints. If the raw row
+    sums were published instead, a lambda tuned on one checkpoint would mean
+    something different at the next."""
+    runner = _emit_once(tmp_path, _redundancy_hook(tmp_path))
+    values = np.array(list(runner.corr_redundancy["red"].values()))
+
+    assert values.mean() == pytest.approx(0.0, abs=1e-9)
+    assert values.std() == pytest.approx(1.0, rel=1e-6)
+
+
+def test_the_score_is_appended_to_its_own_jsonl_log(tmp_path):
+    """One record per emission, appended -- so a --resume adds to the history
+    rather than rewriting it, matching corr_bootstrap_log.txt."""
+    hook = _redundancy_hook(tmp_path)
+    _emit_once(tmp_path, hook)
+    _emit_once(tmp_path, hook, seed=1)
+
+    lines = (tmp_path / "corr_redundancy_log.txt").read_text().strip().split("\n")
+    assert len(lines) == 2
+    record = json.loads(lines[0])
+    assert set(record["red"]) == set(NAMES)
+    assert "raw" in record and "dropped" in record
+
+
+def test_the_raw_row_sums_are_logged_alongside_the_standardized_score(tmp_path):
+    """Standardization is lossy -- it throws away the scale that says how redundant
+    the bank is overall. Recording the raw sums keeps that recoverable offline."""
+    runner = _emit_once(tmp_path, _redundancy_hook(tmp_path))
+    raw = np.array(list(runner.corr_redundancy["raw"].values()))
+
+    assert (raw >= 0).all(), "squared row sums cannot be negative"
+    assert raw.std() > 0
+
+
+def test_no_score_is_published_when_the_shared_factor_alarm_fires(tmp_path):
+    """_emit already warns 'Do not act on it' when every op loads on one per-image
+    factor -- at that point R ranks which IMAGES are hard, not which augmentations
+    overlap. Until now nothing enforced it and prune_augmentations ran anyway."""
+    hook = _redundancy_hook(tmp_path)
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=1000)
+    runner.corr_redundancy = {"stale": True}
+
+    r = np.eye(N_OPS)
+    hook.prune_augmentations(runner, r, checkpoint=0.5, max_loading=0.95)
+
+    assert runner.corr_redundancy is None, "a score was published past the alarm"
+    assert not (tmp_path / "corr_redundancy_log.txt").exists()
+
+
+def test_no_score_is_published_when_red_is_degenerate(tmp_path):
+    """A silent no-op is the failure mode most likely to waste a week: the run
+    looks like a real experimental arm and the pdf never moved."""
+    hook = _redundancy_hook(tmp_path)
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=1000)
+
+    # Identity R: every off-diagonal cell zero, so every op is equally redundant.
+    hook.prune_augmentations(runner, np.eye(N_OPS), checkpoint=0.5, max_loading=0.1)
+
+    assert runner.corr_redundancy is None
+
+
+def test_an_all_nan_matrix_publishes_nothing_and_does_not_raise(tmp_path):
+    hook = _redundancy_hook(tmp_path)
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=1000)
+
+    hook.prune_augmentations(runner, np.full((N_OPS, N_OPS), np.nan), checkpoint=0.5)
+
+    assert getattr(runner, "corr_redundancy", None) is None
+
+
+def test_the_fdr_survivor_mask_is_used_when_the_bootstrap_ran(tmp_path):
+    """The gate section 3.2 asks for: cells that did not survive multiplicity
+    correction at 496 simultaneous tests contribute nothing to red(a)."""
+    hook = _redundancy_hook(tmp_path, bootstrap=True, bootstrap_reps=50)
+    runner = _emit_once(tmp_path, hook, n_probes=40)
+
+    assert runner.corr_redundancy["fdr_gated"] is True
+
+
+def test_red_mode_selects_the_reduction(tmp_path):
+    """squared/abs/signed are the ablation arms. They have to actually differ."""
+    # Separate work_dirs: each hook caches its log paths on first emission.
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir(exist_ok=True)
+
+    squared = _emit_once(tmp_path / "a", _redundancy_hook(tmp_path)).corr_redundancy
+    hook = _redundancy_hook(tmp_path, red_mode="signed")
+    signed = _emit_once(tmp_path / "b", hook).corr_redundancy
+
+    assert signed["mode"] == "signed"
+    assert squared["red"] != signed["red"]
+
+
+def test_an_unknown_red_mode_is_rejected_at_construction(tmp_path):
+    """Not at the first emission, which on the default corr_interval is 25% of the
+    way into a multi-hour run."""
+    with pytest.raises(ValueError, match="unknown red_mode"):
+        PerturbationSensitivityAnalysisHookWithGradients(interval=10, red_mode="cubed")

@@ -35,6 +35,10 @@ from sensaug.dataset.differentiable_augmentations import (
     img_to_rgb01,
     rgb01_to_img,
 )
+from sensaug.dataset.differentiable_augmentations_aa import (
+    ALL_DIFFERENTIABLE_PERTURBATIONS,
+    GEOMETRIC_OP_KEYS,
+)
 from sensaug.runner_utils import _perturbation_transform_cfg
 
 
@@ -46,12 +50,18 @@ def bgr_image():
 # --- registry shape -----------------------------------------------------------
 
 
-def test_covers_exactly_the_original_fourteen_ops():
+def test_covers_exactly_the_merged_thirty_two_ops():
     """No op may be added or dropped in the wrapping. A missing one would vanish
     from the SA curve while still appearing in R, and be probed at the fallback
-    magnitude forever with nothing in the log to say so."""
-    assert set(DIFF_PERTURBATIONS) == set(DIFFERENTIABLE_PERTURBATIONS)
-    assert len(DIFF_PERTURBATIONS) == 14
+    magnitude forever with nothing in the log to say so.
+
+    32 = the 14 ops ported from the reference repo + the 18 AutoAugment-family
+    ops. The base module's DIFFERENTIABLE_PERTURBATIONS still means only the
+    former, so this checks against the merged registry the wrappers are
+    generated from."""
+    assert set(DIFF_PERTURBATIONS) == set(ALL_DIFFERENTIABLE_PERTURBATIONS)
+    assert len(DIFF_PERTURBATIONS) == 32
+    assert set(DIFFERENTIABLE_PERTURBATIONS) < set(DIFF_PERTURBATIONS)
 
 
 def test_mirrors_the_new_perturbations_dict_shape():
@@ -143,12 +153,22 @@ def test_resolve_perturbation_set_selects_registries():
     assert resolve_perturbation_set("diff") is DIFF_PERTURBATIONS
 
 
-def test_geometric_only_is_rejected_for_diff():
-    """Every differentiable op is photometric. Silently returning all of them under
-    a geometric-only flag would run a differently-scoped experiment than asked
-    for, with nothing to reveal it."""
-    with pytest.raises(ValueError, match="not available for the 'diff'"):
-        resolve_perturbation_set("diff", geometric_only=True)
+def test_geometric_and_photometric_filters_partition_the_diff_set():
+    """This used to assert that geometric_only RAISED for the diff set, because
+    every differentiable op was photometric. The AutoAugment-family rotate/shear/
+    translate ops ended that, so the filter now has to return the right subset --
+    silently returning all 32 under a geometric-only flag would run a
+    differently-scoped experiment than asked for, with nothing to reveal it."""
+    geometric = resolve_perturbation_set("diff", geometric_only=True)
+    photometric = resolve_perturbation_set("diff", photometric_only=True)
+
+    assert set(geometric) == set(GEOMETRIC_OP_KEYS)
+    assert len(geometric) == 10
+    assert set(geometric).isdisjoint(photometric)
+    assert set(geometric) | set(photometric) == set(DIFF_PERTURBATIONS)
+
+    # Everything ported from the reference repo is photometric.
+    assert set(DIFFERENTIABLE_PERTURBATIONS) <= set(photometric)
 
 
 def test_unknown_perturbation_set_raises():
