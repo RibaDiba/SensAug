@@ -127,6 +127,42 @@ def apply_acdc_train_eval(cfg, split="all"):
     return cfg
 
 
+def _localize_pretrained_checkpoint(cfg, backbone):
+    """Redirect backbone.init_cfg checkpoint URLs to PRETRAINED_CACHE_DIR.
+
+    Compute nodes on Della have no internet access, so any config whose backbone
+    init_cfg points at a download.openmmlab.com URL (segformer, pspnet-rsb,
+    convnext, swin) crashes deep inside model.init_weights() with a DNS error.
+    Fails fast here instead, before Runner/NCCL/dataloaders spin up, if the local
+    copy hasn't been staged yet via scripts/download_pretrained_checkpoints.py.
+    """
+    if not PRETRAINED_CACHE_DIR or "model" not in cfg:
+        return
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "Pretrained" and str(
+            node.get("checkpoint", "")
+        ).startswith("http"):
+            url = node["checkpoint"]
+            local_path = os.path.join(PRETRAINED_CACHE_DIR, os.path.basename(url))
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"Pretrained checkpoint not cached locally: {url}\n"
+                    f"Expected at: {local_path}\n"
+                    "Compute nodes have no internet access -- fetch it first from a "
+                    "login node (or your machine + rsync) with:\n"
+                    f"  python scripts/download_pretrained_checkpoints.py --backbone {backbone}"
+                )
+            node["checkpoint"] = local_path
+            return
+        for v in node.values():
+            _walk(v)
+
+    _walk(cfg.model)
+
+
 def build_config(args):
     if args.use_foundation_backbone and args.dataset == "cityscapes":
         config_path = os.path.dirname(MMCONFIG_PATH)
@@ -185,6 +221,7 @@ def build_config(args):
     cfg.launcher = args.launcher
     cfg.pretrained = None
     cfg.model.pretrained = None
+    _localize_pretrained_checkpoint(cfg, args.backbone)
 
     # enable automatic-mixed-precision training
     if args.amp:
@@ -231,9 +268,7 @@ def build_config(args):
         args.aug_type == "grad_corr" and args.no_corr_sa
     )
 
-    if args.aug_type == "default":  # use default augmentations from config
-        pipeline = cfg.train_dataloader.dataset.pipeline
-    elif plain_pipeline:  # use no augmentations
+    if plain_pipeline:  # use no augmentations
         excluded_augmentations = [
             "PhotoMetricDistortion",
             "RandomFlip",
@@ -270,23 +305,32 @@ def build_config(args):
             pipeline.append(dict(type="RandAugmentTransform"))
         elif augmentation_type == "trivialaugment":
             pipeline.append(dict(type="TrivialAugmentWideTransform"))
-        elif augmentation_type in ("random", "ours", "grad_corr"):
+        elif augmentation_type in ("random", "ours", "grad_corr", "default"):
             pipeline.append(
                 dict(
                     type="RandomAlphaTrainTransform",
                     geometric_only=args.geometric_only,
                     photometric_only=args.photometric_only,
-                    # grad_corr's SA curve and the correlation matrix R are keyed by
-                    # the differentiable-op vocabulary, but that's a measurement
-                    # concern (fed to CollectGradientHook via runner.corr_magnitudes),
-                    # not a training-augmentation concern. The diff ops are
-                    # GPU-batched-only by design (see differentiable_augmentations.py);
-                    # applying them per-image on CPU here (as this used to) is 40-150x
-                    # slower than the "new" vocabulary every other aug type uses.
-                    # Training just uses "new" like ours/random -- see loops.py's
-                    # RobustValLoop.run(), which must never rebuild this pipeline back
-                    # onto the diff vocabulary for the same reason.
-                    perturbation_set="new",
+                    # grad_corr/ours/default all train on "aligned": the same 32 ops
+                    # R is computed over, played through the plain CPU transform
+                    # classes. That is what lets a per-op score read off R index
+                    # straight into the training pdf -- "new" is 20 PascalCase names
+                    # against R's 32 snake_case ones, and they overlap on nothing.
+                    # Keeping all three of these arms on the same vocabulary is also
+                    # what makes them comparable to each other in the first place --
+                    # they're meant to differ in how they pick/weight from the set,
+                    # not in which ops are available. "random" is left on "new" on
+                    # purpose: it isn't one of the compared arms.
+                    #
+                    # NOT "diff", which has the right names but the wrong
+                    # implementation: those ops are GPU-batched-only by design (see
+                    # differentiable_augmentations.py) and 40-150x slower applied
+                    # per-image on CPU, which is what this pipeline does.
+                    perturbation_set=(
+                        "aligned"
+                        if augmentation_type in ("grad_corr", "ours", "default")
+                        else "new"
+                    ),
                 )
             )
         elif augmentation_type == "idbh":
@@ -369,8 +413,14 @@ def build_config(args):
     if sa_loop:
         eval_ratio = 0.25 if "acdc" not in args.dataset.lower() else 1.0
         cfg.val_cfg.type = "RobustValLoop"
+        # "aligned", not "diff": same 32 op names either way, but the CPU classes
+        # rather than the per-image torch wrappers. The SA round-eval inserts these
+        # into the val dataloader once per (op, level) pair, and on the diff
+        # vocabulary that was the dominant cost of a grad_corr run. ours also trains
+        # on "aligned" now (see the pipeline-construction block above), so its SA
+        # phase must probe the same vocabulary its uniform warmup phase used.
         cfg.val_cfg.perturbation_set = (
-            "diff" if args.aug_type == "grad_corr" else "new"
+            "aligned" if args.aug_type in ("grad_corr", "ours") else "new"
         )
         cfg.val_cfg.ratio = eval_ratio
         cfg.val_cfg.sa_curve_path = "sensaug/testing/test_levels_voc.json"
@@ -384,6 +434,8 @@ def build_config(args):
         cfg.val_cfg.geometric_only = args.geometric_only
         cfg.val_cfg.photometric_only = args.photometric_only
         cfg.val_cfg.weighted_augs = args.weighted_augs
+        cfg.val_cfg.corr_lambda = args.corr_lambda
+        cfg.val_cfg.corr_lambda_ramp = args.corr_lambda_ramp
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio
@@ -430,6 +482,8 @@ def build_config(args):
             dict(
                 type="PerturbationSensitivityAnalysisHookWithGradients",
                 interval=emit_interval,
+                red_mode=args.corr_red_mode,
+                mask_within_op=not args.corr_keep_within_op,
                 priority="LOW",
             ),
         ]
@@ -483,6 +537,7 @@ if __name__ == "__main__":
     SUPPORTED_DATASETS  = _seg["SUPPORTED_DATASETS"]
     SUPPORTED_BACKBONES = _seg["SUPPORTED_BACKBONES"]
     SCHEDULE            = _seg["SCHEDULE"]
+    PRETRAINED_CACHE_DIR = _seg["PRETRAINED_CACHE_DIR"]
 
     parser = argparse.ArgumentParser(description="main")
     parser.add_argument(
@@ -649,6 +704,48 @@ if __name__ == "__main__":
         "matrix emissions. Overrides schedule.corr_interval in the cluster config. "
         "Independent of --round_interval. Defaults to max_iters // 4. Ignored when "
         "--corr-sync-sa is set.",
+    )
+    parser.add_argument(
+        "--corr-lambda",
+        type=float,
+        default=0.0,
+        help="strength of the redundancy down-weighting applied to the training "
+        "pdf: q(a) proportional to pdf(a) * exp(-lambda * red(a)), where red(a) is "
+        "the standardized row sum of the correlation matrix R. 0 (the default) "
+        "leaves the pdf bit-identical and is the control arm. Because red(a) is "
+        "standardized, lambda means the same thing across runs and checkpoints: on "
+        "the logged matrices 0.25 gives a max/min spread of 2.3-3.1x, 0.5 gives "
+        "5-10x, and 1.0 is already extreme. Needs an R-keyed vocabulary, i.e. "
+        "--aug-type=grad_corr.",
+    )
+    parser.add_argument(
+        "--corr-red-mode",
+        type=str,
+        default="squared",
+        choices=["squared", "abs", "signed"],
+        help="how a row of R reduces to one redundancy score per op. 'squared' "
+        "(default) is closure-proof and independent of any op's sign convention. "
+        "'abs' and 'signed' are ablation arms -- note 'signed' PROTECTS an "
+        "anti-correlated pair rather than down-weighting it.",
+    )
+    parser.add_argument(
+        "--corr-lambda-ramp",
+        type=str,
+        default="linear",
+        choices=["linear", "constant"],
+        help="whether lambda ramps from 0 to --corr-lambda over training (default) "
+        "or applies at full strength from the first emission. R measured early "
+        "describes a model that barely discriminates between augmentations yet, so "
+        "the ramp acts least on the least trustworthy measurement.",
+    )
+    parser.add_argument(
+        "--corr-keep-within-op",
+        action="store_true",
+        default=False,
+        help="keep the lighter/darker and _pos/_neg cells in red(a). They are "
+        "excluded by default: the two directions of one op measure a "
+        "parameterization convention, not redundancy between augmentations anyone "
+        "would have chosen independently.",
     )
     parser.add_argument(
         "--adamw",

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=grad_corr_3
+#SBATCH --job-name=default_segformer_2
 #SBATCH --account=puchalla
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
@@ -17,9 +17,9 @@
 #SBATCH --error=/projects/PUCHALLA/LLP2024/tumor/logs/%x.%j.err
 
 # config (overridable via env vars):
-NAME="${NAME:-grad_corr_3}"
-AUG_TYPE="${1:-grad_corr}"
-BACKBONE="${2:-pspnet}"
+NAME="${NAME:-default_segformer_2}"
+AUG_TYPE="${1:-default}"
+BACKBONE="${2:-segformer}"
 DATASET="${3:-cityscapes}"
 # Name includes AUG_TYPE so different aug types (or none vs grad_corr) never
 # collide on the same work_dir -- train.py's resume check would otherwise
@@ -78,7 +78,8 @@ torchrun \
     --exp_name=${EXP_NAME} \
     --launcher="pytorch" \
     --no-inv-aug \
-    --auto-scale-lr
+    --auto-scale-lr \
+    --descending-MA
 # The correlation pipeline is an --aug-type now, not a flag: to enable it here,
 # pass grad_corr as the first positional arg (or set AUG_TYPE), rather than
 # uncommenting a flag.

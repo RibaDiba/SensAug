@@ -2,6 +2,13 @@ data_root: /projects/PUCHALLA/LLP2024/tumor/data
 mmconfig_path: /projects/PUCHALLA/LLP2024/tumor/sensaug/custom_configs/mmseg
 primary_metric: mIoU
 
+# Compute nodes have no internet access, so backbone configs whose init_cfg points
+# at a download.openmmlab.com URL (segformer, pspnet-rsb, convnext, swin) crash at
+# model.init_weights() with a DNS error. This is where those URLs get redirected to
+# instead -- populate it once via scripts/download_pretrained_checkpoints.py, run
+# from a login node (or your own machine + rsync), before submitting those jobs.
+pretrained_cache_dir: /projects/PUCHALLA/LLP2024/tumor/pretrained_checkpoints
+
 # The two pipelines run on independent clocks. Both are in ITERATIONS; null takes
 # the default. CLI flags (--round_interval, --corr-interval) override these.
 schedule:

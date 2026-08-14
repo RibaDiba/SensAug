@@ -34,6 +34,27 @@ The code reads the paths from these files throughout training and testing. Every
 
 > The cluster YAMLs replace the old `SEG_CONFIG.py`, which no longer exists.
 
+### Pretrained backbone checkpoints
+
+Compute nodes on Della have no internet access. Several backbone configs (segformer,
+pspnet-rsb, convnext, swin) point their `backbone.init_cfg` at a
+`download.openmmlab.com` URL, which crashes `model.init_weights()` with a DNS error
+if the job hits it on a compute node.
+
+`train.py` redirects those URLs to `pretrained_cache_dir` (set in the cluster YAML)
+and fails fast with a clear message — not the checkpoint-loading traceback — if the
+file isn't cached there yet. Populate the cache once, from somewhere with real
+internet access (a Della **login** node, or your own machine + `rsync`/`scp` — not
+a compute node or an sbatch job):
+
+```bash
+python scripts/download_pretrained_checkpoints.py --backbone segformer
+# or: --backbone pspnet convnext swin, or --all for every supported backbone
+```
+
+Use `--dry-run` first to see what would be fetched (and its size) without
+downloading anything.
+
 ## Setting up Supported Datasets 
 
 Currently, this repo supports all backbones provided by MMSegmentation and additionally the datasets listed under `datasets:` in the cluster config (see [configs/nexus.yaml](configs/nexus.yaml) for the full set):
@@ -69,7 +90,7 @@ There are many command-line arguments in the train.py script, which you can list
 | `--cluster-config` | str | *(required)* | Path to YAML cluster config (e.g. `configs/della.yaml`) |
 | `--work_dir` | str | *(required)* | Root directory where experiment output folders are saved |
 | `--exp_name` | str | `ours_{backbone}_{dataset}` | Experiment name; creates a subfolder under `work_dir` |
-| `--aug-type` | str | `none` | Augmentation strategy: `none`, `ours`, `default`, `random`, `autoaugment`, `augmix`, `randaugment`, `trivialaugment`, `idbh`, `vip` |
+| `--aug-type` | str | `none` | Augmentation strategy: `none`, `ours`, `default`, `grad_corr`, `random`, `autoaugment`, `augmix`, `randaugment`, `trivialaugment`, `idbh`, `vip`. `grad_corr` enables the gradient cross-correlation pipeline (see [Scheduling](#scheduling-two-independent-pipelines)) — it is its own value, not a separate flag |
 | `--backbone` | str | `pspnet` | Model backbone (must exist under `sensaug/custom_configs/mmseg/`) |
 | `--dataset` | str | `cityscapes` | Dataset key from cluster config |
 | `--use-foundation-backbone` | flag | False | Use DINOv2 foundation model as backbone |
@@ -83,8 +104,8 @@ There are many command-line arguments in the train.py script, which you can list
 | `--descending-MA` | flag | False | Prioritize less severe augmentations (descending moving average) |
 | `--freeze-early-layers` | flag | False | Freeze early backbone layers during training |
 | `--round_interval` | int | `max_iters // 20` | Iterations between robustness re-evaluations — the **SA pipeline's clock**. Overrides `schedule.round_interval` in the cluster config. See [Scheduling](#scheduling-two-independent-pipelines) |
-| `--grad-corr` | flag | False | Enable the **gradient cross-correlation pipeline**: log the augmentation cross-correlation matrix R. Independent of `--aug-type`, so it also works against an `--aug-type=none` baseline |
-| `--corr-interval` | int | `max_iters // 4` | Iterations between gradient sweeps and R emissions — the **correlation pipeline's clock**. Only meaningful with `--grad-corr`. Overrides `schedule.corr_interval` in the cluster config |
+| `--no-corr-sa` | flag | False | Under `--aug-type=grad_corr`, disable the SA loop — trains exactly like `none` while still running the correlation measurement. This is the control arm |
+| `--corr-interval` | int | `max_iters // 4` | Iterations between gradient sweeps and R emissions — the **correlation pipeline's clock**. Only meaningful under `--aug-type=grad_corr`. Overrides `schedule.corr_interval` in the cluster config |
 | `--sa_interval` | int | None | ⚠️ Currently unused — parsed but never read. The SA-curve recompute cadence is hardcoded to every 6th round in `sensaug/loops.py` |
 | `--adamw` | flag | False | Use AdamW optimizer instead of default SGD |
 | `--amp` | flag | False | Enable automatic mixed-precision (AMP) training |
@@ -114,15 +135,15 @@ Leave a value `null` (or omit the `schedule:` block entirely) to take the defaul
 Notes on each:
 
 - **SA pipeline.** Runs only under `--aug-type=ours`. Every `round_interval` iterations it re-evaluates perturbation robustness and rebuilds the training sampling PDF. The SA *curve* itself is recomputed every 6th round (hardcoded in `sensaug/loops.py`), so the effective SA-curve cadence is `6 × round_interval`.
-- **Correlation pipeline.** Opt-in via `--grad-corr`, and **independent of `--aug-type`** — it runs for `none`, `default`, `ours`, anything. Every `corr_interval` iterations it freezes the model, sweeps the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per augmentation per image, and correlates that sweep into R. It fires from `after_train_iter`, so it never depends on a val round happening. The final training iteration always fires, so the converged model's R exists even when `max_iters` is not a multiple of `corr_interval`.
+- **Correlation pipeline.** Opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag you layer on top of another one (there is no standalone `--grad-corr` flag; `--aug-type=none --grad-corr` is not valid). Every `corr_interval` iterations it freezes the model, sweeps the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per augmentation per image, and correlates that sweep into R. It fires from `after_train_iter`, so it never depends on a val round happening. The final training iteration always fires, so the converged model's R exists even when `max_iters` is not a multiple of `corr_interval`.
 
-Being able to run the correlation pipeline against an `--aug-type=none` baseline is the point of keeping the two independent — R is a claim about the augmentation operators themselves, not about the `ours` training loop:
+R is a claim about the augmentation operators themselves, not about the `ours` training loop, so the pipeline also needs an unaugmented control arm to compare against. That's `--no-corr-sa`: it disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.
 
 ```bash
 python train.py \
   --cluster-config=configs/della.yaml \
   --backbone=pspnet --dataset=cityscapes \
-  --aug-type=none --grad-corr --corr-interval=20000 \
+  --aug-type=grad_corr --no-corr-sa --corr-interval=20000 \
   --work_dir=./experiments --exp_name=corr_baseline_pspnet_cityscapes
 ```
 
@@ -142,7 +163,7 @@ or, if you want to submit to a GPU cluster with a SLURM scheduler, you can simpl
 
 ```sbatch job_scripts/train_generic.sh [aug] [model] [dataset]```
 
-[aug] options: 'none', 'ours', 'default', 'autoaugment', 'augmix', 'randaugment', 'trivialaugment'
+[aug] options: 'none', 'ours', 'default', 'grad_corr', 'random', 'autoaugment', 'augmix', 'randaugment', 'trivialaugment', 'idbh', 'vip'
 
 [model] options: any model name from subfolders of [```custom_configs/mmseg```](sensaug/custom_configs/mmseg). example: 'pspnet', 'segformer', 'vit', 'swin'. 
 
