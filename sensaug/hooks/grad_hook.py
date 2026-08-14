@@ -68,7 +68,12 @@ from mmseg.registry import HOOKS
 from mmengine.hooks import Hook
 
 # Local imports
-from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+# The merged 32-op vocabulary (the base module's 14 + the 18 AutoAugment-family
+# ops), aliased to the old name so every sweep site below is unchanged. See
+# ALL_DIFFERENTIABLE_PERTURBATIONS for the label caveat on the geometric ops.
+from sensaug.dataset.differentiable_augmentations_aa import (
+    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+)
 from sensaug.corr_magnitudes import (
     MAGNITUDE_MODES,
     MODE_FIXED,

@@ -56,8 +56,13 @@ from mmseg.registry import HOOKS
 from mmengine.hooks import Hook
 
 # Local imports
-from sensaug.dataset.differentiable_augmentations import DIFFERENTIABLE_PERTURBATIONS
+# The merged 32-op vocabulary -- these are the axes of R. Aliased to the old
+# name so nothing else in this module changes.
+from sensaug.dataset.differentiable_augmentations_aa import (
+    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+)
 from sensaug.hooks.grad_hook import fires_at, training_progress
+from sensaug.redundancy import MODES, compute_red, summarise
 # Imported straight off the submodule, NOT as `from sensaug.hooks import corr_viz`.
 # hooks/__init__.py imports this module, so the package form is a cycle through a
 # half-initialized package -- and the `except ImportError: pass` wrapping that
@@ -398,9 +403,13 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         bootstrap_seed: int = 0,
         fdr_alpha: float = 0.05,
         gather_ranks: bool = True,
+        red_mode: str = "squared",
+        mask_within_op: bool = True,
     ) -> None:
         if interval < 1:
             raise ValueError(f"interval must be a positive iteration count, got {interval}")
+        if red_mode not in MODES:
+            raise ValueError(f"unknown red_mode {red_mode!r}, expected one of {MODES}")
         self.interval = interval
         self.n_min = n_min
         self.normalize_per_image = normalize_per_image
@@ -409,9 +418,15 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         self.bootstrap_seed = bootstrap_seed
         self.fdr_alpha = fdr_alpha
         self.gather_ranks = gather_ranks
+        # How the per-op redundancy score reduces a row of R. "squared" is
+        # closure-proof and sign-convention independent; "abs" and "signed" are
+        # ablation arms. See sensaug/redundancy.py.
+        self.red_mode = red_mode
+        self.mask_within_op = mask_within_op
 
         self.corr_log_path = None
         self.bootstrap_log_path = None
+        self.redundancy_log_path = None
         self.names = list(DIFFERENTIABLE_PERTURBATIONS)
 
     def after_train_iter(
@@ -560,7 +575,13 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
                 level=30,  # WARNING
             )
 
-        self.prune_augmentations(r_primary)
+        self.prune_augmentations(
+            runner,
+            r_primary,
+            checkpoint=checkpoint,
+            survives=(cell_stats or {}).get("survives"),
+            max_loading=max_loading,
+        )
 
     def _emit_bootstrap(self, checkpoint, d_grad, probe_ids, dropped):
         """Per-cell CIs + BH-FDR, written to their own file -- 91 cells x several
@@ -878,15 +899,95 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         """
         return correlate(d_grad)
 
-    def prune_augmentations(self, r: np.ndarray) -> None:
-        """Prune redundant augmentations given the correlation matrix R.
+    def prune_augmentations(
+        self,
+        runner: Runner,
+        r: np.ndarray,
+        checkpoint: float = None,
+        survives: np.ndarray = None,
+        max_loading: float = np.nan,
+    ) -> None:
+        """Publish a per-op redundancy score for the SA loop to reweight the pdf by.
 
-        Deliberately still a stub. R defines "redundant" as loss-gradient
-        alignment at a fixed reference magnitude -- not as overlap in held-out
-        per-image performance drop, which is what the pruning claim actually
-        wants to rest on. That definition needs sign-off before anything acts on
-        it. When it does: soft down-weighting of the sampling probability only,
-        never hard deletion -- at the correlation sizes expected here (~0.3-0.5)
-        deletion is unjustified.
+        Soft down-weighting of the sampling probability only, never hard deletion:
+        at the correlation sizes actually observed here (mean |r| of 0.11-0.22)
+        deletion would not be justified, and exp() is strictly positive so it is
+        structurally impossible rather than merely avoided. The scoring itself lives
+        in sensaug/redundancy.py, deliberately free of mmseg so it is testable
+        without a GPU.
+
+        Named for what it used to be a stub for. It does not prune.
+
+        Published onto the runner rather than pushed, the same handoff channel
+        `runner.corr_magnitudes` uses in the other direction: this hook fires on
+        `corr_interval` (4 emissions by default) and the SA loop regenerates the pdf
+        on `round_interval` (20 rounds), so the loop reads whatever is current and
+        the two clocks never have to agree. Before the first emission there is no
+        score and the pdf is untouched.
+
+        The score is a per-op summary of R, and R defines "redundant" as loss-
+        gradient alignment at the probe magnitude -- not as overlap in held-out
+        per-image performance drop, which is what a pruning claim would need to rest
+        on. Down-weighting is defensible on the weaker definition; deletion is not.
         """
-        pass
+        if not np.isfinite(r).any():
+            return
+
+        # The shared-factor alarm already prints "Do not act on it" a few lines
+        # above; until now nothing enforced it. When every op loads on one
+        # per-image factor, R is ranking which IMAGES are hard, and a score built
+        # from it would reweight augmentations on the strength of image difficulty.
+        if np.isfinite(max_loading) and max_loading > _LOADING_ALARM:
+            runner.corr_redundancy = None
+            print_log(
+                f"[grad-corr] redundancy score withheld: max shared-factor loading "
+                f"{max_loading:.2f} > {_LOADING_ALARM}. The pdf is left unweighted.",
+                logger="current",
+                level=30,  # WARNING
+            )
+            return
+
+        # No bootstrap means no survivor mask; score every cell rather than fail.
+        # Losing the multiplicity gate makes the score noisier, not wrong.
+        score = compute_red(
+            r,
+            self.names,
+            mode=self.red_mode,
+            mask_within_op=self.mask_within_op,
+            survivor_mask=survives,
+        )
+
+        if not score.usable:
+            runner.corr_redundancy = None
+            print_log(
+                f"[grad-corr] redundancy score unusable, pdf left unweighted: "
+                f"{score.reason}",
+                logger="current",
+                level=30,  # WARNING
+            )
+            return
+
+        runner.corr_redundancy = {
+            "iter": int(getattr(runner, "iter", 0)),
+            "checkpoint": checkpoint,
+            "mode": score.mode,
+            "fdr_gated": survives is not None,
+            "red": score.as_dict(),
+            "raw": {n: float(v) for n, v in zip(score.names, score.raw)},
+            "dropped": score.dropped,
+        }
+
+        print_log(f"[grad-corr] {summarise(score)}", logger="current")
+
+        if not is_main_process():
+            return
+
+        if self.redundancy_log_path is None:
+            self.redundancy_log_path = os.path.join(
+                runner.cfg.work_dir, "corr_redundancy_log.txt"
+            )
+        # JSONL append, matching corr_bootstrap_log.txt: one record per emission,
+        # so the score is recomputable offline and a resume does not rewrite
+        # history.
+        with open(self.redundancy_log_path, "a") as f:
+            f.write(json.dumps(_jsonable(runner.corr_redundancy)) + "\n")
