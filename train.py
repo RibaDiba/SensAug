@@ -44,6 +44,16 @@ def atoi(text):
 
 
 def trigger_visualization_hook(cfg, args):
+    """
+    Configure the visualization backend and enable the augmentation-aware visualization hook.
+    
+    Parameters:
+        cfg: Training configuration containing default hooks, visualizer settings, and work directory.
+        args: Command-line options controlling result display and visualization output.
+    
+    Returns:
+        The updated training configuration.
+    """
     cfg["visualizer"] = dict(
         type="BPSegLocalVisualizer",
         alpha=0.4,
@@ -80,11 +90,16 @@ def trigger_visualization_hook(cfg, args):
 
 
 def resolve_interval(cli_value, key, default):
-    """Resolve one pipeline's clock: CLI flag > cluster config `schedule:` > default.
-
-    All three are iteration counts. The checks are explicit `is not None` rather
-    than `or`, so a deliberate 0 reaches the hook that validates it and fails
-    loudly, instead of silently falling through to the default.
+    """
+    Resolve an iteration interval using command-line, schedule, and default values in priority order.
+    
+    Parameters:
+        cli_value: The command-line interval, when provided.
+        key: The schedule setting name.
+        default: The fallback interval.
+    
+    Returns:
+        The selected interval, preserving an explicitly configured value of zero.
     """
     if cli_value is not None:
         return cli_value
@@ -94,14 +109,28 @@ def resolve_interval(cli_value, key, default):
 
 def natural_keys(text):
     """
-    alist.sort(key=natural_keys) sorts in human order
-    http://nedbatchelder.com/blog/200712/human_sorting.html
-    (See Toothy's implementation in the comments)
+    Split text into numeric and nonnumeric components for human-order sorting.
+    
+    Parameters:
+        text (str): The text to split.
+    
+    Returns:
+        list: The components with digit-only segments converted to integers.
     """
     return [atoi(c) for c in re.split(r"(\d+)", text)]
 
 
 def apply_acdc_train_eval(cfg, split="all"):
+    """
+    Configure training, validation, and test data loaders for an ACDC dataset split.
+    
+    Parameters:
+        cfg: Configuration object containing the dataset and dataloader settings.
+        split (str): ACDC split name, or "all" to use the combined dataset.
+    
+    Returns:
+        The updated configuration object.
+    """
     cfg.dataset_type = "ACDCDataset"
     cfg.data_root = DATA_ROOT_LOOKUP["acdc"]
 
@@ -128,18 +157,30 @@ def apply_acdc_train_eval(cfg, split="all"):
 
 
 def _localize_pretrained_checkpoint(cfg, backbone):
-    """Redirect backbone.init_cfg checkpoint URLs to PRETRAINED_CACHE_DIR.
-
-    Compute nodes on Della have no internet access, so any config whose backbone
-    init_cfg points at a download.openmmlab.com URL (segformer, pspnet-rsb,
-    convnext, swin) crashes deep inside model.init_weights() with a DNS error.
-    Fails fast here instead, before Runner/NCCL/dataloaders spin up, if the local
-    copy hasn't been staged yet via scripts/download_pretrained_checkpoints.py.
+    """
+    Replace remote pretrained checkpoint references with cached local files.
+    
+    Parameters:
+        cfg: Model configuration containing the backbone initialization settings.
+        backbone: Backbone name used in the missing-checkpoint staging instructions.
+    
+    Raises:
+        FileNotFoundError: If a referenced remote checkpoint is not present in the
+            configured cache directory.
     """
     if not PRETRAINED_CACHE_DIR or "model" not in cfg:
         return
 
     def _walk(node):
+        """
+        Replace cached HTTP pretrained-checkpoint references in a configuration mapping.
+        
+        Parameters:
+            node (dict): Configuration mapping to traverse recursively.
+        
+        Raises:
+            FileNotFoundError: If a referenced pretrained checkpoint is not cached locally.
+        """
         if not isinstance(node, dict):
             return
         if node.get("type") == "Pretrained" and str(
@@ -164,6 +205,16 @@ def _localize_pretrained_checkpoint(cfg, backbone):
 
 
 def build_config(args):
+    """
+    Builds the complete training configuration from the provided command-line arguments.
+    
+    Parameters:
+        args: Command-line arguments controlling the dataset, model, augmentation,
+            optimization, evaluation, checkpoint, and training settings.
+    
+    Returns:
+        The configured MMEngine configuration used to construct the training runner.
+    """
     if args.use_foundation_backbone and args.dataset == "cityscapes":
         config_path = os.path.dirname(MMCONFIG_PATH)
         print(f"{config_path}/vitsam_cityscapes_1024.py")

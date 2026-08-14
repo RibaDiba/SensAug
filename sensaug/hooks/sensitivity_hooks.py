@@ -52,14 +52,14 @@ class AugSegVisualizationHook(SegVisualizationHook):
         outputs: Sequence[SegDataSample],
         mode: str = "val",
     ) -> None:
-        """Run after every ``self.interval`` validation iterations.
-
+        """Visualize augmented segmentation predictions at the configured iteration interval.
+        
         Args:
-            runner (:obj:`Runner`): The runner of the validation process.
-            batch_idx (int): The index of the current batch in the val loop.
-            data_batch (dict): Data from dataloader.
-            outputs (Sequence[:obj:`SegDataSample`]): Outputs from model.
-            mode (str): mode (str): Current mode of runner. Defaults to 'val'.
+            runner (Runner): The active runner.
+            batch_idx (int): Index of the current batch.
+            data_batch (dict): Batch containing the augmented input images.
+            outputs (Sequence[SegDataSample]): Segmentation results and ground-truth data.
+            mode (str): Current execution mode. Visualization is skipped in training mode.
         """
 
         if self.draw is False or mode == "train":
@@ -100,6 +100,16 @@ class PerturbationSensitivityAnalysisHook(Hook):
     """Hook for sensitivity analysis, done at start of every epoch."""
 
     def __init__(self, sa_interval=10000, round_interval=2000) -> None:
+        """
+        Configure sensitivity-analysis and perturbation-selection intervals.
+        
+        Parameters:
+            sa_interval (int): Number of iterations between sensitivity-curve updates.
+            round_interval (int): Number of iterations between perturbation-selection rounds.
+        
+        Raises:
+            AssertionError: If `round_interval` is greater than `sa_interval`.
+        """
         assert round_interval <= sa_interval, (
             "round interval cannot be greater than sa interval"
         )
@@ -113,6 +123,14 @@ class PerturbationSensitivityAnalysisHook(Hook):
         self, runner: Runner, batch_idx: int, data_batch=None
     ) -> None:
         # initialize / create the file to log to
+        """
+        Update sensitivity-analysis state and training perturbation settings at the configured intervals.
+        
+        Parameters:
+            runner (Runner): Training runner used for validation, configuration, and dataset updates.
+            batch_idx (int): Index of the current training batch.
+            data_batch: Current training batch.
+        """
         if self.sa_log_path is None:
             self.sa_log_path = os.path.join(runner.cfg.work_dir, "sa_curve_log.txt")
             open(self.sa_log_path, "w+").close()  # clear the file if already exists
@@ -178,6 +196,13 @@ class WeightedPerturbationSensitivityAnalysisHook(Hook):
     """Hook for weighted sensitivity analysis, done at start of every epoch."""
 
     def __init__(self, sa_interval=10000, round_interval=2000) -> None:
+        """
+        Initialize sensitivity-analysis scheduling and state.
+        
+        Parameters:
+            sa_interval (int): Number of iterations between sensitivity-curve updates.
+            round_interval (int): Number of iterations between perturbation-selection rounds.
+        """
         assert round_interval <= sa_interval, (
             "round interval cannot be greater than sa interval"
         )
@@ -191,6 +216,13 @@ class WeightedPerturbationSensitivityAnalysisHook(Hook):
         self.sa_interval_to_rounds = sa_interval // round_interval
 
     def update_sa_curve(self, runner, val_dataloader_cfg):
+        """
+        Compute and record a sensitivity curve for the validation dataloader.
+        
+        Parameters:
+            runner: Training runner used during sensitivity analysis.
+            val_dataloader_cfg: Configuration for the validation dataloader.
+        """
         print("Running sensitivity analysis in before_train_epoch hook...")
         self.sa_curve = adaptive_sensitivity_analysis(
             val_dataloader_cfg, runner, num_levels=5, tolerance=0.05
@@ -208,6 +240,9 @@ class WeightedPerturbationSensitivityAnalysisHook(Hook):
         self, runner: Runner, batch_idx: int, data_batch=None
     ) -> None:
         # initialize / create the file to log to
+        """
+        Update the training perturbation distribution at configured round intervals using validation mIoU sensitivity measurements.
+        """
         if self.sa_log_path is None:
             self.sa_log_path = os.path.join(runner.cfg.work_dir, "sa_curve_log.txt")
 
@@ -289,6 +324,16 @@ class WeightedPerturbationSensitivityAnalysisHook(Hook):
 @HOOKS.register_module()
 class PerturbationSensitivityAnalysisHookNew(Hook):
     def __init__(self, sa_interval=10000, round_interval=2000) -> None:
+        """
+        Configure sensitivity-analysis and perturbation-selection intervals.
+        
+        Parameters:
+            sa_interval (int): Number of iterations between sensitivity-curve updates.
+            round_interval (int): Number of iterations between perturbation-selection rounds.
+        
+        Raises:
+            AssertionError: If `round_interval` is greater than `sa_interval`.
+        """
         assert round_interval <= sa_interval, (
             "round interval cannot be greater than sa interval"
         )
@@ -301,6 +346,12 @@ class PerturbationSensitivityAnalysisHookNew(Hook):
     def before_train_iter(
         self, runner: Runner, batch_idx: int, data_batch=None
     ) -> None:
+        """
+        Update perturbation settings during training based on validation sensitivity analysis.
+        
+        Parameters:
+            runner (Runner): Training runner used to compute validation metrics and update dataloaders.
+        """
         if self.sa_log_path is None:
             self.sa_log_path = os.path.join(runner.cfg.work_dir, "sa_curve_log.txt")
             open(self.sa_log_path, "w+").close()  # clear the file if already exists
@@ -351,6 +402,13 @@ class PerturbationSensitivityAnalysisHookNew(Hook):
 @HOOKS.register_module()
 class WeightedPerturbationSensitivityAnalysisHookNew(Hook):
     def __init__(self, sa_interval=10000, round_interval=2000) -> None:
+        """
+        Initialize sensitivity-analysis scheduling and state.
+        
+        Parameters:
+            sa_interval (int): Number of iterations between sensitivity-curve updates.
+            round_interval (int): Number of iterations between perturbation-selection rounds.
+        """
         assert round_interval <= sa_interval, (
             "round interval cannot be greater than sa interval"
         )
@@ -364,6 +422,13 @@ class WeightedPerturbationSensitivityAnalysisHookNew(Hook):
         self.sa_interval_to_rounds = sa_interval // round_interval
 
     def update_sa_curve(self, runner, val_dataloader_cfg):
+        """
+        Compute and log an updated sensitivity curve for the validation dataloader.
+        
+        Parameters:
+            runner: Training runner used for sensitivity analysis.
+            val_dataloader_cfg: Validation dataloader configuration.
+        """
         print("Running sensitivity analysis in before_train_epoch hook...")
         self.sa_curve = adaptive_sensitivity_analysis_new(
             val_dataloader_cfg, runner, num_levels=5, tolerance=0.05
@@ -379,6 +444,13 @@ class WeightedPerturbationSensitivityAnalysisHookNew(Hook):
     def before_train_iter(
         self, runner: Runner, batch_idx: int, data_batch=None
     ) -> None:
+        """
+        Update training perturbation probabilities from validation sensitivity.
+        
+        At each configured round, evaluates candidate perturbation magnitudes, generates
+        a probability distribution from the resulting mIoU values, applies it to the
+        training dataloader, and restores the clean validation pipeline.
+        """
         if self.sa_log_path is None:
             self.sa_log_path = os.path.join(runner.cfg.work_dir, "sa_curve_log.txt")
 
@@ -414,6 +486,16 @@ class WeightedPerturbationSensitivityAnalysisHookNew(Hook):
             apply_perturbations_dataloader_new(runner, train=False, transform=None)
 
     def generate_pdf(self, miou_record):
+        """
+        Generate a perturbation probability distribution from mIoU degradation.
+        
+        Parameters:
+            miou_record (dict): Mapping of perturbation names to candidate levels and
+                their validation mIoU values.
+        
+        Returns:
+            tuple: A mapping of perturbation-level pairs to probabilities and `None`.
+        """
         pdf_dict = {}
         num_perturbations = len(miou_record.keys())
         perturbation_total_prob = 1.0

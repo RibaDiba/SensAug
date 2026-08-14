@@ -52,17 +52,17 @@ LEVEL_MIN, LEVEL_MAX = 0.0, 1.0
 
 
 def conditional_levels(pdf_dict, op_names=None):
-    """Joint pdf over ``(op, level)`` pairs -> per-op conditional over levels.
-
-    ``pdf_dict`` (from RobustValLoop.generate_pdf_*) is a JOINT distribution: its
-    values sum to 1 across all ops together, so an op's raw values are not a
-    distribution over that op's own levels. The probe needs "given this op, which
-    magnitude", so each op's block is renormalized to sum to 1 on its own.
-
-    The synthetic ``("none", 0)`` entry is dropped -- it is training's
-    probability of applying no augmentation at all, not a magnitude for any op.
-
-    Returns ``{op: {"levels": [...], "probs": [...]}}``, levels ascending.
+    """
+    Convert a joint operation-and-level distribution into per-operation conditional distributions.
+    
+    Parameters:
+        pdf_dict (dict): Joint probabilities keyed by operation and level.
+        op_names (iterable, optional): Operations to include in the result.
+    
+    Returns:
+        dict: Mapping of each operation to ascending ``levels`` and normalized ``probs``.
+            The synthetic ``"none"`` entry is excluded. Operations with zero total
+            probability receive a uniform level distribution.
     """
     by_op = {}
     for key, prob in pdf_dict.items():
@@ -93,17 +93,14 @@ def conditional_levels(pdf_dict, op_names=None):
 
 
 def modal_magnitude(entry):
-    """The single most probable level for one op -- the default probe magnitude.
-
-    Constant across the batch, which is what keeps R a statement about image
-    variation alone: a magnitude that varied per image would add a second source
-    of variance to every row.
-
-    NOTE which level this is depends on the pdf's shape. generate_pdf_new weights
-    levels by betabinom(0.75, 1.0) over their mIoU rank, which is DECREASING, so
-    the mode is the rank-0 level -- under the default (descending_MA=False,
-    reverse=True) that is the HIGHEST-mIoU, i.e. mildest, level. Check the first
-    emitted snapshot against expectation before trusting a run.
+    """
+    Selects the most probable magnitude level for an operation.
+    
+    Parameters:
+    	entry (dict): Operation distribution containing `levels` and `probs`.
+    
+    Returns:
+    	float: The level with the highest probability.
     """
     return float(entry["levels"][int(np.argmax(np.asarray(entry["probs"])))])
 
@@ -116,19 +113,23 @@ def sample_magnitudes(
     jitter_draw=None,
     jitter_std=LEVEL_JITTER_STD,
 ):
-    """Draw `n` magnitudes for one op, the way training would.
-
-    Mirrors RandomTrainTransformNew: pick a level from the op's distribution, add
-    N(0, jitter_std), clip to [0, 1].
-
-    `quantiles` and `jitter_draw` are the common-random-numbers hooks. Pass the
-    SAME arrays for every op (mode ``sampled_shared``) and image i gets the same
-    percentile of each op's level distribution and the same jitter deviate
-    everywhere. Leave them None (mode ``sampled_independent``) and every op draws
-    on its own, which is what training literally does per image -- but independent
-    draws inject noise that is uncorrelated across rows, attenuating every cell of
-    R toward zero by a factor that depends on the pdf's spread, so R stops being
-    comparable across checkpoints.
+    """
+    Draw magnitudes for one operation from its level distribution.
+    
+    Parameters:
+        entry (dict): Operation entry containing ``levels`` and ``probs``.
+        n (int): Number of magnitudes to draw.
+        rng: Random number generator used when quantiles or jitter values are not supplied.
+        quantiles: Optional uniform quantiles used for inverse-CDF level selection.
+        jitter_draw: Optional standard-normal deviates used for magnitude jitter.
+        jitter_std (float): Standard deviation of the Gaussian jitter.
+    
+    Returns:
+        numpy.ndarray: Magnitudes clipped to the range [0, 1].
+    
+    Raises:
+        ValueError: If random sampling or jitter is required but no random number
+            generator is supplied.
     """
     levels = np.asarray(entry["levels"], dtype=np.float64)
     probs = np.asarray(entry["probs"], dtype=np.float64)
@@ -158,14 +159,21 @@ def sample_magnitudes(
 
 
 def resolve_magnitudes(snapshot, op_names, batch_size, mode, fallback, rng=None):
-    """Magnitudes for every op for one probe batch.
-
-    Returns ``{op: np.ndarray of shape (batch_size,)}``. Ops absent from the
-    snapshot fall back to `fallback` -- an op the SA curve does not cover must not
-    silently vanish from R.
-
-    Returns the fallback for EVERY op when `snapshot` is empty or `mode` is
-    ``fixed``, which is the pre-first-SA and SA-disabled case.
+    """
+    Resolve per-operation magnitudes for a probe batch.
+    
+    Parameters:
+        snapshot: Per-operation magnitude distributions.
+        op_names: Operations for which to produce magnitudes.
+        batch_size: Number of magnitudes to generate for each operation.
+        mode: Magnitude selection mode.
+        fallback: Magnitude used for fixed mode, empty snapshots, and operations absent from the snapshot.
+    
+    Returns:
+        A mapping from operation names to arrays of shape ``(batch_size,)``.
+    
+    Raises:
+        ValueError: If ``mode`` is unsupported or sampling requires an RNG that was not supplied.
     """
     if mode not in MAGNITUDE_MODES:
         raise ValueError(f"unknown magnitude mode {mode!r}, expected one of {MAGNITUDE_MODES}")

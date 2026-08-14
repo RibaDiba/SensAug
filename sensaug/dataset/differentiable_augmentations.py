@@ -93,14 +93,15 @@ def _as_delta(delta: Union[float, Tensor], reference: Tensor) -> Tensor:
 
 
 def _broadcast_delta(delta: Tensor, batch_size: int) -> Tensor:
-    """Reshape a scalar (0-dim) or per-image (B,) delta to (n, 1, 1, 1), n in
-    {1, B}, so it broadcasts against a (B, C, H, W) batch.
-
-    The per-image form is what lets a single probe measure d loss / d delta
-    SEPARATELY for each image (see sensaug.hooks.grad_hook): autograd then
-    returns a length-B gradient instead of one batch-averaged number. A 0-dim
-    delta reshapes to (1, 1, 1, 1) and broadcasts identically to before, so the
-    scalar path is numerically unchanged.
+    """
+    Reshape a scalar or per-image magnitude for broadcasting across an image batch.
+    
+    Parameters:
+    	delta (Tensor): A scalar tensor or a tensor containing one value per batch image.
+    	batch_size (int): Number of images in the batch.
+    
+    Returns:
+    	Tensor: The reshaped magnitude with shape `(n, 1, 1, 1)`, where `n` is 1 or `batch_size`.
     """
     d = delta.reshape(-1, 1, 1, 1)
     assert d.shape[0] in (1, batch_size), (
@@ -124,17 +125,18 @@ def _weighted_rail_perturb(
     rail_min: Union[float, Tensor],
     rail_max: Union[float, Tensor],
 ) -> Tensor:
-    """out = channel * (1 - |delta|) + rail * |delta|, rail = rail_max if
-    delta >= 0 else rail_min. Same weighted-average-toward-a-rail-value
-    formula as sensaug.dataset.augmentations.perturb_rgb / HSVPerturbation --
-    kept for numeric continuity with the rest of the repo instead of the
-    reference repo's multiplicative `*= (1 + delta)`. Differentiable in
-    `channel` and in the magnitude of `delta`; the SIGN of delta only selects
-    which constant rail is used (a hard, non-differentiable branch), matching
-    the existing repo convention.
-
-    `delta` may be scalar or per-image, so the rail is selected elementwise:
-    with a per-image delta the sign can differ across the batch.
+    """
+    Move channel values toward the minimum or maximum rail according to the
+    magnitude sign.
+    
+    Parameters:
+        channel (Tensor): Channel values to perturb.
+        delta (Tensor): Scalar or per-image perturbation magnitude.
+        rail_min (float or Tensor): Rail used for negative magnitudes.
+        rail_max (float or Tensor): Rail used for zero or positive magnitudes.
+    
+    Returns:
+        Tensor: Perturbed channel values.
     """
     d = _broadcast_delta(delta, channel.shape[0])
     rail = torch.where(d >= 0, _as_rail(rail_max, d), _as_rail(rail_min, d))
@@ -171,9 +173,19 @@ def color_channel(images: Tensor, channel: int, delta: Union[float, Tensor]) -> 
 
 
 def hsv_channel(images: Tensor, channel: int, delta: Union[float, Tensor]) -> Tensor:
-    """Push one HSV channel toward its rail; converts RGB->HSV->RGB via
-    kornia. Signed delta directly encodes direction (reference repo's
-    color_H/color_S/color_V)."""
+    """
+    Perturb one channel of an RGB image by moving it toward its HSV rail.
+    
+    Parameters:
+        images (Tensor): RGB images in BCHW format with values in [0, 1].
+        channel (int): HSV channel index: 0 for hue, 1 for saturation, or 2 for value.
+        delta (Union[float, Tensor]): Signed perturbation magnitude; negative values
+            move toward the lower rail and positive values move toward the upper rail.
+    
+    Returns:
+        Tensor: RGB images with the selected HSV channel perturbed and values clamped
+            to [0, 1].
+    """
     assert channel in (H, S, V), "channel must be H, S, or V (0, 1, 2)"
     delta_t = _as_delta(delta, images)
     hsv = kornia.color.rgb_to_hsv(images)
@@ -195,23 +207,17 @@ def hsv_channel(images: Tensor, channel: int, delta: Union[float, Tensor]) -> Te
 
 
 def _gaussian_kernel1d(size: int, sigma: Tensor) -> Tensor:
-    """Hand-built (guaranteed differentiable w.r.t. `sigma`) 1D Gaussian kernel
-    STACK, shape (n, size) with n = 1 for a scalar sigma and n = B for a
-    per-image sigma. Mirrors the reference repo's own "custom conv2d" blur --
-    deliberately not kornia.filters.gaussian_blur2d, whose sigma-argument
-    autograd support is version-dependent.
-
-    ONE DIMENSION, not two: an isotropic 2D Gaussian is separable, and this
-    function's previous 2D form built the kernel as exactly that -- the outer
-    product `gauss_y[:, :, None] * gauss_x[:, None, :]`, normalized by its 2D
-    sum. Since sum(outer(a, b)) == sum(a) * sum(b), normalizing each 1D factor
-    by its own sum reproduces the identical 2D kernel, so `blur` can convolve
-    with the two factors in sequence instead of materializing their product.
-    That is an algebraic identity, not an approximation: the measured
-    difference against the dense 2D convolution is float32 round-off (~1e-6 on
-    values in [0, 1]), and it turns a kh*kw-tap convolution into kh+kw taps --
-    a 33x reduction in multiply-adds at the default kernel size, which is what
-    makes the CPU per-image SA path affordable (see `blur`).
+    """
+    Construct normalized one-dimensional Gaussian kernels for the given standard deviations.
+    
+    Parameters:
+    	size (int): Number of elements in each kernel.
+    	sigma (Tensor): Scalar or per-image standard deviation values.
+    
+    Returns:
+    	Tensor: Kernels with shape `(1, size)` for a scalar standard deviation or
+    	`(batch_size, size)` for per-image values, differentiable with respect to
+    	`sigma`.
     """
     s = sigma.reshape(-1)  # (n,) -- a 0-dim sigma becomes (1,)
     ax = torch.arange(size, dtype=sigma.dtype, device=sigma.device) - (size - 1) / 2.0
@@ -221,19 +227,12 @@ def _gaussian_kernel1d(size: int, sigma: Tensor) -> Tensor:
 
 
 def _warn_if_undersupported(sigma: Tensor, kernel_size: Tuple[int, int]) -> None:
-    """Warn when `kernel_size` is too small to resolve `sigma`.
-
-    BLUR_KERNEL_SIZE is sized for this module's [0, 1] magnitude contract, so a
-    caller reaching outside that contract would otherwise silently get a
-    truncated -- effectively weaker -- blur than the sigma it asked for. Warn
-    rather than raise: passing a deliberately under-supported kernel is a valid
-    thing to do in tests (it makes per-image kernel mix-ups easier to detect),
-    and no production path can trip this, since both magnitude sources clamp to
-    [0, 1] (sensitivity_analysis.adaptive_sensitivity_analysis_new's
-    min_level/max_level, and corr_magnitudes' clip).
-
-    Reads sigma under no_grad: this is a diagnostic on the magnitude's value and
-    must not become part of what autograd differentiates.
+    """
+    Warn when the kernel size provides insufficient support for the requested blur scale.
+    
+    Parameters:
+        sigma (Tensor): Blur standard deviation values to evaluate.
+        kernel_size (Tuple[int, int]): Height and width of the Gaussian kernel.
     """
     with torch.no_grad():
         sigma_max = float(sigma.max())
@@ -256,22 +255,17 @@ def blur(
     sigma: Union[float, Tensor],
     kernel_size: Tuple[int, int] = BLUR_KERNEL_SIZE,
 ) -> Tensor:
-    """Gaussian blur; magnitude == sigma directly (unsigned; no lighter/darker
-    direction, param_min = 0.0). kernel_size is a fixed hyperparameter, not
-    swept -- matches the reference repo. NOTE: this is NOT numerically
-    equivalent to augmentations.py's Blur/GaussianBlurPerturbation, which
-    instead derive kernel_size from magnitude via cv2's implicit sigma.
-
-    `sigma` may be a scalar (one blur for the whole batch) or a length-B vector
-    (a different blur per image).
-
-    Convolves with the two 1D factors of the separable Gaussian in sequence
-    rather than with their dense 2D product -- same kernel, kh+kw taps instead
-    of kh*kw (see _gaussian_kernel1d). kernel_size is deliberately NOT derived
-    from sigma: a sigma-dependent kernel size would, for a per-image sigma, make
-    the whole batch share a size chosen by its largest sigma, and image i's
-    output would then depend on the other images' magnitudes -- exactly the
-    cross-image coupling CollectGradientHook._sweep is built to exclude.
+    """
+    Apply Gaussian blur to a batch of images.
+    
+    Parameters:
+        images (Tensor): BCHW image tensor to blur.
+        sigma (float or Tensor): Blur standard deviation, either shared across the
+            batch or specified separately for each image.
+        kernel_size (Tuple[int, int]): Fixed Gaussian kernel height and width.
+    
+    Returns:
+        Tensor: Blurred images with the same shape as ``images``.
     """
     sigma_t = _as_delta(sigma, images).clamp(min=1e-3)
     _warn_if_undersupported(sigma_t, kernel_size)
@@ -307,13 +301,15 @@ def blur(
 
 
 def gaussian_noise(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Additive Gaussian noise scaled by delta (signed; param_min = -eps).
-    `delta` may be a scalar or a length-B vector (one scale per image).
-
-    Reparameterized: the gradient flows to the scale, not to the random sample.
-    NOTE the sample is drawn fresh on every call, so two calls with the same
-    delta differ -- callers that need comparability across calls (the gradient
-    probe does) must fix the RNG themselves."""
+    """
+    Add Gaussian noise to images and clamp the result to the range [0, 1].
+    
+    Parameters:
+        delta (float or Tensor): Noise scale, provided as a scalar or one value per image.
+    
+    Returns:
+        Tensor: The perturbed images.
+    """
     delta_t = _as_delta(delta, images)
     d = _broadcast_delta(delta_t, images.shape[0])
     noise = torch.randn(images.shape, dtype=images.dtype, device=images.device)
@@ -333,6 +329,12 @@ class DiffAugment:
     _HSV_CHANNEL = {"H": H, "S": S, "V": V}
 
     def __init__(self, eps: float = 1.0, kernel_size: Tuple[int, int] = BLUR_KERNEL_SIZE):
+        """Initialize an augmentation dispatcher with a perturbation magnitude and blur kernel size.
+        
+        Parameters:
+        	eps (float): Maximum magnitude used by supported perturbations.
+        	kernel_size (Tuple[int, int]): Height and width of the Gaussian blur kernel.
+        """
         self.eps = eps
         self.kernel_size = kernel_size
 
@@ -405,11 +407,14 @@ DIFFERENTIABLE_PERTURBATIONS = {
 
 
 def img_to_rgb01(img: np.ndarray) -> Tensor:
-    """mmseg's HWC uint8 BGR image -> this module's (1, 3, H, W) float32 RGB [0, 1].
-
-    Mirrors what the gradient probe reconstructs in grad_hook._probe_batch (which
-    de-normalizes the data preprocessor's output back to RGB [0, 1]), so the SA
-    pipeline and the probe hand the ops the same tensor for the same image.
+    """
+    Convert an HWC uint8 BGR image to a batched float32 RGB tensor with values in [0, 1].
+    
+    Parameters:
+    	img (np.ndarray): Input image in HWC uint8 BGR format.
+    
+    Returns:
+    	Tensor: Image tensor in (1, 3, H, W) float32 RGB format with values in [0, 1].
     """
     rgb = np.ascontiguousarray(img[..., ::-1])  # BGR -> RGB
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(torch.float32)
@@ -417,11 +422,14 @@ def img_to_rgb01(img: np.ndarray) -> Tensor:
 
 
 def rgb01_to_img(tensor: Tensor) -> np.ndarray:
-    """Inverse of img_to_rgb01.
-
-    Rounds rather than truncates: `.to(torch.uint8)` truncates, which would bias
-    every channel down by up to one level and make magnitude=0 a visible darkening
-    rather than the exact no-op it must be.
+    """
+    Convert a batched RGB tensor with values in [0, 1] to an HWC uint8 BGR image.
+    
+    Parameters:
+        tensor (Tensor): RGB image tensor with shape (1, 3, H, W).
+    
+    Returns:
+        np.ndarray: HWC BGR image with uint8 values in [0, 255].
     """
     rgb = (tensor.squeeze(0).permute(1, 2, 0) * 255.0).round().clamp(0.0, 255.0)
     return np.ascontiguousarray(rgb.to(torch.uint8).numpy()[..., ::-1])  # -> BGR

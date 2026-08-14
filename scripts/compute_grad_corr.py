@@ -67,6 +67,13 @@ from sensaug.hooks.grad_sens_analysis import (
 
 
 def parse_args():
+    """
+    Parse command-line arguments for post-hoc gradient cross-correlation analysis.
+    
+    Returns:
+        argparse.Namespace: Parsed experiment, checkpoint, output, sweep, magnitude,
+            sampling, and bootstrap settings.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Compute the gradient cross-correlation matrix R for an "
@@ -122,6 +129,20 @@ def parse_args():
 
 
 def resolve_checkpoint(work_dir, checkpoint, use_latest):
+    """
+    Select a checkpoint path for post-hoc analysis.
+    
+    Parameters:
+        work_dir (str): Experiment directory containing checkpoint files.
+        checkpoint (str or None): Explicit checkpoint path to use.
+        use_latest (bool): Whether to use the checkpoint named in `last_checkpoint`.
+    
+    Returns:
+        str: The selected checkpoint path.
+    
+    Raises:
+        FileNotFoundError: If no `best*.pth` checkpoint exists when no explicit or latest checkpoint is selected.
+    """
     if checkpoint is not None:
         return checkpoint
     if use_latest:
@@ -149,15 +170,22 @@ class _PosthocRunner:
     """
 
     def __init__(self, runner, iter_, max_iters):
+        """Wrap a runner with explicit iteration metadata."""
         self._runner = runner
         self.iter = iter_
         self.max_iters = max_iters
 
     def __getattr__(self, name):
+        """Delegate attribute access to the wrapped runner."""
         return getattr(self._runner, name)
 
 
 def main():
+    """
+    Run post-hoc gradient correlation analysis for a trained checkpoint.
+    
+    Loads the dumped experiment configuration and selected checkpoint, performs one gradient sweep on the validation data, and writes correlation and sensitivity-analysis logs to the configured output directory.
+    """
     args = parse_args()
     work_dir = os.path.abspath(args.work_dir)
 

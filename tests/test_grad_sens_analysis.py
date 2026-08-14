@@ -43,18 +43,28 @@ N_OPS = len(NAMES)
 
 
 def _buffer(probes_per_op):
-    """probes_per_op: list of (B,) arrays, reused for every op."""
+    """Create per-operation probe buffers from the provided probe arrays.
+    
+    Parameters:
+    	probes_per_op (list): Probe arrays to copy for each operation.
+    
+    Returns:
+    	dict: A mapping from operation names to independent copies of the probe arrays.
+    """
     return {name: [p.copy() for p in probes_per_op] for name in NAMES}
 
 
 def _confounded_grid(n_ops=N_OPS, n_images=800, seed=0):
-    """Ops that are genuinely INDEPENDENT of one another, observed through a
-    shared per-image scale.
-
-    Two facts drive this: augmentation sensitivities are predominantly positive
-    (perturbing an image almost always increases its loss), and a hard image has a
-    big gradient for EVERY op. So a shared per-image factor multiplies rows that
-    have a positive mean -- which manufactures correlation out of nothing.
+    """
+    Generate independent operation sensitivities with a shared per-image difficulty factor.
+    
+    Parameters:
+        n_ops (int): Number of operations.
+        n_images (int): Number of images.
+        seed (int): Seed for the random number generator.
+    
+    Returns:
+        numpy.ndarray: Sensitivity values with shape ``(n_ops, n_images)``.
     """
     rng = np.random.default_rng(seed)
     base = rng.normal(loc=1.0, scale=0.15, size=(n_ops, n_images))
@@ -312,6 +322,13 @@ def test_jsonable_writes_nan_as_null():
 
 class _FakeRunner:
     def __init__(self, work_dir, buffer, max_iters=1000):
+        """Initialize a test runner with a working directory, augmentation-gradient buffer, and iteration limit.
+        
+        Parameters:
+            work_dir: Directory associated with the runner.
+            buffer: Augmentation-gradient probe buffer.
+            max_iters: Maximum number of training iterations.
+        """
         self.cfg = types.SimpleNamespace(work_dir=str(work_dir))
         self.aug_grad_buffer = buffer
         self.max_iters = max_iters
@@ -322,6 +339,14 @@ def _hook(**kwargs):
     # interval=500 against max_iters=1000 fires at iter 499 and 999 -- runner.iter is
     # the 0-based index of the iteration that just finished, so those are the 500th
     # and 1000th, i.e. 50% and 100% through.
+    """Create a perturbation sensitivity analysis hook with test defaults.
+    
+    Parameters:
+        **kwargs: Configuration overrides for the analysis hook.
+    
+    Returns:
+        PerturbationSensitivityAnalysisHookWithGradients: A configured analysis hook.
+    """
     kwargs.setdefault("interval", 500)
     kwargs.setdefault("bootstrap", False)
     kwargs.setdefault("n_min", 8)
@@ -329,6 +354,7 @@ def _hook(**kwargs):
 
 
 def _fill(buffer, n_probes, batch=4, seed=0):
+    """Populate each operation buffer with random probe samples."""
     rng = np.random.default_rng(seed)
     for _ in range(n_probes):
         for name in NAMES:
@@ -552,6 +578,15 @@ def test_a_dropped_op_survives_the_json_round_trip_as_null(tmp_path):
 
 
 def _redundancy_hook(tmp_path, **kwargs):
+    """
+    Create a redundancy-analysis hook with default test settings.
+    
+    Parameters:
+        kwargs: Configuration overrides for the hook.
+    
+    Returns:
+        The configured redundancy-analysis hook.
+    """
     kwargs.setdefault("interval", 500)
     kwargs.setdefault("bootstrap", False)
     kwargs.setdefault("n_min", 8)
@@ -678,7 +713,8 @@ def test_red_mode_selects_the_reduction(tmp_path):
 
 
 def test_an_unknown_red_mode_is_rejected_at_construction(tmp_path):
-    """Not at the first emission, which on the default corr_interval is 25% of the
-    way into a multi-hour run."""
+    """
+    Verify that constructing the analysis hook with an unknown redundancy reduction mode raises a `ValueError`.
+    """
     with pytest.raises(ValueError, match="unknown red_mode"):
         PerturbationSensitivityAnalysisHookWithGradients(interval=10, red_mode="cubed")

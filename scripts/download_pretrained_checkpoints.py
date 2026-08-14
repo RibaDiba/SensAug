@@ -45,6 +45,19 @@ CHECKPOINT_URL_RE = re.compile(r"""checkpoint\s*=\s*["'](https?://[^"']+\.pth)["
 
 
 def find_urls(mmconfig_path, backbone):
+    """
+    Find checkpoint URLs declared in a backbone configuration directory.
+    
+    Parameters:
+    	mmconfig_path (str): Root directory containing backbone configurations.
+    	backbone (str): Name of the backbone configuration directory.
+    
+    Returns:
+    	list[str]: Sorted unique checkpoint URLs found in Python configuration files.
+    
+    Raises:
+    	FileNotFoundError: If the backbone configuration directory does not exist.
+    """
     backbone_dir = os.path.join(mmconfig_path, backbone)
     if not os.path.isdir(backbone_dir):
         raise FileNotFoundError(f"No such backbone config dir: {backbone_dir}")
@@ -56,6 +69,15 @@ def find_urls(mmconfig_path, backbone):
 
 
 def human_size(num_bytes):
+    """
+    Convert a byte count to a rounded human-readable size using binary units.
+    
+    Parameters:
+    	num_bytes (float): The number of bytes to convert.
+    
+    Returns:
+    	str: The rounded size with a B, KB, MB, GB, or TB suffix.
+    """
     for unit in ("B", "KB", "MB", "GB"):
         if num_bytes < 1024:
             return f"{num_bytes:.0f}{unit}"
@@ -64,6 +86,15 @@ def human_size(num_bytes):
 
 
 def remote_size(url):
+    """
+    Retrieve the remote file size from its HTTP headers.
+    
+    Parameters:
+    	url (str): URL of the remote file.
+    
+    Returns:
+    	int or None: The file size in bytes, or `None` if the response has no `Content-Length` header.
+    """
     req = urllib.request.Request(url, method="HEAD")
     with urllib.request.urlopen(req, timeout=15) as resp:
         length = resp.headers.get("Content-Length")
@@ -71,6 +102,14 @@ def remote_size(url):
 
 
 def download(url, dest_dir, dry_run):
+    """
+    Download a checkpoint into the cache directory unless it is already cached or dry-run mode is enabled.
+    
+    Parameters:
+    	url (str): HTTPS checkpoint URL.
+    	dest_dir (str): Directory where the checkpoint is cached.
+    	dry_run (bool): Whether to report the download without retrieving the file.
+    """
     dest = os.path.join(dest_dir, os.path.basename(url))
     if os.path.isfile(dest):
         print(f"  [cached]     {os.path.basename(dest)}")
@@ -92,6 +131,10 @@ def download(url, dest_dir, dry_run):
 
 
 def main():
+    """Run the checkpoint staging command for selected or all supported backbones.
+    
+    Reads the cluster configuration, scans each selected backbone for checkpoint URLs, and downloads missing checkpoints to the configured cache directory. In dry-run mode, reports the checkpoints that would be downloaded without fetching them.
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--backbone",
