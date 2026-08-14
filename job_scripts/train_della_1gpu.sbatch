@@ -22,11 +22,18 @@ DATASET="${3:-cityscapes}"
 # Name includes AUG_TYPE so different aug types (or none vs grad_corr) never
 # collide on the same work_dir -- train.py's resume check would otherwise
 # silently continue a previous run's checkpoint under a different config.
-# Keep "gradcorr" in the name: train.py appends "_gradcorr" (or "_gradcorr_nosa")
-# to any exp_name lacking it when --aug-type=grad_corr, which would otherwise
-# desync EXP_NAME from the real work_dir -- and from the resume guard below.
 # RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
 EXP_NAME="${4:-${AUG_TYPE}_${NAME}_${BACKBONE}_${DATASET}_1gpu${RUN_TAG:+_${RUN_TAG}}}"
+# train.py appends "_gradcorr" (or "_gradcorr_nosa" under --no-corr-sa, which this
+# script doesn't pass) to any exp_name lacking that exact substring when
+# --aug-type=grad_corr. AUG_TYPE contributes "grad_corr" (underscored) above, which
+# does NOT satisfy that check -- "gradcorr" has no underscore -- so train.py always
+# appends the suffix itself. Apply it here too so EXP_NAME already matches what
+# train.py will actually use: train.py then sees the suffix already present and
+# leaves it alone, keeping the resume check below and the real work_dir in sync.
+if [ "${AUG_TYPE}" = "grad_corr" ] && [[ "${EXP_NAME}" != *gradcorr* ]]; then
+    EXP_NAME="${EXP_NAME}_gradcorr"
+fi
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
