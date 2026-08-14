@@ -42,11 +42,18 @@ from sensaug.runner_utils import _perturbation_transform_cfg
 
 @pytest.fixture
 def bgr_image():
+    """
+    Create a deterministic random BGR image fixture.
+    
+    Returns:
+    	np.ndarray: A 13-by-19 BGR image with `uint8` pixel values.
+    """
     return (np.random.default_rng(0).random((13, 19, 3)) * 255).astype(np.uint8)
 
 
 @pytest.fixture
 def seg_map():
+    """Create a deterministic random segmentation map with labels from 0 through 18."""
     return (np.random.default_rng(1).integers(0, 19, size=(13, 19))).astype(np.uint8)
 
 
@@ -256,10 +263,9 @@ def test_resolve_perturbation_set_selects_the_aligned_registry():
 
 
 def test_geometric_and_photometric_filters_partition_the_aligned_set():
-    """Unlike the old "diff" branch in adaptive_sensitivity_analysis_new, which
-    ignored these filters on the grounds that every differentiable op was
-    photometric, this set genuinely has both kinds. Silently returning all 32 under
-    --geometric-only would run a differently-scoped experiment than was asked for."""
+    """
+    Verify that geometric and photometric filters partition the aligned perturbation set.
+    """
     geometric = resolve_perturbation_set("aligned", geometric_only=True)
     photometric = resolve_perturbation_set("aligned", photometric_only=True)
 
@@ -321,7 +327,15 @@ def test_new_vocabulary_names_are_unaffected_by_the_argument():
 
 
 def _aligned_pdf(levels=(0.2, 0.5, 0.8)):
-    """A generate_pdf_new-shaped pdf over the aligned vocabulary."""
+    """
+    Build a normalized probability distribution over aligned perturbations and a no-op choice.
+    
+    Parameters:
+        levels (tuple): Magnitude levels assigned to each perturbation.
+    
+    Returns:
+        dict: A mapping of perturbation-name and magnitude pairs to their probabilities.
+    """
     names = list(ALIGNED_PERTURBATIONS)
     none_mass = 1.0 / (len(names) + 1)
     per_entry = (1.0 - none_mass) / (len(names) * len(levels))
@@ -384,4 +398,12 @@ def test_the_sampler_draws_the_aligned_vocabulary_and_changes_pixels(bgr_image):
 
 
 def seg_map_for(img):
+    """Create a zero-valued segmentation map matching the image dimensions.
+    
+    Parameters:
+    	img: An image whose height and width determine the segmentation map shape.
+    
+    Returns:
+    	A uint8 segmentation map with the same height and width as the image.
+    """
     return np.zeros(img.shape[:2], dtype=np.uint8)

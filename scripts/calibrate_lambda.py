@@ -37,11 +37,17 @@ DEFAULT_LAMBDAS = (0.1, 0.25, 0.5, 1.0, 2.0)
 
 
 def load_records(pattern):
-    """Every (label, record) pair from the matching corr_matrix_log.json files.
-
-    The log is a single JSON array rather than JSONL, and every record carries its
-    own `names`, so the axis order is self-describing on disk and matrices of
-    different vocabulary sizes can be compared side by side.
+    """
+    Load records from JSON log files matching a glob pattern.
+    
+    Invalid or unreadable files are skipped.
+    
+    Parameters:
+        pattern (str): Glob pattern identifying the log files.
+    
+    Returns:
+        list: A list of ``(label, record)`` pairs, where each label is the
+        parent directory name of the source file.
     """
     out = []
     for path in sorted(glob.glob(pattern)):
@@ -58,11 +64,14 @@ def load_records(pattern):
 
 
 def matrix_of(record):
-    """The matrix the pipeline would actually act on, NaN-restored.
-
-    _jsonable writes NaN as null (json.dump is called with allow_nan=False), so the
-    dropped rows and columns come back as None and have to be put back as NaN --
-    compute_red distinguishes "dropped upstream" from "correlates with nothing".
+    """
+    Reconstruct the correlation matrix used by the pipeline.
+    
+    Parameters:
+    	record (dict): Record containing a scaled-normalized matrix or a raw matrix.
+    
+    Returns:
+    	np.ndarray: The selected matrix with JSON null values restored as NaN.
     """
     rows = record.get("R_scalenorm") or record["R_raw"]
     return np.array(
@@ -86,6 +95,12 @@ def uniform_pdf(names):
 
 
 def main():
+    """
+    Calibrate redundancy reweighting strength by sweeping lambda values over logged correlation matrices.
+    
+    Returns:
+    	int: 0 when calibration completes, or 1 when no matching records are found.
+    """
     parser = argparse.ArgumentParser(
         description="Sweep lambda against logged correlation matrices."
     )

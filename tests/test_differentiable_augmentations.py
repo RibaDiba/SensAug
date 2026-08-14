@@ -29,6 +29,7 @@ LEGACY_PERTURBATION_KEYS = {
 
 @pytest.fixture
 def batch():
+    """Create a deterministic batch of two random RGB images."""
     torch.manual_seed(0)
     return torch.rand(2, 3, 16, 16)
 
@@ -261,10 +262,17 @@ def test_blur_applies_each_images_own_sigma(big_batch):
 
 
 def _dense_blur_reference(images, sigma, kernel_size=(67, 67)):
-    """The PREVIOUS implementation, verbatim in behaviour: one dense 2D kernel
-    built as an outer product and normalized by its 2D sum. Kept here (not
-    imported) precisely so these tests keep comparing against the old numbers
-    even after the production code no longer contains this form."""
+    """
+    Apply a dense Gaussian blur reference implementation to an image batch.
+    
+    Parameters:
+    	images (torch.Tensor): Image batch with shape `(batch, channels, height, width)`.
+    	sigma (float or torch.Tensor): Gaussian standard deviation, scalar or one value per image.
+    	kernel_size (tuple[int, int]): Height and width of the Gaussian kernel.
+    
+    Returns:
+    	torch.Tensor: Blurred images with the same shape as `images`.
+    """
     kh, kw = kernel_size
     s = torch.as_tensor(sigma, dtype=images.dtype).reshape(-1).clamp(min=1e-3)
     ax_y = torch.arange(kh, dtype=images.dtype) - (kh - 1) / 2.0

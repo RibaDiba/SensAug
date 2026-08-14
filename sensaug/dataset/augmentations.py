@@ -895,6 +895,15 @@ class RandomAlphaTrainTransform(BaseTransform):
         photometric_only: bool = False,
         perturbation_set: str = "new",
     ):
+        """
+        Configure random augmentation selection by modality and perturbation set.
+        
+        Parameters:
+            geometric_only (bool): Whether to restrict selection to geometric transforms.
+            photometric_only (bool): Whether to restrict selection to photometric transforms.
+            perturbation_set (str): Registry of transforms to use, such as ``"new"``,
+                ``"diff"``, or ``"aligned"``.
+        """
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
         # "new" -> NEW_PERTURBATIONS, "diff" -> the differentiable ops the gradient
@@ -906,6 +915,15 @@ class RandomAlphaTrainTransform(BaseTransform):
         resolve_perturbation_set(perturbation_set, geometric_only, photometric_only)
 
     def transform(self, results: dict) -> dict:
+        """
+        Apply one randomly selected augmentation or leave the sample unchanged.
+        
+        Parameters:
+        	results (dict): Sample data containing the image and optional ground-truth segmentation map.
+        
+        Returns:
+        	dict: The augmented sample data.
+        """
         results["img"] = np.ascontiguousarray(results["img"].copy())
 
         if results.get("gt_seg_map", None) is not None:
@@ -939,6 +957,16 @@ class RandomTrainTransformNew(BaseTransform):
     """
 
     def __init__(self, pdf_dict: dict, perturbation_set: str = "new"):
+        """
+        Initialize a transform that samples perturbations and levels from a probability distribution.
+        
+        Parameters:
+            pdf_dict (dict): Mapping of `(perturbation, level)` pairs to sampling probabilities.
+            perturbation_set (str): Registry containing the named perturbations.
+        
+        Raises:
+            ValueError: If the probabilities do not sum to 1 within the allowed tolerance.
+        """
         self.pdf_dict: dict = pdf_dict
         # Which registry the pdf's op names are drawn from -- "new" for
         # NEW_PERTURBATIONS, "diff" for the differentiable ops. The two share no
@@ -961,6 +989,15 @@ class RandomTrainTransformNew(BaseTransform):
         self._probs /= total
 
     def transform(self, results: dict) -> dict:
+        """
+        Apply one randomly selected perturbation to the input data.
+        
+        Parameters:
+            results (dict): Image and segmentation data to transform.
+        
+        Returns:
+            dict: The transformed data.
+        """
         num_transforms = 1
 
         for _ in range(num_transforms):
@@ -1091,22 +1128,21 @@ class HSVPerturbation(BaseTransform):
         self.hsv2rgb = lambda x: cv2.cvtColor(x, cv2.COLOR_HSV2BGR)
 
     def transform(self, results: dict) -> dict:
-        """Modify the red channel of an image by a certain factor.
-        Negative values are in the lighter direction and positive values are in the darker direction.
-        If the image is torch Tensor, it is expected
-        to have [..., C, H, W] shape, where ... means an arbitrary number of leading dimensions,
-
-        Args:
-            img (PIL Image or Tensor): Image to be modified.
-
+        """
+        Modify the configured HSV channel of an image.
+        
+        Parameters:
+            results (dict): Transformation results containing the image.
+        
         Returns:
-            PIL Image or Tensor: Image with modified red channel
+            dict: Results with the modified image.
         """
         return perturb_hsv(
             results, channel=self.channel, alpha=self.alpha, direction=self.direction
         )
 
     def __repr__(self) -> str:
+        """Return a string representation containing the transform's channel, magnitude, and direction."""
         return (
             f"{self.__class__.__name__}(channel={self.channel}, "
             f"alpha={self.alpha}, direction={self.direction})"
@@ -1277,6 +1313,18 @@ class CombinationPerturbation(BaseTransform):
 
 
 def perturb_rgb(results, channel, alpha, direction):
+    """
+    Adjusts one image channel by lightening or darkening it according to the specified direction.
+    
+    Parameters:
+    	results (dict): Transform results containing the image under the `"img"` key.
+    	channel (int): Index of the image channel to modify.
+    	alpha (float): Magnitude of the channel adjustment.
+    	direction (int): Direction of the adjustment, typically `1` for lightening or `-1` for darkening.
+    
+    Returns:
+    	dict: The updated transform results with the modified image and original image shape.
+    """
     img = results["img"]
     img[..., channel] = (
         img[..., channel] - alpha * img[..., channel] + 255 * direction * alpha
@@ -1288,18 +1336,17 @@ def perturb_rgb(results, channel, alpha, direction):
 
 
 def perturb_hsv(results, channel, alpha, direction):
-    """HSV counterpart of `perturb_rgb`. channel 0/1/2 -> H/S/V, direction 0/1 ->
-    darker/lighter.
-
-    Lifted verbatim out of HSVPerturbation.transform so the two channel-specific
-    special cases live in exactly one place: hue saturates at 180 under cv2's
-    8-bit HSV (not 255), and darkening V rails toward a small positive floor
-    rather than to 0, which would collapse the image to black and make the op
-    indistinguishable from any other V darkening at high magnitude.
-
-    Unlike `perturb_rgb` this does NOT rewrite results["ori_shape"] -- preserving
-    HSVPerturbation's behaviour, which the legacy non-"_new" SA path in
-    sensitivity_analysis.py/gpr_sa.py/bopt_sa.py constructs by name.
+    """
+    Adjusts one HSV channel of the image by the specified magnitude and direction.
+    
+    Parameters:
+        results (dict): Results dictionary containing the BGR image under ``"img"``.
+        channel (int): HSV channel to modify: 0 for hue, 1 for saturation, or 2 for value.
+        alpha (float): Adjustment magnitude.
+        direction (int): Adjustment direction: 0 for darker and 1 for lighter.
+    
+    Returns:
+        dict: The updated results dictionary containing the modified ``uint8`` image.
     """
     max_val = 180 if channel == 0 else 255
 
@@ -1385,6 +1432,15 @@ class DarkerB(BaseTransform):
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """
+        Lighten the red image channel by the configured magnitude.
+        
+        Parameters:
+            results (dict): Image and segmentation data to transform.
+        
+        Returns:
+            dict: The transformed data.
+        """
         results = perturb_rgb(results, channel=0, alpha=self.magnitude, direction=0)
         return results
 
@@ -1402,9 +1458,23 @@ class LighterH(BaseTransform):
     """Applies HSV perturbation to an image."""
 
     def __init__(self, magnitude: float):
+        """Initialize the transform with the absolute value of the specified magnitude.
+        
+        Parameters:
+        	magnitude (float): The transform magnitude.
+        """
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """
+        Adjusts the hue channel of the image using the configured magnitude.
+        
+        Parameters:
+        	results (dict): Transform data containing the image.
+        
+        Returns:
+        	dict: The transformed data.
+        """
         return perturb_hsv(results, channel=0, alpha=self.magnitude, direction=1)
 
 
@@ -1413,9 +1483,23 @@ class DarkerH(BaseTransform):
     """Applies HSV perturbation to an image."""
 
     def __init__(self, magnitude: float):
+        """Initialize the transform with the absolute value of the specified magnitude.
+        
+        Parameters:
+        	magnitude (float): The transform magnitude.
+        """
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """
+        Adjusts the hue channel of the image according to the configured magnitude.
+        
+        Parameters:
+        	results (dict): Transformation results containing the image data.
+        
+        Returns:
+        	dict: The updated transformation results.
+        """
         return perturb_hsv(results, channel=0, alpha=self.magnitude, direction=0)
 
 
@@ -1424,9 +1508,23 @@ class LighterS(BaseTransform):
     """Applies HSV perturbation to an image."""
 
     def __init__(self, magnitude: float):
+        """Initialize the transform with the absolute value of the specified magnitude.
+        
+        Parameters:
+        	magnitude (float): The transform magnitude.
+        """
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """
+        Increase image saturation by the configured magnitude.
+        
+        Parameters:
+        	results (dict): Transformation data containing the image.
+        
+        Returns:
+        	dict: The updated transformation data.
+        """
         return perturb_hsv(results, channel=1, alpha=self.magnitude, direction=1)
 
 
@@ -1435,9 +1533,22 @@ class DarkerS(BaseTransform):
     """Applies HSV perturbation to an image."""
 
     def __init__(self, magnitude: float):
+        """Initialize the transform with the absolute value of the specified magnitude.
+        
+        Parameters:
+        	magnitude (float): The transform magnitude.
+        """
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """Apply a magnitude-based saturation adjustment to the image.
+        
+        Parameters:
+        	results (dict): Augmentation results containing the image.
+        
+        Returns:
+        	dict: The updated augmentation results.
+        """
         return perturb_hsv(results, channel=1, alpha=self.magnitude, direction=0)
 
 
@@ -1446,9 +1557,23 @@ class LighterV(BaseTransform):
     """Applies HSV perturbation to an image."""
 
     def __init__(self, magnitude: float):
+        """Initialize the transform with the absolute value of the specified magnitude.
+        
+        Parameters:
+        	magnitude (float): The transform magnitude.
+        """
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """
+        Lighten the image's HSV value channel.
+        
+        Parameters:
+        	results (dict): Transform results containing the image.
+        
+        Returns:
+        	dict: The results with the value channel adjusted.
+        """
         return perturb_hsv(results, channel=2, alpha=self.magnitude, direction=1)
 
 
@@ -1457,9 +1582,22 @@ class DarkerV(BaseTransform):
     """Applies HSV perturbation to an image."""
 
     def __init__(self, magnitude: float):
+        """Initialize the transform with the absolute value of the specified magnitude.
+        
+        Parameters:
+        	magnitude (float): The transform magnitude.
+        """
         self.magnitude = abs(magnitude)
 
     def transform(self, results: dict) -> dict:
+        """Adjust the image's HSV value channel using the configured magnitude.
+        
+        Parameters:
+            results (dict): Image and segmentation data to transform.
+        
+        Returns:
+            dict: The transformed data.
+        """
         return perturb_hsv(results, channel=2, alpha=self.magnitude, direction=0)
 
 
@@ -1571,6 +1709,15 @@ class _DiffAugTransform(BaseTransform):
     def transform(self, results: dict) -> dict:
         # no_grad: inside a dataloader worker there is nothing to differentiate,
         # and the graph would otherwise be built and discarded per sample.
+        """
+        Apply the differentiable perturbation to the image.
+        
+        Parameters:
+        	results (dict): Transformation results containing the image under the ``"img"`` key.
+        
+        Returns:
+        	dict: The results dictionary with the perturbed image.
+        """
         with torch.no_grad():
             perturbed = self.op(img_to_rgb01(results["img"]), self.magnitude)
         results["img"] = rgb01_to_img(perturbed)
@@ -1581,13 +1728,14 @@ class _DiffAugTransform(BaseTransform):
 
 
 def _make_diff_transform(name: str):
-    """Generate + register one wrapper class for `name`.
-
-    Generated rather than hand-written because 14 near-identical classes would
-    drift. The class is bound into module globals under its generated name so
-    pickle can find it: dataloader workers started with `spawn` (rather than
-    Linux's default `fork`) pickle the dataset, and a class unreachable by
-    qualified name would fail there and nowhere else.
+    """
+    Create and register an MMSegmentation transform wrapper for a differentiable operation.
+    
+    Parameters:
+        name (str): Name of the differentiable operation.
+    
+    Returns:
+        type: The generated and registered transform class.
     """
     cls_name = "Diff" + "".join(part.capitalize() for part in name.split("_"))
     cls = type(
@@ -1715,12 +1863,20 @@ ALIGNED_PERTURBATIONS_PHOTOMETRIC = {
 def resolve_perturbation_set(
     name: str, geometric_only: bool = False, photometric_only: bool = False
 ) -> dict:
-    """Select a perturbation registry by name, honouring the geometric/photometric
-    filters. Both registries share the {op_name: (transform_cls, bool)} shape, so
-    callers need only swap the lookup.
-
-    Called at runtime (not at import) because DIFF_PERTURBATIONS is defined below
-    the transforms that use it.
+    """
+    Select a perturbation registry by name and optional modality filter.
+    
+    Parameters:
+        name (str): Registry name: ``"new"``, ``"diff"``, or ``"aligned"``.
+        geometric_only (bool): Whether to select geometric perturbations only.
+        photometric_only (bool): Whether to select photometric perturbations only.
+    
+    Returns:
+        dict: The selected perturbation registry. If both filters are enabled,
+            the geometric-only registry is selected.
+    
+    Raises:
+        ValueError: If ``name`` is not a supported registry name.
     """
     if name == "new":
         if geometric_only:

@@ -77,6 +77,11 @@ def batch():
 
 @pytest.fixture
 def big_batch():
+    """Create a deterministic batch of four random RGB images sized 32×32.
+    
+    Returns:
+        A tensor containing four RGB images with values in the range [0, 1].
+    """
     torch.manual_seed(0)
     return torch.rand(4, 3, 32, 32)
 
@@ -314,6 +319,7 @@ def test_signed_scale_selects_per_image_not_per_batch(big_batch):
 
 
 def _mean_pixel_shift(op, batch, delta):
+    """Measure the mean absolute pixel change produced by an operation."""
     return float((op(batch, delta) - batch).abs().mean())
 
 

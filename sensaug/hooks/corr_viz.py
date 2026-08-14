@@ -45,16 +45,41 @@ DROPPED_FILL = "#e8e7e3"
 
 
 def _srgb_to_linear(c):
+    """Convert sRGB channel values to linear RGB values.
+    
+    Parameters:
+        c: sRGB channel values.
+    
+    Returns:
+        Linear RGB channel values with the same shape as `c`.
+    """
     c = np.asarray(c, dtype=float)
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
 def _linear_to_srgb(c):
+    """
+    Convert linear RGB channel values to sRGB-encoded values.
+    
+    Parameters:
+    	c (array-like): Linear RGB channel values.
+    
+    Returns:
+    	np.ndarray: The corresponding sRGB-encoded channel values.
+    """
     c = np.asarray(c, dtype=float)
     return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.abs(c) ** (1 / 2.4) - 0.055)
 
 
 def _hex_to_oklab(value: str) -> np.ndarray:
+    """Convert a hexadecimal sRGB color to OKLab coordinates.
+    
+    Parameters:
+    	value (str): A six-digit hexadecimal color, with or without a leading `#`.
+    
+    Returns:
+    	np.ndarray: The color represented as an OKLab coordinate array.
+    """
     value = value.lstrip("#")
     rgb = np.array([int(value[i : i + 2], 16) for i in (0, 2, 4)]) / 255.0
     r, g, b = _srgb_to_linear(rgb)
@@ -72,7 +97,15 @@ def _hex_to_oklab(value: str) -> np.ndarray:
 
 
 def _oklab_to_rgb(lab: np.ndarray) -> np.ndarray:
-    """(N, 3) OKLab -> (N, 3) sRGB in [0, 1]. Out-of-gamut results are clipped."""
+    """
+    Convert OKLab color coordinates to clipped sRGB values.
+    
+    Parameters:
+        lab (np.ndarray): OKLab coordinates with three channels per color.
+    
+    Returns:
+        np.ndarray: sRGB values in the range [0, 1].
+    """
     lab = np.atleast_2d(lab)
     L, A, B = lab[:, 0], lab[:, 1], lab[:, 2]
     l_ = L + 0.3963377774 * A + 0.2158037573 * B
@@ -91,6 +124,14 @@ def _oklab_to_rgb(lab: np.ndarray) -> np.ndarray:
 
 
 def _build_cmap(n_steps: int = 256) -> LinearSegmentedColormap:
+    """Build the diverging correlation colormap with a distinct color for missing measurements.
+    
+    Parameters:
+    	n_steps (int): Number of colors in the colormap.
+    
+    Returns:
+    	LinearSegmentedColormap: The interpolated correlation colormap with missing values rendered using the dropped-cell fill color.
+    """
     neg, mid, pos = (_hex_to_oklab(h) for h in (POLE_NEG, MIDPOINT, POLE_POS))
     half = n_steps // 2
     t = np.linspace(0.0, 1.0, half).reshape(-1, 1)
@@ -107,9 +148,15 @@ CORR_CMAP = _build_cmap()
 
 
 def dropped_ops(r: np.ndarray) -> np.ndarray:
-    """Indices whose whole row is NaN -- the ops correlate() dropped for having no
-    variance over the window. Derived from R itself so the figure cannot disagree
-    with the matrix it is drawing."""
+    """
+    Identify rows containing no finite correlation values.
+    
+    Parameters:
+        r (np.ndarray): Correlation matrix to inspect.
+    
+    Returns:
+        np.ndarray: Indices of rows whose entries are all non-finite.
+    """
     return np.flatnonzero(~np.isfinite(np.asarray(r)).any(axis=1))
 
 
@@ -123,24 +170,22 @@ def render_matrix(
     vlim: float = 1.0,
     cbar_label: str = "Pearson r",
 ) -> np.ndarray:
-    """Render R as an (H, W, 3) uint8 array, ready for SummaryWriter.add_image.
-
-    Args:
-        r: (A, A) correlation matrix. NaN is a real value here (a dropped op), and
-            is rendered as absent rather than as zero.
-        names: length-A op names, in the canonical DIFFERENTIABLE_PERTURBATIONS
-            order. Never reorder or cluster -- a moving axis would destroy the
-            checkpoint-to-checkpoint comparability the whole figure exists for.
-        mark: (A, A) bool. The only cells that get a printed number and a ring --
-            normally the BH-FDR survivors. Annotating all A^2 cells (the previous
-            behaviour) buries the handful you may actually act on among ~180 you
-            may not. None marks nothing.
-        warn: banner text stamped across the top. Used for the shared-factor alarm,
-            so a matrix that must not be acted on says so on its own face and not
-            only in the run log.
-        vlim: colour limit, ALWAYS fixed by the caller and never derived from the
-            data. Autoscaling per emission would make two checkpoints with
-            different structure render identically.
+    """
+    Render a correlation matrix as an RGB image for image logging.
+    
+    Parameters:
+        r (np.ndarray): Correlation matrix whose non-finite cells represent
+            unmeasured operations.
+        names: Labels for the matrix rows and columns.
+        title (str): Figure title.
+        subtitle (str): Optional subtitle.
+        mark (np.ndarray): Optional boolean mask identifying cells to annotate.
+        warn (str): Optional warning banner displayed on the figure.
+        vlim (float): Symmetric absolute limit for the color scale.
+        cbar_label (str): Label for the colorbar.
+    
+    Returns:
+        np.ndarray: An RGB image with dtype ``uint8``.
     """
     r = np.asarray(r, dtype=float)
     n = len(names)
@@ -241,11 +286,15 @@ def render_matrix(
 
 
 def _figure_to_rgb(fig) -> np.ndarray:
-    """(H, W, 3) uint8 from a drawn figure.
-
-    buffer_rgba, not tostring_rgb: the latter was deprecated in matplotlib 3.8 and
-    REMOVED in 3.10, so it would take the whole correlation pipeline down on any
-    env that has moved forward.
+    """
+    Convert a rendered Matplotlib figure to an RGB image.
+    
+    Parameters:
+        fig: The figure to render and convert.
+    
+    Returns:
+        np.ndarray: An image array with shape ``(height, width, 3)`` and
+            ``uint8`` values.
     """
     fig.canvas.draw()
     rgba = np.asarray(fig.canvas.buffer_rgba())
@@ -271,12 +320,28 @@ def markdown_report(
     survives: np.ndarray = None,
     top_n: int = 12,
 ) -> str:
-    """A markdown table of the strongest pairs, for TensorBoard's TEXT tab.
-
-    Puts the numbers that otherwise only exist in corr_bootstrap_log.txt next to
-    the heatmap that summarises them, so reading R does not mean leaving the UI.
-    All the significance columns are optional: with bootstrap=False they are simply
-    absent rather than faked.
+    """
+    Generate a Markdown report of the strongest finite off-diagonal correlations.
+    
+    Parameters:
+        names: Labels for the correlation matrix rows and columns.
+        r (np.ndarray): Correlation matrix.
+        checkpoint (float): Checkpoint value shown in the report.
+        iteration (int): Iteration number shown in the report.
+        n_images (int): Number of images summarized.
+        n_probes (int): Number of probes summarized.
+        dropped_names: Names of operations with no finite correlation values.
+        magnitude_source (str): Source of magnitude metadata.
+        magnitude_mode (str): Magnitude measurement mode.
+        max_shared_loading (float): Maximum shared-factor loading.
+        ci_lo (np.ndarray): Lower confidence-interval bounds.
+        ci_hi (np.ndarray): Upper confidence-interval bounds.
+        q (np.ndarray): Benjamini–Hochberg false-discovery-rate values.
+        survives (np.ndarray): Flags indicating which pairs survive significance filtering.
+        top_n (int): Maximum number of correlation pairs to include.
+    
+    Returns:
+        str: Markdown report containing metadata and the strongest correlation pairs.
     """
     r = np.asarray(r, dtype=float)
     n = len(names)
@@ -325,11 +390,29 @@ def markdown_report(
 
 
 def _num_cell(value, fmt: str) -> str:
+    """Format a finite numeric value or return an em dash for non-finite values.
+    
+    Parameters:
+    	value: The value to format.
+    	fmt (str): The format string applied to finite values.
+    
+    Returns:
+    	str: The formatted value, or an em dash for a non-finite value.
+    """
     value = float(value)
     return fmt.format(value) if np.isfinite(value) else "—"
 
 
 def _ci_cell(lo, hi) -> str:
+    """Format a finite confidence interval as a signed two-decimal range.
+    
+    Parameters:
+    	lo: Lower confidence interval bound.
+    	hi: Upper confidence interval bound.
+    
+    Returns:
+    	str: The formatted interval, or an em dash if either bound is not finite.
+    """
     lo, hi = float(lo), float(hi)
     if not (np.isfinite(lo) and np.isfinite(hi)):
         return "—"

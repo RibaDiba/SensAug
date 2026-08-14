@@ -86,29 +86,34 @@ class RedundancyScore(NamedTuple):
     reason: Optional[str]
 
     def as_dict(self) -> Dict[str, float]:
-        """The standardized score keyed by op name, which is how reweight and the
-        log both want it."""
+        """
+        Convert standardized redundancy scores to a mapping keyed by operation name.
+        
+        Returns:
+        	Dict[str, float]: Standardized score for each operation.
+        """
         return {name: float(v) for name, v in zip(self.names, self.std)}
 
     @property
     def usable(self) -> bool:
+        """Indicate whether the redundancy score is usable.
+        
+        Returns:
+        	bool: `True` if the score has no unusability reason, `False` otherwise.
+        """
         return self.reason is None
 
 
 def within_op_pairs(names: Sequence[str]) -> List[Tuple[int, int]]:
-    """Index pairs for the two halves of a single op, e.g. lighter_S/darker_S and
-    sharpness_pos/sharpness_neg.
-
-    Excluded from red(a) because they measure a parameterization convention, not
-    redundancy between two augmentations someone might have chosen independently.
-    The two directions of one op are the same structural relationship whichever
-    sign it comes out with, and under the `signed` reduction a strongly negative
-    within-op cell would hand that op the strongest protection in the matrix --
-    exactly backwards.
-
-    Derived from the names rather than hard-coded so it stays correct for both the
-    14-op vocabulary the earlier runs logged and the 32-op one (6 pairs and 15
-    pairs respectively).
+    """
+    Identify paired augmentation directions that belong to the same operation.
+    
+    Parameters:
+        names (Sequence[str]): Augmentation names to inspect.
+    
+    Returns:
+        List[Tuple[int, int]]: Index pairs for matching ``lighter_*/darker_*`` or
+            ``*_pos/*_neg`` augmentation names.
     """
     index = {name: i for i, name in enumerate(names)}
     pairs = []
@@ -132,19 +137,26 @@ def compute_red(
     survivor_mask=None,
     min_std: float = 1e-6,
 ) -> RedundancyScore:
-    """Per-op redundancy score from the correlation matrix.
-
-    r:             (A, A) correlation matrix. NaN is expected -- `correlate` leaves
-                   dropped rows and columns NaN, and the json log writes them null.
-    survivor_mask: (A, A) bool from fdr_correct. Cells that did not survive
-                   multiplicity correction contribute nothing. Standard hygiene at
-                   496 simultaneous tests, and it is also what keeps a `signed`
-                   variant defensible if the closure question ever resolves toward
-                   the constraint binding: a survivor subset sum stays unconstrained
-                   even where the full row sum would not.
-
-    `squared` is the default because it is closure-proof and does not depend on the
-    sign convention of any individual op. `abs` and `signed` exist as ablation arms.
+    """
+    Compute standardized per-operation redundancy scores from a correlation matrix.
+    
+    Parameters:
+        r: A square correlation matrix.
+        names: Operation names corresponding to the matrix rows and columns.
+        mode: Reduction applied to correlations: ``"squared"``, ``"abs"``, or
+            ``"signed"``.
+        mask_within_op: Whether to exclude paired directions of the same operation.
+        survivor_mask: Optional boolean matrix identifying cells that contribute to
+            the scores.
+        min_std: Minimum score standard deviation required for usable results.
+    
+    Returns:
+        RedundancyScore: Raw and standardized scores, dropped operations, and any
+            reason the scores are unusable.
+    
+    Raises:
+        ValueError: If the mode, matrix shape, name count, or survivor-mask shape
+            is invalid.
     """
     if mode not in MODES:
         raise ValueError(f"unknown red mode {mode!r}, expected one of {MODES}")
@@ -220,12 +232,19 @@ def compute_red(
 
 
 def ramp_lambda(target: float, progress: float, mode: str = "linear") -> float:
-    """Scale lambda by training progress.
-
-    R measured early describes a model that barely discriminates between
-    augmentations yet, so applying full strength from step 0 acts hardest on the
-    least trustworthy measurement. `progress` is the fraction of training elapsed,
-    the same quantity grad_hook.training_progress() reports.
+    """
+    Scale the reweighting strength according to training progress.
+    
+    Parameters:
+        target (float): Desired lambda value at full progress.
+        progress (float): Fraction of training completed.
+        mode (str): Scaling mode, either ``"linear"`` or ``"constant"``.
+    
+    Returns:
+        float: The scaled lambda value.
+    
+    Raises:
+        ValueError: If ``mode`` is not ``"linear"`` or ``"constant"``.
     """
     if mode == "constant":
         return float(target)
@@ -247,18 +266,17 @@ def reweight(
     lam: float,
     hold_keys: Iterable = (NONE_KEY,),
 ) -> ReweightResult:
-    """Max-entropy reweighting of a (op, level)-keyed pdf by a per-op score.
-
-    red(a) is per-op, so it scales every level of that op by the same factor: the
-    beta-binomial shape generate_pdf_new gives an op's levels is preserved exactly,
-    and only the mass allotted BETWEEN ops moves. Ops missing from `red` -- dropped
-    upstream, or simply not in the vocabulary R was measured over -- score 0, which
-    under standardization is the mean, i.e. no adjustment either way.
-
-    lambda=0 returns the input unchanged and bit-identical, not merely close. That
-    arm has to reproduce the baseline exactly for any comparison against it to mean
-    anything, so it short-circuits rather than multiplying by exp(0) and
-    renormalising through float error.
+    """
+    Reweights augmentation probabilities according to per-operation redundancy scores while preserving the relative probability of each operation's levels.
+    
+    Parameters:
+        pdf_dict (Dict): Probability distribution keyed by operations or operation-level pairs.
+        red (Optional[Dict[str, float]]): Per-operation redundancy scores.
+        lam (float): Reweighting strength.
+        hold_keys (Iterable): Distribution keys whose probabilities remain fixed.
+    
+    Returns:
+        ReweightResult: The reweighted distribution and its application status.
     """
     held = set(hold_keys)
 
@@ -330,8 +348,16 @@ def _op_of(key):
 
 
 def summarise(score: RedundancyScore, top: int = 5) -> str:
-    """One-line human summary for the training log: which ops this would push down
-    hardest and which it would leave alone."""
+    """
+    Create a one-line summary of redundancy scores for training logs.
+    
+    Parameters:
+        score (RedundancyScore): Redundancy scores and associated operation metadata.
+        top (int): Maximum number of most and least redundant operations to include.
+    
+    Returns:
+        str: A formatted summary of score statistics and the most and least redundant operations, or the reason the scores are unusable.
+    """
     if not score.usable:
         return f"red({score.mode}) unusable: {score.reason}"
     order = np.argsort(score.std)

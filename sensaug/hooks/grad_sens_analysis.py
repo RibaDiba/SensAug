@@ -80,15 +80,18 @@ _LOADING_ALARM = 0.9
 
 
 def stack_probe_buffer(buffer: dict, names: list):
-    """Flatten a window of probes into a (A, N_images) matrix.
-
-    Returns (d_grad, probe_ids), where probe_ids[j] is the index of the probe
-    column j came from -- the cluster id the bootstrap resamples on.
-
-    Column alignment across ops holds because every op is probed on the same
-    shared batch each probe, appended in the same op-loop order, and a failed
-    probe is all-or-nothing. That is an invariant, so assert it rather than
-    truncating to the shortest row (which would silently misalign the columns).
+    """
+    Flatten buffered probe results into an augmentation-by-image gradient matrix.
+    
+    Parameters:
+    	buffer (dict): Mapping of augmentation names to per-probe gradient arrays.
+    	names (list): Augmentation names defining the matrix row order.
+    
+    Returns:
+    	Tuple[np.ndarray, np.ndarray]: The gradient matrix and an array identifying the probe associated with each image column.
+    
+    Raises:
+    	AssertionError: If augmentation rows contain different numbers of image columns.
     """
     rows = [
         np.concatenate(buffer[name]) if buffer[name] else np.empty(0) for name in names
@@ -111,17 +114,28 @@ def stack_probe_buffer(buffer: dict, names: list):
 
 
 def shared_image_factor(d_grad: np.ndarray) -> np.ndarray:
-    """The per-image mean absolute sensitivity: the empirical "image difficulty"
-    factor that every op loads on (hard image -> big gradient for everything)."""
+    """
+    Compute the mean absolute sensitivity for each image.
+    
+    Parameters:
+    	d_grad (np.ndarray): Sensitivity matrix with augmentations as rows and images as columns.
+    
+    Returns:
+    	np.ndarray: Per-image mean absolute sensitivity values.
+    """
     return np.abs(d_grad).mean(axis=0)
 
 
 def shared_factor_loadings(d_grad: np.ndarray, shared: np.ndarray) -> np.ndarray:
-    """corr(each op's row, the shared factor).
-
-    THE diagnostic for this matrix: if these are all ~0.9+, R is measuring which
-    images are hard, not which augmentations are redundant, and nothing
-    downstream of it is trustworthy.
+    """
+    Measure how strongly each augmentation's sensitivity pattern follows the shared image-difficulty factor.
+    
+    Parameters:
+        d_grad (np.ndarray): Sensitivity matrix with one augmentation per row and one image per column.
+        shared (np.ndarray): Per-image shared difficulty factor.
+    
+    Returns:
+        np.ndarray: Pearson correlation for each augmentation, with `np.nan` for constant inputs or an insufficiently variable shared factor.
     """
     loadings = np.full(d_grad.shape[0], np.nan)
     if shared.size < 2 or shared.std() < _STD_EPS:
@@ -133,12 +147,14 @@ def shared_factor_loadings(d_grad: np.ndarray, shared: np.ndarray) -> np.ndarray
 
 
 def correlate(d_grad: np.ndarray):
-    """Pearson correlation across the rows of a (A, N) matrix, with the
-    zero-variance rows dropped rather than silently NaN'd.
-
-    Returns (R, dropped_idx). R is always (A, A); a dropped op's row and column
-    (diagonal included) are NaN, so a dropped op can never be mistaken for an
-    uncorrelated one.
+    """
+    Compute Pearson correlations between the rows of a gradient matrix.
+    
+    Parameters:
+    	d_grad (np.ndarray): An array with augmentations as rows and images as columns.
+    
+    Returns:
+    	An `(A, A)` correlation matrix and the indices of zero-variance rows. Dropped rows and columns are filled with `NaN`.
     """
     n_ops = d_grad.shape[0]
     r = np.full((n_ops, n_ops), np.nan)
@@ -158,18 +174,15 @@ def correlate(d_grad: np.ndarray):
 
 
 def closure_null(n_ops: int) -> float:
-    """The baseline correlation induced purely by the per-image normalization.
-
-    Dividing every row by a normalizer ESTIMATED FROM THOSE SAME ROWS closes the
-    composition: the A normalized values in a column are tied together, which
-    pushes the pairwise correlations to about -1/(A-1) even when the underlying
-    ops are perfectly independent. At A=14 that is -0.077.
-
-    Small, but it is the null: cells must be judged against THIS, not against
-    zero, or every mildly negative cell reads as significant. (An external
-    normalizer -- e.g. the clean per-image loss, one extra forward per probe --
-    would avoid the artifact entirely; that is the clean fix if -0.077 ever
-    starts to matter.)
+    """
+    Compute the expected baseline correlation introduced by per-image normalization.
+    
+    Parameters:
+    	n_ops (int): Number of augmentation operations.
+    
+    Returns:
+    	float: The expected correlation, equal to -1 divided by ``n_ops - 1`` when
+    	there are at least two operations, or 0.0 otherwise.
     """
     return -1.0 / (n_ops - 1) if n_ops > 1 else 0.0
 
@@ -182,24 +195,20 @@ def cluster_bootstrap_ci(
     alpha: float = 0.05,
     null: float = 0.0,
 ):
-    """Bootstrap CIs for every cell of R by resampling whole PROBES.
-
-    Resampling probes, not individual image columns, is the point. Columns within
-    a probe come from one batch scored by one model state, so they are not
-    independent draws; a naive column bootstrap treats N_images as the sample
-    size, understates the variance, and hands back intervals that are too tight.
-
-    Returns (ci_lo, ci_hi, p). The interval is the percentile interval over the
-    replicates. The p-value tests r == `null` (0 for a raw R, closure_null(A) for
-    a per-image-normalized one) via a normal approximation on the bootstrap
-    standard error.
-
-    The p-value deliberately does NOT come from the replicate percentiles. A
-    percentile p-value cannot go below 1/n_reps, and Benjamini-Hochberg over the
-    91 pairwise cells needs p <= alpha/91 ~ 5.5e-4 for the very first rejection:
-    at n_reps=1000 the floor is 1e-3, so nothing could EVER survive FDR and the
-    correction would silently reject every cell. The bootstrap SE has no such
-    floor and still carries the clustering.
+    """
+    Estimate clustered bootstrap confidence intervals and p-values for correlation cells.
+    
+    Parameters:
+    	d_grad (np.ndarray): Gradient matrix with augmentations in rows and images in columns.
+    	probe_ids (np.ndarray): Probe identifier for each image column.
+    	n_reps (int): Number of bootstrap replicates.
+    	seed (int): Random seed for reproducible resampling.
+    	alpha (float): Two-sided confidence level complement.
+    	null (float): Correlation value tested by the p-values.
+    
+    Returns:
+    	Tuple[np.ndarray, np.ndarray, np.ndarray]: Lower confidence bounds, upper confidence
+    	bounds, and two-sided p-values for the correlation matrix.
     """
     rng = np.random.default_rng(seed)
     probes = np.unique(probe_ids)
@@ -226,11 +235,16 @@ def cluster_bootstrap_ci(
 
 
 def fdr_correct(p: np.ndarray, alpha: float = 0.05):
-    """Benjamini-Hochberg across the A*(A-1)/2 unique off-diagonal cells.
-
-    With 14 ops that is 91 simultaneous tests, several of which will look
-    significant by chance -- correcting for that is what stops a pruning decision
-    resting on noise. Returns (q, survives), both (A, A) and symmetric.
+    """
+    Apply Benjamini–Hochberg correction to the unique off-diagonal p-values.
+    
+    Parameters:
+        p (np.ndarray): Square matrix of pairwise p-values.
+        alpha (float): Significance level used to determine surviving hypotheses.
+    
+    Returns:
+        tuple: A symmetric matrix of adjusted p-values and a symmetric boolean
+            matrix indicating which hypotheses survive the correction.
     """
     n_ops = p.shape[0]
     upper = np.triu_indices(n_ops, k=1)
@@ -272,11 +286,14 @@ def merge_rank_buffers(buffers: list, names: list) -> dict:
 
 
 def _jsonable(value):
-    """numpy -> python, and non-finite -> None.
-
-    json.dumps writes a bare `NaN` token for float('nan'), which is not valid
-    JSON: python reads it back, jq and pandas do not. R deliberately contains
-    NaN (dropped ops), so every record goes through this on the way out.
+    """
+    Convert NumPy values and non-finite numbers to JSON-compatible values.
+    
+    Parameters:
+    	value: A value that may contain NumPy scalars, arrays, sequences, or mappings.
+    
+    Returns:
+    	The converted value, with non-finite numbers represented as ``None``.
     """
     if isinstance(value, np.ndarray):
         return _jsonable(value.tolist())
@@ -294,16 +311,16 @@ def _jsonable(value):
 
 
 def _first_primary(records: list):
-    """The primary R from the earliest record in corr_matrix_log.json, as an
-    (A, A) float array -- the baseline for the drift panel.
-
-    Reads the file rather than caching the first matrix on the hook so that a
-    --resume keeps diffing against the run's true first emission instead of
-    restarting the baseline at whatever the restart happened to measure.
-
-    _jsonable wrote every NaN out as null, so None comes back in and has to be
-    turned into NaN again; np.array(..., dtype=float) does that for None but not
-    for a nested list containing it, hence the explicit conversion.
+    """
+    Return the first recorded correlation matrix for use as the drift baseline.
+    
+    Parameters:
+        records (list): Correlation records ordered by emission time.
+    
+    Returns:
+        np.ndarray or None: The first scale-normalized matrix, or the first raw
+            matrix when scale-normalized data is unavailable; `None` if no usable
+            record exists.
     """
     if not records:
         return None
@@ -316,15 +333,14 @@ def _first_primary(records: list):
 
 
 def _tb_writer(vis):
-    """The raw torch SummaryWriter under mmengine's Visualizer, or None.
-
-    mmengine's Visualizer only forwards add_scalar and add_image to its backends,
-    so the HISTOGRAMS and TEXT tabs are unreachable through the documented API.
-    The writer itself is one attribute deeper, on the backend.
-
-    Everything here is best-effort and swallows failures: this runs inside
-    after_train_iter, and a TensorBoard nicety must never be able to take a
-    training run down. A None return degrades the pipeline to scalars + images.
+    """
+    Locate a TensorBoard writer that supports histogram and text logging.
+    
+    Parameters:
+        vis: MMEngine visualizer to inspect.
+    
+    Returns:
+        The compatible TensorBoard writer, or None if unavailable.
     """
     try:
         backends = getattr(vis, "_vis_backends", None) or {}
@@ -351,16 +367,8 @@ def _tb_writer(vis):
 
 
 def _write_json_atomic(path, obj):
-    """Rewrite `path` as one JSON document, via a temp file + os.replace.
-
-    A whole-file rewrite can be interrupted halfway and leave a truncated file
-    behind, where the append it replaced could not. os.replace is atomic, so a
-    crash mid-write leaves the previous checkpoint's file fully intact rather than
-    corrupting every checkpoint written so far.
-
-    allow_nan=False so a value that skipped _jsonable raises here instead of
-    writing a bare `NaN` token, which json.dump emits happily and which is not
-    valid JSON (jq and pandas both reject it).
+    """
+    Write an object to a JSON file while preserving the previous file until the replacement is complete.
     """
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -406,6 +414,24 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         red_mode: str = "squared",
         mask_within_op: bool = True,
     ) -> None:
+        """
+        Configure the gradient-based perturbation sensitivity analysis hook.
+        
+        Parameters:
+        	interval (int): Number of training iterations between analysis windows.
+        	n_min (int): Minimum number of images required to emit an analysis window.
+        	normalize_per_image (bool): Whether to normalize each image's gradient trace before correlation.
+        	bootstrap (bool): Whether to compute clustered bootstrap statistics.
+        	bootstrap_reps (int): Number of bootstrap replicates.
+        	bootstrap_seed (int): Seed used for bootstrap resampling.
+        	fdr_alpha (float): Significance level for Benjamini–Hochberg correction.
+        	gather_ranks (bool): Whether to aggregate gradient buffers across distributed ranks.
+        	red_mode (str): Reduction mode used to compute per-operation redundancy scores.
+        	mask_within_op (bool): Whether to exclude within-operation pairs from redundancy scoring.
+        
+        Raises:
+        	ValueError: If `interval` is less than 1 or `red_mode` is unsupported.
+        """
         if interval < 1:
             raise ValueError(f"interval must be a positive iteration count, got {interval}")
         if red_mode not in MODES:
@@ -432,6 +458,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
     def after_train_iter(
         self, runner: Runner, batch_idx: int, data_batch=None, outputs=None
     ) -> None:
+        """Emit the collected augmentation-gradient window at the configured interval."""
         buffer = getattr(runner, "aug_grad_buffer", None)
         if buffer is None:
             return
@@ -461,6 +488,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             buffer[name].clear()
 
     def _emit(self, runner: Runner, checkpoint: float, buffer: dict) -> None:
+        """Emit correlation analysis results for a completed gradient window, including diagnostics, optional bootstrap statistics, logging, and redundancy scoring."""
         if self.corr_log_path is None:
             work_dir = runner.cfg.work_dir
             self.corr_log_path = os.path.join(work_dir, "corr_matrix_log.json")
@@ -584,19 +612,20 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         )
 
     def _emit_bootstrap(self, checkpoint, d_grad, probe_ids, dropped):
-        """Per-cell CIs + BH-FDR, written to their own file -- 91 cells x several
-        fields per checkpoint would bury R if inlined into corr_matrix_log.json.
-
-        Stays append-only JSONL, unlike corr_matrix_log.json: it is the bulky one,
-        and nothing needs to load it as a single document.
-
-        Returns ``(n_survivors, n_cells, stats)``, where ``stats`` is a dict of
-        (A, A) arrays -- ci_lo, ci_hi, q, survives -- in the CANONICAL op index
-        space, or None when there was nothing to test. The re-expansion matters:
-        everything below is computed on ``d_keep``, so its indices count kept ops,
-        not ops. Handing those arrays to the figure unexpanded would label every
-        cell correctly right up until the first op is dropped, and then silently
-        mislabel all of them.
+        """
+        Compute clustered bootstrap confidence intervals and FDR-adjusted pairwise statistics.
+        
+        Parameters:
+            checkpoint: Identifier for the analysis window being recorded.
+            d_grad: Gradient matrix indexed by augmentation and image.
+            probe_ids: Probe identifier for each image, used as the bootstrap cluster.
+            dropped: Augmentation indices excluded from the analysis.
+        
+        Returns:
+            A tuple containing the number of FDR survivors, the number of tested
+            off-diagonal pairs, and expanded statistics arrays in the full augmentation
+            index space. The statistics value is `None` when fewer than two
+            augmentations remain.
         """
         keep = np.setdiff1d(np.arange(len(self.names)), dropped)
         if keep.size < 2:
@@ -691,22 +720,12 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         cell_stats=None,
         magnitude_info=None,
     ) -> None:
-        """Write R and its diagnostics to TensorBoard.
-
-        Scalars and images go through mmengine's ``runner.visualizer``, which
-        forwards to the TensorboardVisBackend configured in train.py. The
-        histogram and the text report go through the raw SummaryWriter underneath
-        it, which mmengine's Visualizer does not expose -- see ``_tb_writer``.
-
-        Every tag lives under ``grad_corr/`` so the pipeline owns its own section
-        of the UI and cannot collide with training or SA metrics.
-
-        TAG STABILITY IS THE POINT. Every tag emitted here is a pure function of
-        the op names, never of this emission's values, so each one is a continuous
-        curve across the run's checkpoints. The previous ``top_pair/<a>_vs_<b>``
-        tags were built from whichever 5 pairs happened to rank highest at that
-        emission, so the tag SET moved between emissions and a four-checkpoint run
-        produced up to twenty one-point series -- nothing that could be compared.
+        """
+        Write correlation matrices and diagnostics to TensorBoard.
+        
+        Per-operation, per-pair, aggregate, magnitude, heatmap, and drift metrics are
+        recorded under the ``grad_corr/`` namespace. Correlation matrices may include
+        FDR-survivor annotations and warnings when shared image difficulty dominates.
         """
         vis = getattr(runner, "visualizer", None)
         if vis is None:
@@ -844,11 +863,10 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         self, vis, step, checkpoint, offdiag_finite, r_primary, dropped_names,
         n_images, n_probes, max_loading, cell_stats, magnitude_info,
     ) -> None:
-        """The histogram and text tabs, which need the raw SummaryWriter.
-
-        Entirely optional: if the writer is unreachable the scalars and images
-        above have already landed, and this is the part that is allowed to be
-        missing.
+        """
+        Log the correlation histogram and Markdown report to TensorBoard when the underlying writer is available.
+        
+        Logging failures are reported and do not affect previously written metrics or images.
         """
         writer = _tb_writer(vis)
         if writer is None:
@@ -885,17 +903,17 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             )
 
     def calculate_cross_corelation(self, d_grad: np.ndarray):
-        """Pearson cross-correlation across the augmentation rows of D_grad.
-
-        Args:
-            d_grad (np.ndarray): shape (A, N_images) -- A differentiable ops x
-                N images in the window. The images axis is the point: correlating
-                over probes instead would measure convergence drift.
-
+        """
+        Compute Pearson correlations between augmentation rows in a gradient matrix.
+        
+        Parameters:
+        	d_grad (np.ndarray): An array of shape (A, N) containing per-augmentation
+        		gradient traces for A augmentations across N images.
+        
         Returns:
-            (np.ndarray, np.ndarray): the symmetric (A, A) correlation matrix,
-            and the indices of ops dropped for having no variance over the window
-            (their rows/cols are NaN).
+        	tuple: The symmetric (A, A) correlation matrix and the indices of
+        		zero-variance augmentations. Rows and columns for dropped augmentations
+        		contain NaN values.
         """
         return correlate(d_grad)
 
@@ -907,28 +925,21 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         survives: np.ndarray = None,
         max_loading: float = np.nan,
     ) -> None:
-        """Publish a per-op redundancy score for the SA loop to reweight the pdf by.
-
-        Soft down-weighting of the sampling probability only, never hard deletion:
-        at the correlation sizes actually observed here (mean |r| of 0.11-0.22)
-        deletion would not be justified, and exp() is strictly positive so it is
-        structurally impossible rather than merely avoided. The scoring itself lives
-        in sensaug/redundancy.py, deliberately free of mmseg so it is testable
-        without a GPU.
-
-        Named for what it used to be a stub for. It does not prune.
-
-        Published onto the runner rather than pushed, the same handoff channel
-        `runner.corr_magnitudes` uses in the other direction: this hook fires on
-        `corr_interval` (4 emissions by default) and the SA loop regenerates the pdf
-        on `round_interval` (20 rounds), so the loop reads whatever is current and
-        the two clocks never have to agree. Before the first emission there is no
-        score and the pdf is untouched.
-
-        The score is a per-op summary of R, and R defines "redundant" as loss-
-        gradient alignment at the probe magnitude -- not as overlap in held-out
-        per-image performance drop, which is what a pruning claim would need to rest
-        on. Down-weighting is defensible on the weaker definition; deletion is not.
+        """
+        Publish a per-operation redundancy score for downstream sampling reweighting.
+        
+        The score is withheld when shared-factor loading exceeds the alarm threshold or
+        when the score is unusable. This method never deletes augmentations.
+        
+        Parameters:
+            runner (Runner): Training runner that receives the published score.
+            r (np.ndarray): Correlation matrix among augmentation operations.
+            checkpoint (float, optional): Checkpoint associated with the correlation
+                matrix.
+            survives (np.ndarray, optional): Mask identifying correlation pairs that
+                pass multiple-testing correction.
+            max_loading (float, optional): Maximum shared-factor loading used to
+                suppress scores dominated by shared image difficulty.
         """
         if not np.isfinite(r).any():
             return

@@ -27,6 +27,15 @@ from sensaug.redundancy import ramp_lambda, reweight
 
 
 def dict_mean(dict_list):
+    """
+    Calculate the mean value for each key across a list of dictionaries.
+    
+    Parameters:
+    	dict_list (list[dict]): Dictionaries with matching keys and numeric values.
+    
+    Returns:
+    	dict: A dictionary containing the mean value for each key.
+    """
     mean_dict = {}
     for key in dict_list[0].keys():
         mean_dict[key] = sum(d[key] for d in dict_list) / len(dict_list)
@@ -405,6 +414,21 @@ class RobustValLoop(ValLoop):
         corr_lambda_ramp: str = "linear",
         fp16: bool = False,
     ) -> None:
+        """
+        Initialize robust validation with sensitivity-analysis and augmentation settings.
+        
+        Parameters:
+            runner: Training runner that provides configuration and iteration state.
+            dataloader: Validation data loader.
+            evaluator: Metric evaluator.
+            ratio: Fraction of validation data used for subset evaluation.
+            sa_curve_path: Path to the sensitivity-analysis curve required for evaluation.
+            warmup_rounds: Number of initial rounds before adaptive augmentation begins.
+            perturbation_set: Augmentation vocabulary used for sensitivity analysis.
+            corr_lambda: Strength of redundancy-based probability reweighting.
+            corr_lambda_ramp: Schedule used to ramp redundancy reweighting.
+            fp16: Whether to use half-precision validation inference.
+        """
         super().__init__(runner, dataloader, evaluator, fp16)
 
         assert sa_curve_path is not None, (
@@ -467,6 +491,12 @@ class RobustValLoop(ValLoop):
             )
 
     def load_sa_curve(self):
+        """
+        Load the sensitivity-analysis curve from the configured file.
+        
+        Raises:
+            AssertionError: If no sensitivity-analysis curve path is configured.
+        """
         assert self.static_sa_curve_path is not None, "No SA curve path provided"
         path = self.static_sa_curve_path
         with open(path, "r") as f:
@@ -474,18 +504,15 @@ class RobustValLoop(ValLoop):
             self.sa_curve = json.loads(sa_curve_str)
 
     def _apply_redundancy_reweighting(self, pdf_dict: dict) -> dict:
-        """Down-weight ops the correlation pipeline found redundant with the rest
-        of the bank.
-
-        Reads `runner.corr_redundancy`, published by
-        PerturbationSensitivityAnalysisHookWithGradients.prune_augmentations. That
-        hook fires on `corr_interval` and this loop on `round_interval`, so what is
-        read here is simply the latest score -- there is none at all until the first
-        emission, and the pdf is returned untouched until then.
-
-        Called by all three pdf generators, so `--corr-lambda` composes with
-        `--uniform` and `--weighted-augs` rather than silently applying to only one
-        of them.
+        """
+        Apply published redundancy scores to a perturbation probability distribution.
+        
+        Parameters:
+            pdf_dict (dict): Perturbation probability distribution to reweight.
+        
+        Returns:
+            dict: Reweighted probability distribution, or the original distribution when
+                redundancy reweighting is disabled or no scores are available.
         """
         if not self.corr_lambda:
             return pdf_dict
@@ -537,27 +564,29 @@ class RobustValLoop(ValLoop):
 
     @property
     def _is_corr_vocabulary(self) -> bool:
-        """Whether this vocabulary's op names are the ones R is indexed by.
-
-        True for both "diff" and "aligned" -- they share all 32 keys and differ only
-        in which class each key resolves to. Anything handed to the gradient probe
-        or read back from it keys off this, never off the implementation.
+        """
+        Determine whether the selected vocabulary uses correlation-compatible operation names.
+        
+        Returns:
+            bool: `true` if the vocabulary is `"diff"` or `"aligned"`, `false` otherwise.
         """
         return self.perturbation_set in ("diff", "aligned")
 
     @property
     def _trains_on_this_vocabulary(self) -> bool:
-        """Whether the training pipeline may be rebuilt onto this vocabulary.
-
-        False only for "diff": those ops are GPU-batched-only by design and 40-150x
-        slower applied per-image on CPU, which is what a training pipeline does. It
-        is the one vocabulary that is measurement-only. "aligned" exists precisely
-        so grad_corr can have R's op names on the training side without that cost.
+        """
+        Determine whether the selected perturbation vocabulary can be used to rebuild the training pipeline.
+        
+        Returns:
+        	bool: `true` if the vocabulary can be used for training, `false` for the measurement-only vocabulary.
         """
         return self.perturbation_set != "diff"
 
     def update_sa_curve(self):
         # if get_rank() == 0:
+        """
+        Recomputes the adaptive sensitivity-analysis curve and records it in the sensitivity-analysis history log.
+        """
         print_log("Running sensitivity analysis...", logger="current")
         val_dataloader_cfg = deepcopy(self.runner.cfg.val_dataloader)
         self.sa_curve = adaptive_sensitivity_analysis_new(
@@ -581,6 +610,12 @@ class RobustValLoop(ValLoop):
 
     def test_perturbed_new(self):
         # dict to keep track of MIOU performance of all types and levels
+        """
+        Evaluate each perturbation type across its sensitivity levels and aggregate the resulting metrics.
+        
+        Returns:
+        	tuple: A tuple containing per-level mIoU values by perturbation type and averaged metrics keyed by perturbation type and metric name.
+        """
         miou_record = {}
         metrics_record = {}
         final_metrics = {}
@@ -621,6 +656,13 @@ class RobustValLoop(ValLoop):
 
     def test_perturbed(self):
         # dict to keep track of MIOU performance of all types and levels
+        """
+        Evaluate each perturbation type across its sensitivity levels.
+        
+        Returns:
+        	miou_record (dict): Mean intersection-over-union values indexed by perturbation type and level.
+        	final_metrics (dict): Average metrics for each perturbation type, keyed by perturbation type and metric name.
+        """
         miou_record = {}
         metrics_record = {}
         final_metrics = {}
@@ -654,32 +696,12 @@ class RobustValLoop(ValLoop):
         return miou_record, final_metrics
 
     def publish_corr_magnitudes(self):
-        """Hand this round's per-op magnitude distributions to the gradient
-        cross-correlation probe.
-
-        Only meaningful for an R-keyed vocabulary ("diff" or "aligned"): the probe
-        differentiates DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by
-        NEW_PERTURBATIONS names would match nothing and every op would silently
-        fall back to the fixed reference magnitude. Skipped outright rather than
-        published-and-ignored, so `runner.corr_magnitudes` is never a misleading
-        non-empty dict.
-
-        Under "aligned" the names match but the magnitude SCALES do not: the SA
-        level is derived on the CPU op and the probe applies it to the
-        differentiable one, and the two registries were never calibrated against
-        each other (blur is the starkest -- cv2's kernel-size-derived implicit
-        sigma against sigma itself). The op identity transfers; treat the magnitude
-        as approximate.
-
-        Published onto the runner (the same handoff channel CollectGradientHook
-        already uses for `runner.aug_grad_buffer`) rather than pushed: the probe
-        fires on its own clock and simply reads whatever is current, which is what
-        makes "use the latest distribution" work when it fires less often than
-        this loop.
-
-        Rank-consistency: every rank runs this loop and mmengine all-reduces the
-        evaluator metrics that produce the pdf, so all ranks derive the same
-        snapshot. Only rank 0 writes the file.
+        """Publish the current per-operation magnitude distributions for correlation analysis.
+        
+        The distributions are stored on the runner and, on the main process, appended to
+        the configured correlation-magnitude history file. Publication is skipped when
+        the selected perturbation vocabulary is not correlation-compatible or no PDF is
+        available.
         """
         if not self._is_corr_vocabulary or not self.pdf_dict:
             return
@@ -727,14 +749,11 @@ class RobustValLoop(ValLoop):
         )
 
     def _remove_H_perturbations(self, miou_record):
-        """Drop the color/photometric ops from the training pdf (`--no-inv-aug`).
-
-        The op names are vocabulary-specific. For "new" this is Posterize/Solarize,
-        as it has always been. For the R-keyed vocabularies those names do not exist
-        ("aligned" has no Posterize/Solarize at all, since neither has a
-        differentiable counterpart), so it is the hue ops themselves -- which is
-        also what the flag's name (remove_H) says. Popping nothing at all would
-        silently ignore --no-inv-aug for those whole vocabularies.
+        """
+        Remove photometric perturbation entries from the mIoU record when configured.
+        
+        Parameters:
+            miou_record (dict): Perturbation-to-mIoU mapping to modify in place.
         """
         if not self.remove_H:
             return
@@ -747,6 +766,12 @@ class RobustValLoop(ValLoop):
             miou_record.pop(name, None)
 
     def generate_uniform_pdf(self):
+        """
+        Evaluate perturbations and generate a probability density function with equal weight across perturbation classes.
+        
+        Returns:
+            tuple: The generated perturbation probability density function and the final evaluation metrics.
+        """
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
@@ -771,7 +796,12 @@ class RobustValLoop(ValLoop):
         return pdf_dict, final_metrics
 
     def generate_pdf_new_weighted_aug(self):
-        """same as generate_pdf_new, but we dont give uniformity to augmentation classes---they are all weighted by MA."""
+        """
+        Generate an augmentation probability distribution weighted by measured mIoU across all perturbation-level pairs.
+        
+        Returns:
+            tuple: The generated perturbation probability distribution and the corresponding evaluation metrics.
+        """
 
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
@@ -817,6 +847,12 @@ class RobustValLoop(ValLoop):
         return pdf_dict, final_metrics
 
     def generate_pdf_new(self):
+        """
+        Generate an augmentation probability distribution from perturbation sensitivity results.
+        
+        Returns:
+            tuple: The generated perturbation probability distribution and the final evaluation metrics.
+        """
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
@@ -895,7 +931,12 @@ class RobustValLoop(ValLoop):
         return metrics
 
     def run(self) -> dict:
-        """Launch test."""
+        """
+        Run validation for the current round and return the resulting metrics.
+        
+        Returns:
+        	dict: Metrics from the clean evaluation, optionally combined with perturbation metrics.
+        """
 
         self.runner.call_hook("before_val")
         self.runner.call_hook("before_val_epoch")

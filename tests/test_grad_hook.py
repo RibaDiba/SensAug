@@ -35,6 +35,7 @@ class _FakePreprocessor:
     std = torch.full((3,), 255.0)
 
     def __call__(self, data, training=False):
+        """Return the input data unchanged."""
         return data
 
 
@@ -56,10 +57,28 @@ class _TinySegModel(torch.nn.Module):
         self.data_preprocessor = _FakePreprocessor()
 
     def forward(self, x):
+        """
+        Apply the convolution and batch-normalization layers to an input batch.
+        
+        Parameters:
+            x: Input tensor.
+        
+        Returns:
+            Tensor containing the transformed batch.
+        """
         return self.bn(self.conv(x))
 
     def loss(self, inputs, data_samples=None):
         # A batch-mean loss, mirroring mmseg's CE with reduction='mean'.
+        """Compute the batch-mean squared output loss.
+        
+        Parameters:
+            inputs: Model inputs used to compute the loss.
+            data_samples: Optional sample metadata, unused by this implementation.
+        
+        Returns:
+            dict: A mapping containing the ``"loss_ce"`` loss value.
+        """
         return {"loss_ce": self.forward(inputs).pow(2).mean()}
 
 
@@ -72,11 +91,18 @@ class _FakeRunner:
 
 @pytest.fixture
 def images():
+    """
+    Generate a deterministic batch of four random RGB images.
+    
+    Returns:
+    	torch.Tensor: Four images with three channels and spatial dimensions of 16 by 16.
+    """
     torch.manual_seed(1)
     return torch.rand(4, 3, 16, 16)
 
 
 def _batch(images):
+    """Build a model input batch from the provided images."""
     return {"inputs": images, "data_samples": None}
 
 
@@ -92,6 +118,7 @@ def _sweep_hook(tmp_path, batches, names=None, **kwargs):
 
 
 def _grad_wrt_delta(model, images, deltas, op):
+    """Compute the loss gradient with respect to augmentation deltas."""
     delta = deltas.clone().requires_grad_(True)
     loss = model.loss(op(images, delta))["loss_ce"]
     return torch.autograd.grad(loss, delta)[0]
@@ -302,6 +329,7 @@ def test_sweep_restores_rng_state(images, tmp_path):
 
 
 def _exploding_op(images, magnitude):
+    """Create non-finite image values by dividing the magnitude by zero."""
     return images * (magnitude.reshape(-1, 1, 1, 1) / 0.0)
 
 
@@ -476,7 +504,13 @@ def test_sweep_logs_every_batch_per_image(images, tmp_path):
 
 
 def _snapshot():
-    """What RobustValLoop.publish_corr_magnitudes puts on the runner."""
+    """
+    Build a representative robustness-magnitude snapshot for the runner.
+    
+    Returns:
+        dict: Operation names mapped to their available magnitude levels and
+            sampling probabilities.
+    """
     return {
         "lighter_R": {"levels": [0.2, 0.7], "probs": [0.8, 0.2]},
         "blur": {"levels": [0.05, 0.9], "probs": [0.1, 0.9]},
@@ -528,7 +562,7 @@ def test_falls_back_to_fixed_without_a_snapshot(images, tmp_path):
 
 
 def test_fixed_mode_ignores_a_live_snapshot(images, tmp_path):
-    """The regression guard: an old run must stay reproducible."""
+    """Verify that fixed magnitude mode uses the configured reference magnitude instead of a live snapshot."""
     hook = _sweep_hook(
         tmp_path, [_batch(images)], interval=1, magnitude_mode="fixed", ref_magnitude=0.5
     )
@@ -580,6 +614,9 @@ def test_snapshot_is_read_once_per_sweep(images, tmp_path):
 
     class _MutatingList(list):
         def __iter__(self):
+            """
+            Iterate over items while updating the runner's correction magnitudes midway through iteration.
+            """
             for i, item in enumerate(list.__iter__(self)):
                 if i == 2:  # SA lands halfway through
                     runner.corr_magnitudes = {

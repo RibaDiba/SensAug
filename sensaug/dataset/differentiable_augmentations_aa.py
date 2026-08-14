@@ -188,14 +188,15 @@ __all__ = [
 
 
 def _batch_delta(delta: Union[float, Tensor], images: Tensor) -> Tensor:
-    """Normalize a scalar-or-per-image magnitude to a length-B tensor on the
-    images' dtype/device, PRESERVING the autograd graph.
-
-    kornia's affine builders want every parameter shaped (B,) -- unlike the
-    sibling module's ops, which broadcast a (1, 1, 1, 1) magnitude against the
-    image. A scalar is expanded rather than repeated: expand is a view, so the
-    gradient of all B uses accumulates back onto the single scalar, which is
-    exactly the scalar-magnitude semantics the contract promises.
+    """
+    Normalize a scalar or per-image magnitude to a length-`B` tensor matching the images' dtype and device.
+    
+    Parameters:
+    	delta (float or Tensor): Scalar magnitude or one magnitude for each image.
+    	images (Tensor): Image batch used to determine the batch size, dtype, and device.
+    
+    Returns:
+    	Tensor: Length-`B` magnitude tensor that preserves autograd information.
     """
     d = _as_delta(delta, images).reshape(-1)
     b = images.shape[0]
@@ -209,13 +210,15 @@ def _batch_delta(delta: Union[float, Tensor], images: Tensor) -> Tensor:
 
 
 def _signed_scale(delta: Tensor, pos_scale: float, neg_scale: float) -> Tensor:
-    """Apply a different scale to the positive and negative directions of
-    `delta`, elementwise (see the PHOTOMETRIC_*_SCALE block for why the legacy
-    classes are asymmetric).
-
-    `neg_scale` is a positive magnitude and multiplies an already-negative
-    delta, so `delta = -m` maps to `-neg_scale * m` -- matching e.g.
-    NegativeBrightnessTransform's `-0.6 * abs(magnitude)`.
+    """Scale positive and negative values of a magnitude tensor independently.
+    
+    Parameters:
+        delta (Tensor): Magnitudes whose sign determines the scale factor.
+        pos_scale (float): Scale applied to nonnegative values.
+        neg_scale (float): Scale applied to negative values.
+    
+    Returns:
+        Tensor: The sign-dependent scaled magnitudes.
     """
     return torch.where(delta >= 0, delta * pos_scale, delta * neg_scale)
 
@@ -229,17 +232,21 @@ def affine_matrix(
     sx: Union[float, Tensor] = 0.0,
     sy: Union[float, Tensor] = 0.0,
 ) -> Tensor:
-    """Build the (B, 2, 3) affine matrix for a batch, about each image's center.
-
-    Arguments are in kornia's NATIVE units, not this module's magnitude
-    contract: `angle` in degrees, `tx`/`ty` in PIXELS, `sx`/`sy` as shear angles
-    in radians. The [0, 1]-magnitude -> native conversion lives in the op
-    wrappers, where the calibration constants are. Each argument may be a scalar
-    or a length-B tensor and stays differentiable either way.
-
-    Public because the geometric ops cannot be applied to a label map through
-    the op functions themselves -- the label needs the SAME matrix, warped with
-    nearest-neighbour interpolation and no gradient (see warp_image_and_label).
+    """
+    Build center-based affine matrices for a batch of images.
+    
+    Arguments use Kornia units: degrees for `angle`, pixels for `tx` and `ty`, and radians for `sx` and `sy`. Each argument may be a scalar or a tensor with one value per image.
+    
+    Parameters:
+        images (Tensor): Batch of images whose shape and device determine the matrix batch.
+        angle (float or Tensor): Rotation angle in degrees.
+        tx (float or Tensor): Horizontal translation in pixels.
+        ty (float or Tensor): Vertical translation in pixels.
+        sx (float or Tensor): Horizontal shear angle in radians.
+        sy (float or Tensor): Vertical shear angle in radians.
+    
+    Returns:
+        Tensor: A batch of affine matrices with shape `(B, 2, 3)`.
     """
     b, _, h, w = images.shape
     angle_t = _batch_delta(angle, images)
@@ -277,15 +284,20 @@ def _affine_op(
     sx: Union[float, Tensor] = 0.0,
     sy: Union[float, Tensor] = 0.0,
 ) -> Tensor:
-    """The single primitive behind all five geometric ops: build an affine
-    matrix, warp with it. Rotate/shear/translate differ only in which argument
-    they populate, so there is exactly one place where the warp can be wrong.
-
-    Bilinear (kornia's default) rather than the legacy transforms' INTER_NEAREST
-    -- nearest is piecewise constant, so its derivative w.r.t. the magnitude is
-    zero almost everywhere and the whole point of this module would be lost.
-    Zero padding matches the legacy `borderValue=0` for images; labels are
-    filled with the ignore index instead (warp_image_and_label).
+    """
+    Apply a differentiable center-based affine transformation to a batch of images.
+    
+    Parameters:
+        images (Tensor): Batch of images shaped ``(B, C, H, W)``.
+        angle (float or Tensor): Rotation angle in degrees.
+        tx (float or Tensor): Horizontal translation in pixels.
+        ty (float or Tensor): Vertical translation in pixels.
+        sx (float or Tensor): Horizontal shear angle in radians.
+        sy (float or Tensor): Vertical shear angle in radians.
+    
+    Returns:
+        Tensor: The transformed images with the same shape as ``images``. Pixels
+        outside the image boundary are filled with zero.
     """
     h, w = images.shape[-2:]
     matrix = affine_matrix(images, angle=angle, tx=tx, ty=ty, sx=sx, sy=sy)
@@ -307,27 +319,55 @@ def rotate_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 
 
 def _shear_angle(delta: Union[float, Tensor], images: Tensor) -> Tensor:
-    """[0, 1] magnitude -> the kornia shear angle reproducing the legacy shear
-    matrix element `delta * SHEAR_MAX_FACTOR`. Negated because kornia writes
-    -tan(angle) into that slot; atan because it writes the TANGENT of the angle,
-    not the angle."""
+    """
+    Convert a shear magnitude to Kornia's shear-angle representation.
+    
+    Parameters:
+    	delta (float or Tensor): Scalar or per-image shear magnitude.
+    	images (Tensor): Image batch used to determine the batch size, dtype, and device.
+    
+    Returns:
+    	Tensor: Per-image shear angles in radians.
+    """
     factor = _batch_delta(delta, images) * SHEAR_MAX_FACTOR
     return -torch.atan(factor)
 
 
 def shear_x_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Horizontal shear about the image center (augmentations.ShearX)."""
+    """Apply horizontal shearing about the image center.
+    
+    Parameters:
+        delta (float or Tensor): Shear magnitude, where positive and negative values
+            determine the shear direction.
+    
+    Returns:
+        Tensor: The horizontally sheared images.
+    """
     return _affine_op(images, sx=_shear_angle(delta, images))
 
 
 def shear_y_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Vertical shear about the image center (augmentations.ShearY)."""
+    """Apply a vertical center-based shear to each image.
+    
+    Parameters:
+        delta: Shear magnitude, where positive and negative values control the shear direction.
+    
+    Returns:
+        The transformed images with the same shape as the input.
+    """
     return _affine_op(images, sy=_shear_angle(delta, images))
 
 
 def translate_x_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Horizontal translation, delta=+1 -> a quarter of the image WIDTH
-    (augmentations.TranslateX)."""
+    """
+    Translate each image horizontally around its center.
+    
+    Parameters:
+        delta (float or Tensor): Translation magnitude, where `+1` shifts images right by one quarter of their width.
+    
+    Returns:
+        Tensor: Images translated horizontally with zero-filled pixels outside the original frame.
+    """
     width = images.shape[-1]
     return _affine_op(
         images, tx=_batch_delta(delta, images) * (width * TRANSLATE_MAX_FRACTION)
@@ -335,8 +375,15 @@ def translate_x_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 
 
 def translate_y_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Vertical translation, delta=+1 -> a quarter of the image HEIGHT
-    (augmentations.TranslateY)."""
+    """
+    Translate images vertically according to the specified magnitude.
+    
+    Parameters:
+        delta (float or Tensor): Translation magnitude, where `+1` shifts by one quarter of the image height.
+    
+    Returns:
+        Tensor: Vertically translated images.
+    """
     height = images.shape[-2]
     return _affine_op(
         images, ty=_batch_delta(delta, images) * (height * TRANSLATE_MAX_FRACTION)
@@ -359,8 +406,15 @@ def translate_y_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 
 
 def brightness_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Brightness. NOTE kornia's adjust_brightness is ADDITIVE, unlike the
-    legacy class's multiplicative torchvision call -- see TODO(calibration)."""
+    """
+    Adjusts image brightness using a sign-dependent magnitude scale.
+    
+    Parameters:
+        delta (float or Tensor): Brightness magnitude, provided as a scalar or one value per image.
+    
+    Returns:
+        Tensor: Brightness-adjusted images with values clamped to the range [0, 1].
+    """
     d = _signed_scale(
         _batch_delta(delta, images), BRIGHTNESS_POS_SCALE, PHOTOMETRIC_NEG_SCALE
     )
@@ -368,8 +422,15 @@ def brightness_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 
 
 def contrast_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Contrast. kornia's adjust_contrast is a pure multiply, not the legacy
-    class's mean-blend -- see TODO(calibration)."""
+    """
+    Adjusts image contrast using a sign-dependent magnitude.
+    
+    Parameters:
+    	delta (float or Tensor): Contrast magnitude, provided as a scalar or one value per image.
+    
+    Returns:
+    	Tensor: Images with adjusted contrast and values clamped to the range [0, 1].
+    """
     d = _signed_scale(
         _batch_delta(delta, images), CONTRAST_POS_SCALE, PHOTOMETRIC_NEG_SCALE
     )
@@ -377,7 +438,15 @@ def contrast_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 
 
 def sharpness_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Sharpness (augmentations.SharpnessTransform)."""
+    """
+    Adjusts image sharpness according to the specified magnitude.
+    
+    Parameters:
+        delta (float or Tensor): Scalar or per-image sharpness magnitude.
+    
+    Returns:
+        Tensor: Images with adjusted sharpness, clamped to the range [0, 1].
+    """
     d = _signed_scale(
         _batch_delta(delta, images), SHARPNESS_POS_SCALE, PHOTOMETRIC_NEG_SCALE
     )
@@ -385,8 +454,15 @@ def sharpness_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 
 
 def color_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
-    """Saturation (augmentations.ColorTransform -- "color" in AutoAugment's
-    naming is saturation). Positive scale is 2.0, not 1.0."""
+    """
+    Adjusts image color saturation according to the specified magnitude.
+    
+    Parameters:
+        delta (float or Tensor): Scalar or per-image signed saturation magnitude.
+    
+    Returns:
+        Tensor: Images with adjusted saturation, clamped to the range [0, 1].
+    """
     d = _signed_scale(
         _batch_delta(delta, images), COLOR_POS_SCALE, PHOTOMETRIC_NEG_SCALE
     )
@@ -402,24 +478,18 @@ def warp_image_and_label(
     matrix: Tensor,
     label_fill: float = LABEL_IGNORE_INDEX,
 ) -> Tuple[Tensor, Tensor]:
-    """Apply one affine matrix to an image batch AND its label map.
-
-    Only the 5 geometric ops need this -- photometric ops move no pixels, so
-    their labels are unchanged. Three things have to be true at once and none of
-    them is the default:
-
-    - the IMAGE warp is bilinear and keeps the graph, so d loss / d magnitude
-      still flows;
-    - the LABEL warp is nearest and takes `matrix.detach()`, so no gradient ever
-      flows through class ids. Gradient through a label is meaningless, and
-      interpolating ids would invent classes that do not exist (a bilinear blend
-      of id 3 and id 8 is id 5.5);
-    - out-of-frame label pixels are filled with the ignore index, not 0. kornia
-      pads with zeros by default, which on Cityscapes is the `road` class -- the
-      loss would then be computed against a quarter-image of fabricated road.
-
-    `label` may be (B, H, W) or (B, 1, H, W); the returned label matches the
-    input's rank and is integral (long).
+    """
+    Warp an image batch and its corresponding label maps with the same affine transformation.
+    
+    Parameters:
+        images (Tensor): Image batch to warp.
+        label (Tensor): Label maps shaped `(B, H, W)` or `(B, 1, H, W)`.
+        matrix (Tensor): Batch of affine transformation matrices.
+        label_fill (float): Label value used for pixels outside the source image.
+    
+    Returns:
+        Tuple[Tensor, Tensor]: Warped images and integer label maps. The label output
+        preserves the input label rank.
     """
     h, w = images.shape[-2:]
     images_out = warp_affine(images, matrix, dsize=(h, w), mode="bilinear")
@@ -443,15 +513,19 @@ def warp_image_and_label(
 def geometric_affine_matrix(
     name: str, images: Tensor, magnitude: Union[float, Tensor]
 ) -> Optional[Tensor]:
-    """The (B, 2, 3) matrix a geometric registry key would warp with, or None if
-    `name` is a photometric op (which needs no label warp).
-
-    Exists so a caller holding only a registry KEY -- which is all
-    sensaug.hooks.grad_hook has -- can still warp the label alongside the image
-    without re-deriving the calibration constants. Keeping this next to the
-    wrappers is the point: a constant changed in one and not the other would
-    warp the label by a different amount than the image, and nothing downstream
-    would notice.
+    """
+    Build the affine transformation matrix for a geometric augmentation.
+    
+    Parameters:
+    	name (str): Registry key identifying the augmentation and its direction.
+    	images (Tensor): Image batch used to determine batch size, device, dtype, and spatial dimensions.
+    	magnitude (float or Tensor): Scalar or per-image augmentation magnitude.
+    
+    Returns:
+    	Optional[Tensor]: A batch of affine matrices with shape `(B, 2, 3)` for geometric keys, or `None` for photometric keys.
+    
+    Raises:
+    	KeyError: If `name` is not a registered augmentation key.
     """
     if name not in GEOMETRIC_OP_KEYS:
         if name in PHOTOMETRIC_OP_KEYS:
@@ -493,6 +567,16 @@ def geometric_affine_matrix(
 
 def _op(fn, sign: float):
     def _wrapped(images: Tensor, magnitude: Union[float, Tensor]) -> Tensor:
+        """
+        Apply the registered operation with a direction-adjusted magnitude.
+        
+        Parameters:
+            images (Tensor): Batch of images to transform.
+            magnitude (Union[float, Tensor]): Scalar or per-image augmentation magnitude.
+        
+        Returns:
+            Tensor: Transformed images.
+        """
         return fn(images, sign * _as_delta(magnitude, images))
 
     return _wrapped

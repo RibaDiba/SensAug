@@ -83,41 +83,34 @@ from sensaug.corr_magnitudes import (
 
 
 def iteration_count(runner) -> int:
-    """The 1-based count of training iterations completed at an ``after_train_iter``.
-
-    ``runner.iter`` is the 0-based index of the iteration that just finished --
-    IterBasedTrainLoop increments ``_iter`` AFTER this hook point -- so the count is
-    one more than it. (Same convention as mmengine's ``Hook.every_n_train_iters``.)
-    Off by one here and every sweep lands one iteration away from where the config
-    says it does, which nothing would ever catch.
+    """
+    Determine the one-based number of completed training iterations.
+    
+    Returns:
+    	int: The completed iteration count.
     """
     return runner.iter + 1
 
 
 def training_progress(runner) -> float:
-    """Fraction of training completed, in [0, 1]. Logged as the ``checkpoint`` field
-    of both this pipeline's logs, so the two stay labelled consistently."""
+    """
+    Measures the fraction of training iterations completed.
+    
+    Returns:
+    	float: The completed-training fraction, or 0.0 when the maximum iteration count is unavailable.
+    """
     max_iters = getattr(runner, "max_iters", 0) or 0
     return iteration_count(runner) / max_iters if max_iters else 0.0
 
 
 def fires_at(runner, interval: int) -> bool:
-    """Whether the correlation pipeline runs at this iteration.
-
-    ONE definition, imported by both halves of the pipeline (the sweep in this
-    module and the R emission in grad_sens_analysis), because they must fire on the
-    same iteration: the analyser correlates the sweep the collector just took, and a
-    gate that disagreed by one iteration would hand it an empty -- or a stale --
-    buffer.
-
-    The final iteration always fires, so the end-of-training R exists even when
-    ``max_iters`` is not a multiple of ``interval``. The two conditions are ORed
-    into one predicate rather than checked separately, so that final iteration fires
-    exactly once in the common case where it satisfies both.
-
-    The predicate is a pure function of ``runner.iter``, which is identical on every
-    rank. That is what makes the analyser's ``all_gather_object`` safe: no rank can
-    skip an emission that the others take, so the collective cannot deadlock.
+    """Determine whether the current iteration is scheduled for processing.
+    
+    Parameters:
+        interval (int): Number of iterations between scheduled runs.
+    
+    Returns:
+        bool: ``True`` on interval multiples or the final iteration, ``False`` otherwise.
     """
     iteration = iteration_count(runner)
     max_iters = getattr(runner, "max_iters", 0) or 0
@@ -202,6 +195,21 @@ class CollectGradientHook(Hook):
         magnitude_mode: str = MODE_MODAL,
         magnitudes_path: str = None,
     ) -> None:
+        """
+        Configure periodic gradient probing and augmentation-magnitude sampling.
+        
+        Parameters:
+            interval (int): Number of training iterations between gradient sweeps.
+            sweep_batch_size (int): Number of validation images processed per probe batch.
+            ref_magnitude (float): Fallback augmentation magnitude when no sampled value is available.
+            per_image_delta (bool): Whether to compute a separate magnitude gradient for each image.
+            probe_seed (int): Seed used for reproducible magnitude sampling during sweeps.
+            magnitude_mode (str): Strategy used to obtain augmentation magnitudes.
+            magnitudes_path (str, optional): Path to a JSON snapshot providing seeded magnitudes.
+        
+        Raises:
+            ValueError: If `interval` is less than one or `magnitude_mode` is unsupported.
+        """
         if interval < 1:
             raise ValueError(f"interval must be a positive iteration count, got {interval}")
         if magnitude_mode not in MAGNITUDE_MODES:
@@ -233,16 +241,16 @@ class CollectGradientHook(Hook):
         self._magnitude_rng = None
 
     def _load_seed_snapshot(self) -> dict:
-        """Read the LAST snapshot out of a corr_magnitudes.json from a prior run.
-
-        The last one, not the first: it is the most converged model's magnitudes,
-        and the point of this file is to pin a control arm to the same magnitudes
-        the comparison run used.
-
-        Fails loudly on a missing or malformed file rather than degrading to the
-        fixed fallback. Silently probing at 0.5 when you asked for a pinned
-        magnitude produces a control that is not comparable to anything, and
-        nothing downstream would reveal it.
+        """
+        Load the latest augmentation-magnitude snapshot from the configured file.
+        
+        Returns:
+        	dict: The latest per-operation magnitude levels and probabilities, or an
+        	empty dictionary when no snapshot file is configured.
+        
+        Raises:
+        	ValueError: If the snapshot file contains no records or its latest record
+        	has no magnitude data.
         """
         if not self.magnitudes_path:
             return {}
@@ -275,6 +283,9 @@ class CollectGradientHook(Hook):
         # Shared buffer, stashed on the runner so the correlation hook can read
         # it. One entry per sweep batch per op, each a (B,) array -- batch
         # boundaries are load-bearing for the cluster bootstrap, so do NOT flatten.
+        """
+        Initialize gradient storage, logging, and the dedicated clean validation dataloader used for probing.
+        """
         self.grad_buffer = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
         runner.aug_grad_buffer = self.grad_buffer
 
@@ -311,10 +322,12 @@ class CollectGradientHook(Hook):
         self._sweep(runner, training_progress(runner))
 
     def after_run(self, runner: Runner) -> None:
+        """Flushes pending gradient records after the training run on the main process."""
         if is_main_process():
             self._flush_records()
 
     def _flush_records(self) -> None:
+        """Append pending gradient records to the configured log file."""
         if not self._pending_records:
             return
         with open(self.grad_log_path, "a") as f:
@@ -323,13 +336,16 @@ class CollectGradientHook(Hook):
         self._pending_records.clear()
 
     def _sweep(self, runner: Runner, checkpoint: float) -> None:
-        """One frozen-frame pass over the entire probe dataloader.
-
-        The model is not stepped anywhere in here -- ``torch.autograd.grad``
-        computes d loss / d delta without populating parameter ``.grad`` -- so
-        every image is scored against the SAME weights. That is the whole point:
-        a column of D_grad is then attributable to the image, not to whenever
-        during training it happened to be drawn.
+        """
+        Collect per-image augmentation gradients across the probe dataloader.
+        
+        The sweep evaluates all batches with a consistent magnitude snapshot and
+        preserves the model and random-number-generator state afterward. Results and
+        magnitude metadata are stored for downstream analysis.
+        
+        Parameters:
+            runner (Runner): Training runner containing the model and probe state.
+            checkpoint (float): Training progress associated with the sweep.
         """
         model = runner.model
         model = model.module if hasattr(model, "module") else model
@@ -465,16 +481,15 @@ class CollectGradientHook(Hook):
         )
 
     def _probe_batch(self, model, data, snapshot):
-        """Returns ``(grads, magnitudes)``, each ``{op_name: (B,) array}`` -- the
-        per-image ``d loss / d magnitude`` and the magnitude it was taken at --
-        for all differentiable ops, measured on a single shared clean batch (so
-        columns stay aligned across ops).
-
-        `snapshot` is the SA-published per-op magnitude distribution, or ``{}``
-        for the fixed-magnitude fallback.
-
-        Assumes the caller has already put the model in eval mode and taken
-        responsibility for restoring the RNG (see _sweep).
+        """
+        Compute per-image loss gradients and augmentation magnitudes for a clean batch.
+        
+        Parameters:
+        	data: A clean batch to preprocess and probe.
+        	snapshot: Per-operation magnitude distributions, or an empty mapping to use the reference magnitude.
+        
+        Returns:
+        	A tuple containing per-operation gradient arrays and magnitude arrays, each indexed by image in the batch.
         """
         # Fix the probe RNG so `noise` draws the SAME sample for every batch. Its
         # gradient is a projection of the pixel gradient onto that sample, so a
@@ -523,12 +538,18 @@ class CollectGradientHook(Hook):
     def _grad_for_op(
         self, name, model, op, rgb01, mean, std, data_samples, magnitude
     ) -> np.ndarray:
-        """d loss / d magnitude for one op, as a (B,) array -- one sensitivity
-        per image. (In the legacy scalar mode, a (1,) array holding the old
-        batch-averaged number.)
-
-        `magnitude` is the (B,) array of probe magnitudes for this op, already
-        resolved from the SA snapshot by the caller.
+        """
+        Compute each image's loss sensitivity to an augmentation magnitude.
+        
+        Parameters:
+        	name (str): Name of the augmentation operation.
+        	magnitude (array-like): Probe magnitude for each image in the batch.
+        
+        Returns:
+        	np.ndarray: Per-image gradients, or a single batch-averaged gradient in legacy scalar mode.
+        
+        Raises:
+        	ProbeError: If the gradient has an unexpected shape or contains non-finite values.
         """
         batch_size = rgb01.shape[0]
         if self.per_image_delta:
@@ -576,12 +597,14 @@ class CollectGradientHook(Hook):
 
 
 def _magnitude_summary(values) -> dict:
-    """Collapse one op's per-image probe magnitudes over a sweep into a summary.
-
-    Mean/min/max rather than the raw array: the per-image values are already
-    written in full to aug_gradient_log.txt, and repeating 500 of them per op in
-    the correlation record would bury R. For the constant modes (`mode`, `fixed`)
-    min == mean == max, which is itself the check that the mode did what it says.
+    """
+    Summarize per-image probe magnitudes for an augmentation operation.
+    
+    Parameters:
+    	values: Magnitude arrays collected across the sweep.
+    
+    Returns:
+    	dict: A dictionary containing the mean, minimum, and maximum magnitude.
     """
     flat = np.concatenate(values)
     return {
@@ -592,16 +615,15 @@ def _magnitude_summary(values) -> dict:
 
 
 def _sum_loss_value(value):
-    """Mirror mmengine parse_losses: a loss entry is a Tensor or a list of
-    Tensors; reduce to a scalar.
-
-    NOTE this batch-mean gives image i a weight proportional to its valid-pixel
-    count (mmseg's CE with ignore_index=255 normalizes by the batch's TOTAL
-    valid-pixel count), so the stored per-image gradients carry a shared
-    per-image scale factor. That is not a constant, and Pearson is not invariant
-    to it -- it is removed downstream by the scale normalization in
-    grad_sens_analysis.calculate_cross_corelation, which handles any per-image
-    multiplicative factor (including plain image difficulty) in one place."""
+    """
+    Reduce a loss value or collection of loss values to a scalar mean.
+    
+    Parameters:
+        value: A tensor or an iterable of tensors representing loss values.
+    
+    Returns:
+        The mean of the tensor, or the sum of the means for an iterable of tensors.
+    """
     if torch.is_tensor(value):
         return value.mean()
     return sum(v.mean() for v in value)

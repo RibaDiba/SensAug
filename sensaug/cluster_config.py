@@ -2,6 +2,17 @@ import yaml
 
 
 def load_seg_config(path):
+    """
+    Load segmentation configuration from a YAML file.
+    
+    Parameters:
+        path: Path to the YAML configuration file.
+    
+    Returns:
+        A dictionary containing model configuration, dataset paths, supported
+        datasets and backbones, scheduling options, and the optional pretrained
+        checkpoint cache directory.
+    """
     with open(path) as f:
         raw = yaml.safe_load(f)
     data_root = raw["data_root"]

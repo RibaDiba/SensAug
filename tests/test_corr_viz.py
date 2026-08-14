@@ -32,6 +32,16 @@ def _r(seed=0, n_ops=8, n_images=300):
 
 
 def _drop(r, index):
+    """
+    Mark an operation as dropped in a correlation matrix.
+    
+    Parameters:
+    	r (numpy.ndarray): Correlation matrix to copy and modify.
+    	index (int): Index of the operation whose row and column are marked as missing.
+    
+    Returns:
+    	numpy.ndarray: A copy of the matrix with the specified row and column set to NaN.
+    """
     r = r.copy()
     r[index, :] = np.nan
     r[:, index] = np.nan

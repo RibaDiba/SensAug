@@ -13,17 +13,19 @@ from sensaug.dataset.augmentations import *
 
 
 def _perturbation_transform_cfg(p_type, value, perturbation_set: str = None):
-    """Map a perturbation name + magnitude onto a registered transform cfg.
-
-    `perturbation_set` disambiguates. DIFF_PERTURBATIONS and ALIGNED_PERTURBATIONS
-    share all 32 keys and mean different classes under each -- `lighter_R` is the
-    per-image torch wrapper DiffLighterR in one and the plain cv2 LighterR in the
-    other. Dispatching on the name alone would silently resolve every aligned-set
-    sweep onto the diff wrappers, i.e. onto the 40-150x slower path the aligned
-    vocabulary exists to avoid, and nothing downstream would say so: the transform
-    names it inserts are real and _assert_transforms_present would pass.
-
-    Left as None (every pre-existing caller) the old name-based order applies.
+    """
+    Map a perturbation name and magnitude to a registered transform name and configuration.
+    
+    Parameters:
+    	p_type: Perturbation name, ImageNet-C name, or combination identifier.
+    	value: Perturbation magnitude or combination choice.
+    	perturbation_set: Optional perturbation set used to resolve ambiguous names.
+    
+    Returns:
+    	A tuple containing the transform class name and its configuration dictionary.
+    
+    Raises:
+    	ValueError: If the perturbation name is not recognized.
     """
     if p_type in IMAGENETC_NAME_FN_DICT.keys():  # noqa: F405
         return "ImageNetCTransform", dict(
@@ -58,9 +60,17 @@ def _perturbation_transform_cfg(p_type, value, perturbation_set: str = None):
 def _build_perturbed_pipeline(
     dataloader_cfg, perturb_levels: Dict, train: bool, perturbation_set: str = None
 ):
-    """Insert perturbation transforms into dataloader_cfg's pipeline, in place.
-
-    Returns the list of transform type names that were inserted.
+    """
+    Insert configured perturbation transforms into a dataloader pipeline.
+    
+    Parameters:
+    	dataloader_cfg: Dataloader configuration whose dataset pipeline is modified in place.
+    	perturb_levels (Dict): Mapping of perturbation names to their magnitudes.
+    	train (bool): Whether the pipeline is used for training.
+    	perturbation_set (str): Optional perturbation set used to resolve transform configurations.
+    
+    Returns:
+    	inserted (List[str]): Names of the perturbation transforms inserted into the pipeline.
     """
     pipeline = dataloader_cfg.dataset.pipeline
 
@@ -89,10 +99,16 @@ def _build_perturbed_pipeline(
 
 
 def _assert_transforms_present(dataloader, expected: List[str], tag: str):
-    """Guard: the loader we are about to hand to the workers really carries the
-    perturbations we asked for. Mutating `dataset.pipeline` on an already-running
-    loader does not reach worker processes when persistent_workers=True, so a
-    silently-clean dataloader is the failure mode this catches.
+    """
+    Verify that a dataloader pipeline contains the expected transform classes.
+    
+    Parameters:
+        dataloader: The dataloader whose pipeline is checked.
+        expected (List[str]): Expected transform class names.
+        tag (str): Label identifying the dataloader in error messages.
+    
+    Raises:
+        RuntimeError: If one or more expected transforms are missing.
     """
     present = [t.__class__.__name__ for t in dataloader.dataset.pipeline.transforms]
     missing = [name for name in expected if name not in present]
@@ -105,7 +121,17 @@ def _assert_transforms_present(dataloader, expected: List[str], tag: str):
 
 
 def _rebuild_loader(runner: Runner, loop, dataloader_cfg, expected: List[str], tag: str):
-    """Rebuild a loop's dataloader from cfg so fresh workers pick up the pipeline."""
+    """
+    Rebuild a loop's dataloader from its configuration and assign the new dataloader to the loop.
+    
+    Parameters:
+        dataloader_cfg: Configuration used to build the dataloader.
+        expected (List[str]): Transform class names that must be present in the rebuilt pipeline.
+        tag (str): Label used when validating the dataloader's transforms.
+    
+    Returns:
+        The newly built dataloader.
+    """
     diff_rank_seed = runner._randomness_cfg.get("diff_rank_seed", False)
     new_dataloader = runner.build_dataloader(
         dataloader_cfg, seed=runner.seed, diff_rank_seed=diff_rank_seed
@@ -116,10 +142,7 @@ def _rebuild_loader(runner: Runner, loop, dataloader_cfg, expected: List[str], t
 
 
 def _rebind_train_iterator(runner: Runner):
-    """IterBasedTrainLoop caches an iterator over the *old* dataloader at __init__
-    time and, with InfiniteSampler, never re-creates it. Swapping
-    train_loop.dataloader alone therefore changes nothing.
-    """
+    """Rebinds the training loop's cached iterator to its current dataloader."""
     loop = runner.train_loop
     if hasattr(loop, "dataloader_iterator"):
         loop.dataloader_iterator = _InfiniteDataloaderIterator(loop.dataloader)
@@ -132,11 +155,18 @@ def verify_perturbation_effective(
     sample_idx: int = 0,
     perturbation_set: str = None,
 ):
-    """Functional self-test: at full magnitude, a perturbation must change pixels.
-
-    Cheap (one sample, main process) and run once per SA pass. Uses magnitude=1.0
-    because the adaptive search can select magnitudes small enough to vanish under
-    uint8 rounding, which would make a strict pixel-difference check flaky.
+    """
+    Verify that a perturbation changes a selected validation sample.
+    
+    Parameters:
+        p_type (str): Name of the perturbation to apply.
+        magnitude (float): Perturbation magnitude used for verification.
+        sample_idx (int): Index of the validation sample to compare.
+        perturbation_set (str): Perturbation set containing the requested perturbation.
+    
+    Raises:
+        RuntimeError: If the clean and perturbed inputs have the same shape and are
+            bit-identical.
     """
     clean_cfg = deepcopy(runner.cfg.val_dataloader)
     pert_cfg = deepcopy(runner.cfg.val_dataloader)
@@ -162,6 +192,12 @@ def verify_perturbation_effective(
 
 
 def create_union_test_set_new(runner: Runner, perturb_levels: Dict = {}):
+    """
+    Constructs a test dataloader containing clean data and one dataset for each requested perturbation.
+    
+    Parameters:
+    	perturb_levels (Dict): Maps perturbation names to their magnitudes.
+    """
     dataset_cfgs: List = []
     dataloader_cfg = deepcopy(runner.cfg.test_dataloader)
 
@@ -249,17 +285,13 @@ def apply_perturbations_dataloader(
     perturb_levels: Dict = {},
     perturbation_set: str = None,
 ):
-    """General perturation dataloader utility function.
-    Changes the perturbations applied on the dataloader, given an existing runner object.
-    Modifies 'runner' directly, returns nothing.
-
-    The dataloader is rebuilt rather than having its dataset.pipeline reassigned:
-    the configs set persistent_workers=True, so worker processes hold their own copy
-    of the dataset and never observe an in-place pipeline swap.
-
-    `perturbation_set` names the vocabulary `perturb_levels`' keys are drawn from;
-    see _perturbation_transform_cfg for why the names alone are not enough. Callers
-    resetting to clean (`perturb_levels={}`) need not pass it -- nothing is resolved.
+    """
+    Apply perturbation levels to the runner's training, validation, or test dataloader.
+    
+    Parameters:
+        train (bool): Whether to update the training dataloader. When false, updates both validation and test dataloaders.
+        perturb_levels (Dict): Perturbation names and magnitudes to apply. An empty mapping restores the clean pipelines.
+        perturbation_set (str): Vocabulary containing the specified perturbation names.
     """
 
     if train:
@@ -294,6 +326,13 @@ def apply_perturbations_dataloader(
 def apply_random_perturbations_train_dataloader_new(
     runner: Runner, pdf_dict: Dict, perturbation_set: str = "new"
 ):
+    """
+    Add random perturbation augmentation to the training dataloader and rebuild its iterator.
+    
+    Parameters:
+        pdf_dict (Dict): Perturbation probability distribution used by the augmentation.
+        perturbation_set (str): Perturbation vocabulary used to resolve operation names.
+    """
     dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
 
     pipeline = [
@@ -335,6 +374,14 @@ def apply_random_alpha_training_augmentations(
     photometric_only=False,
     perturbation_set: str = "new",
 ):
+    """
+    Add random alpha-based augmentations to the training data pipeline.
+    
+    Parameters:
+        geometric_only (bool): Whether to restrict augmentation selection to geometric transforms.
+        photometric_only (bool): Whether to restrict augmentation selection to photometric transforms.
+        perturbation_set (str): Name of the perturbation set used for augmentation selection.
+    """
     dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
 
     pipeline = dataloader_cfg.dataset.pipeline
@@ -367,9 +414,15 @@ def apply_random_alpha_training_augmentations(
 def apply_random_perturbations_test_dataloader(
     runner: Runner, pdf_dict: Dict, perturbation_set: str = "new"
 ):
-    """Applies the random perturbation dataloader based on a given PDF dictionary.
-    Specifically, applies 'RandomTrainTransform' from bp.robustness.augmentations to the current
-    Runner's *test* dataloader.
+    """
+    Apply random perturbations to the test dataloader pipeline.
+    
+    Parameters:
+        pdf_dict (Dict): Probability distribution configuration for selecting perturbations.
+        perturbation_set (str): Registered perturbation set used by the random transform.
+    
+    Returns:
+        DataLoader: The rebuilt test dataloader.
     """
 
     dataloader_cfg = deepcopy(runner.cfg.test_dataloader)

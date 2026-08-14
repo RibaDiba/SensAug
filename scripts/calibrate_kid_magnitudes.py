@@ -63,19 +63,41 @@ class ImagePathDataset(Dataset):
     """
 
     def __init__(self, path):
+        """
+        Initialize the dataset with image files found recursively under a directory.
+        
+        Parameters:
+            path (str or pathlib.Path): Root directory to search for image files.
+        """
         self.images = [
             file for ext in IMG_EXTENSIONS for file in Path(path).rglob(f"*.{ext}")
         ]
 
     def __len__(self):
+        """Return the number of images in the dataset."""
         return len(self.images)
 
     def __getitem__(self, i):
+        """
+        Load and return the image at the specified dataset index.
+        
+        Parameters:
+        	i (int): Index of the image to load.
+        
+        Returns:
+        	numpy.ndarray: The image as an RGB array.
+        """
         img = cv2.imread(str(self.images[i]))
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def parse_args():
+    """
+    Parse command-line options for KID-based augmentation magnitude calibration.
+    
+    Returns:
+    	Namespace: Parsed calibration settings, including the experiment directory, reference data, target KID, candidate grid, operations, batch size, output path, and device.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Calibrate a per-op probe magnitude via KID, for use as a "
@@ -133,6 +155,18 @@ def parse_args():
 
 
 def parse_op_at_magnitude(spec):
+    """
+    Parse an operation and magnitude specification.
+    
+    Parameters:
+    	spec (str): An operation name followed by `@` and its magnitude.
+    
+    Returns:
+    	tuple: The operation name and magnitude as a two-item tuple.
+    
+    Raises:
+    	ValueError: If the operation is not supported.
+    """
     op, _, magnitude_str = spec.partition("@")
     if op not in ALL_DIFFERENTIABLE_PERTURBATIONS:
         raise ValueError(
@@ -143,10 +177,16 @@ def parse_op_at_magnitude(spec):
 
 
 def kid_at(kid_metric, dataloader, op_name, magnitude, device):
-    """KID between the reference set and `op_name` applied at `magnitude` to
-    every image in it. Resets only the fake-feature side of `kid_metric`
-    (reset_real_features=False), the same accumulate/reset/compute pattern
-    sensaug/metrics/kid.py::KID.compute uses.
+    """
+    Measure the KID produced by applying an augmentation at a specified magnitude.
+    
+    Parameters:
+    	op_name (str): Name of the differentiable augmentation to apply.
+    	magnitude (float): Augmentation magnitude.
+    	dataloader: Batches of reference images to augment and evaluate.
+    
+    Returns:
+    	float: Mean KID between the accumulated reference features and the augmented images.
     """
     op = ALL_DIFFERENTIABLE_PERTURBATIONS[op_name]
     kid_metric.reset()
@@ -166,6 +206,16 @@ def kid_at(kid_metric, dataloader, op_name, magnitude, device):
 
 
 def calibrate_op(kid_metric, dataloader, op_name, target_kid, grid, device):
+    """
+    Selects the operation magnitude whose KID is closest to the target.
+    
+    Parameters:
+    	target_kid (float): KID value to match.
+    	grid (array-like): Candidate magnitudes to evaluate.
+    
+    Returns:
+    	tuple[float, float]: The selected magnitude and its KID score.
+    """
     scores = np.array(
         [kid_at(kid_metric, dataloader, op_name, m, device) for m in grid]
     )
@@ -174,6 +224,13 @@ def calibrate_op(kid_metric, dataloader, op_name, target_kid, grid, device):
 
 
 def main():
+    """
+    Calibrate augmentation magnitudes against a shared target KID and write the resulting seed configuration.
+    
+    Raises:
+    	FileNotFoundError: If no dumped configuration or reference images are found, or if the dataset has fewer images than the batch size.
+    	ValueError: If the batch size produces no complete batches or an unknown operation is requested.
+    """
     args = parse_args()
     work_dir = os.path.abspath(args.work_dir)
 

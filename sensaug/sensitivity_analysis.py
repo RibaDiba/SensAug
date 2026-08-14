@@ -46,22 +46,15 @@ BASE_DATASET = "leftImg8bit/val"
 
 
 def adaptive_sensitivity_analysis_diff(cfg, runner, num_levels, tolerance):
-    """SA over the DIFFERENTIABLE ops -- the vocabulary the gradient
-    cross-correlation pipeline measures.
-
-    Exists so the SA curve and the matrix R are keyed by the same augmentations.
-    They previously were not: SA ran over NEW_PERTURBATIONS (Brightness/Color/
-    Shear/...) while the probe differentiated DIFFERENTIABLE_PERTURBATIONS
-    (lighter_R/blur/noise/...), two vocabularies with ZERO overlap, so no SA
-    magnitude could ever be looked up for an op R covered.
-
-    Deliberately reuses the "_new" adaptive machinery rather than the legacy
-    `adaptive_sensitivity_analysis`, even though that one iterates the same 14
-    names: the legacy path's levels are in raw units (blur = kernel size in
-    [0, 49], noise = sigma in [0, 50]) which would each need rescaling into the
-    probe's [0, 1], and it hard-requires metrics["kid"]. Here min/max level are
-    already 0.0/1.0 -- the probe's own magnitude units -- and calculate_miou_kid_new
-    tolerates a missing KID.
+    """
+    Analyze sensitivity for the differentiable perturbation vocabulary.
+    
+    Parameters:
+    	num_levels (int): Number of perturbation levels to evaluate.
+    	tolerance (float): Maximum interpolation error used to stop adaptive sampling.
+    
+    Returns:
+    	dict: Perturbation levels selected by the adaptive sensitivity analysis.
     """
     return adaptive_sensitivity_analysis_new(
         cfg, runner, num_levels, tolerance, perturbation_set="diff"
@@ -71,6 +64,19 @@ def adaptive_sensitivity_analysis_diff(cfg, runner, num_levels, tolerance):
 def adaptive_sensitivity_analysis_new(
     cfg, runner, num_levels, tolerance, perturbation_set="new"
 ):
+    """
+    Adaptively determine perturbation levels using segmentation performance and perceptual similarity.
+    
+    Parameters:
+        cfg: Evaluation configuration.
+        runner: MMEngine runner used to evaluate the perturbed dataset.
+        num_levels: Number of intermediate levels to determine for each perturbation.
+        tolerance: Maximum interpolation error permitted during adaptive sampling.
+        perturbation_set: Perturbation vocabulary to evaluate.
+    
+    Returns:
+        A mapping from perturbation names to their sampled levels.
+    """
     predictor = pchip_interpolator
     perturbation_levels: Dict[str, List[float]] = {}
     apply_perturbations_dataloader(runner, train=False, perturb_levels={})
@@ -318,18 +324,19 @@ def objective_function(
     kid: float,
     max_kid: float,
 ) -> float:
-    """Objective function that represents cumulative sensitivity.
-
-    Args:
-        level: Perturbation level
-        max_level: Maximum perturbation level
-        miou: Mean IoU
-        max_miou: Maximum mean IoU
-        kid: KID
-        max_kid: Maximum KID
-
+    """
+    Compute a scalar sensitivity objective from perturbation level, mIoU, and KID values.
+    
+    Parameters:
+        level: Current perturbation level.
+        max_level: Maximum perturbation level.
+        miou: Mean IoU at the current level.
+        max_miou: Maximum mean IoU.
+        kid: KID at the current level.
+        max_kid: Maximum KID.
+    
     Returns:
-        Objective value
+        Combined sensitivity objective value.
     """
     return (
         (miou / (max_miou + np.finfo(np.float32).eps))
@@ -339,6 +346,17 @@ def objective_function(
 
 
 def calculate_miou_kid_new(cfg, runner, perturbation, level, perturbation_set=None):
+    """
+    Evaluate segmentation performance and KID statistics for a perturbation level.
+    
+    Parameters:
+        perturbation: The perturbation to apply.
+        level: The perturbation intensity.
+        perturbation_set: The perturbation vocabulary used for application.
+    
+    Returns:
+        A tuple containing mIoU, mean KID, and KID standard deviation.
+    """
     apply_perturbations_dataloader(
         runner,
         train=False,
