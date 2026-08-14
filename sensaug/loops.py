@@ -22,6 +22,8 @@ from torchmetrics.image.kid import KernelInceptionDistance
 from sensaug.sensitivity_analysis import *
 from sensaug.runner_utils import *
 from sensaug.corr_magnitudes import conditional_levels, modal_magnitude
+from sensaug.hooks.grad_hook import training_progress
+from sensaug.redundancy import ramp_lambda, reweight
 
 
 def dict_mean(dict_list):
@@ -399,6 +401,8 @@ class RobustValLoop(ValLoop):
         photometric_only: bool = False,
         weighted_augs: bool = False,
         perturbation_set: str = "new",
+        corr_lambda: float = 0.0,
+        corr_lambda_ramp: str = "linear",
         fp16: bool = False,
     ) -> None:
         super().__init__(runner, dataloader, evaluator, fp16)
@@ -427,14 +431,27 @@ class RobustValLoop(ValLoop):
         self.weighted_augs = weighted_augs
 
         # Which augmentation vocabulary SA measures. "new" is the historical
-        # NEW_PERTURBATIONS set; "diff" is the differentiable ops the gradient
-        # cross-correlation pipeline differentiates, so that the SA curve and the
-        # matrix R are keyed by the SAME augmentations (they previously shared no
-        # names at all, so no SA magnitude could be looked up for any op in R).
+        # NEW_PERTURBATIONS set; "diff" and "aligned" are both keyed by the 32 op
+        # names the gradient cross-correlation pipeline differentiates, so that the
+        # SA curve and the matrix R describe the SAME augmentations (they
+        # previously shared no names at all, so no SA magnitude could be looked up
+        # for any op in R).
+        #
+        # "aligned" is what --aug-type=grad_corr uses: those names played through
+        # the plain CPU transform classes rather than the per-image torch wrappers.
+        # Everything below that used to test `!= "diff"` is really asking "is this
+        # vocabulary R-keyed?", so it is spelled that way now -- see
+        # _is_corr_vocabulary.
         self.perturbation_set = perturbation_set
         self.corr_magnitudes_path = os.path.join(
             runner.cfg.work_dir, "corr_magnitudes.json"
         )
+
+        # Redundancy down-weighting strength. 0 means the pdf is returned exactly
+        # as generated -- bit-identical, not merely close -- which is what makes it
+        # usable as the control arm.
+        self.corr_lambda = corr_lambda
+        self.corr_lambda_ramp = corr_lambda_ramp
 
         with open(sa_curve_path, "r") as f:
             sa_curve_str = f.read()
@@ -455,6 +472,89 @@ class RobustValLoop(ValLoop):
         with open(path, "r") as f:
             sa_curve_str = f.read()
             self.sa_curve = json.loads(sa_curve_str)
+
+    def _apply_redundancy_reweighting(self, pdf_dict: dict) -> dict:
+        """Down-weight ops the correlation pipeline found redundant with the rest
+        of the bank.
+
+        Reads `runner.corr_redundancy`, published by
+        PerturbationSensitivityAnalysisHookWithGradients.prune_augmentations. That
+        hook fires on `corr_interval` and this loop on `round_interval`, so what is
+        read here is simply the latest score -- there is none at all until the first
+        emission, and the pdf is returned untouched until then.
+
+        Called by all three pdf generators, so `--corr-lambda` composes with
+        `--uniform` and `--weighted-augs` rather than silently applying to only one
+        of them.
+        """
+        if not self.corr_lambda:
+            return pdf_dict
+
+        published = getattr(self.runner, "corr_redundancy", None)
+        if not published:
+            return pdf_dict
+
+        lam = ramp_lambda(  # noqa: F405
+            self.corr_lambda,
+            training_progress(self.runner),  # noqa: F405
+            mode=self.corr_lambda_ramp,
+        )
+        result = reweight(pdf_dict, published.get("red"), lam)  # noqa: F405
+
+        if is_main_process():
+            if result.applied:
+                print_log(
+                    f"[redundancy] round {self.n_rounds}: reweighted the pdf at "
+                    f"lambda={lam:.3f} (target {self.corr_lambda:g}, "
+                    f"{self.corr_lambda_ramp} ramp) off the "
+                    f"{published.get('checkpoint')} checkpoint's "
+                    f"{published.get('mode')} score -- max/min over the perturbation "
+                    f"mass is now {result.spread:.1f}x",
+                    logger="current",
+                )
+                # The caller already printed the pdf as generated; this is the
+                # after half of the pair, which is what you want side by side the
+                # first time a result looks strange.
+                print("Perturbation PDF after redundancy reweighting:")
+                print(
+                    json.dumps(
+                        {str(k): v for k, v in result.pdf.items()},
+                        indent=4,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                # Never silently. A reweighting that quietly does nothing looks
+                # exactly like a real experimental arm in the results.
+                print_log(
+                    f"[redundancy] round {self.n_rounds}: pdf NOT reweighted -- "
+                    f"{result.reason}",
+                    logger="current",
+                    level=30,  # WARNING
+                )
+
+        return result.pdf
+
+    @property
+    def _is_corr_vocabulary(self) -> bool:
+        """Whether this vocabulary's op names are the ones R is indexed by.
+
+        True for both "diff" and "aligned" -- they share all 32 keys and differ only
+        in which class each key resolves to. Anything handed to the gradient probe
+        or read back from it keys off this, never off the implementation.
+        """
+        return self.perturbation_set in ("diff", "aligned")
+
+    @property
+    def _trains_on_this_vocabulary(self) -> bool:
+        """Whether the training pipeline may be rebuilt onto this vocabulary.
+
+        False only for "diff": those ops are GPU-batched-only by design and 40-150x
+        slower applied per-image on CPU, which is what a training pipeline does. It
+        is the one vocabulary that is measurement-only. "aligned" exists precisely
+        so grad_corr can have R's op names on the training side without that cost.
+        """
+        return self.perturbation_set != "diff"
 
     def update_sa_curve(self):
         # if get_rank() == 0:
@@ -493,7 +593,13 @@ class RobustValLoop(ValLoop):
             for _, level in enumerate(levels):
                 # evaluate on current SA curve to choose PDF
                 apply_perturbations_dataloader(
-                    self.runner, train=False, perturb_levels={p_type: level}
+                    self.runner,
+                    train=False,
+                    perturb_levels={p_type: level},
+                    # "diff" and "aligned" share all 32 keys; without this the
+                    # round-eval resolves every one of them onto the per-image
+                    # torch wrappers regardless of which vocabulary is in play.
+                    perturbation_set=self.perturbation_set,
                 )
                 metrics = self._run_eval(ratio=self.ratio)
                 miou = metrics["mIoU"]
@@ -551,11 +657,19 @@ class RobustValLoop(ValLoop):
         """Hand this round's per-op magnitude distributions to the gradient
         cross-correlation probe.
 
-        Only meaningful for the "diff" vocabulary: the probe differentiates
-        DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by NEW_PERTURBATIONS
-        names would match nothing and every op would silently fall back to the
-        fixed reference magnitude. Skipped outright rather than published-and-
-        ignored, so `runner.corr_magnitudes` is never a misleading non-empty dict.
+        Only meaningful for an R-keyed vocabulary ("diff" or "aligned"): the probe
+        differentiates DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by
+        NEW_PERTURBATIONS names would match nothing and every op would silently
+        fall back to the fixed reference magnitude. Skipped outright rather than
+        published-and-ignored, so `runner.corr_magnitudes` is never a misleading
+        non-empty dict.
+
+        Under "aligned" the names match but the magnitude SCALES do not: the SA
+        level is derived on the CPU op and the probe applies it to the
+        differentiable one, and the two registries were never calibrated against
+        each other (blur is the starkest -- cv2's kernel-size-derived implicit
+        sigma against sigma itself). The op identity transfers; treat the magnitude
+        as approximate.
 
         Published onto the runner (the same handoff channel CollectGradientHook
         already uses for `runner.aug_grad_buffer`) rather than pushed: the probe
@@ -567,7 +681,7 @@ class RobustValLoop(ValLoop):
         evaluator metrics that produce the pdf, so all ranks derive the same
         snapshot. Only rank 0 writes the file.
         """
-        if self.perturbation_set != "diff" or not self.pdf_dict:
+        if not self._is_corr_vocabulary or not self.pdf_dict:
             return
 
         snapshot = conditional_levels(  # noqa: F405
@@ -616,16 +730,17 @@ class RobustValLoop(ValLoop):
         """Drop the color/photometric ops from the training pdf (`--no-inv-aug`).
 
         The op names are vocabulary-specific. For "new" this is Posterize/Solarize,
-        as it has always been. For "diff" those names do not exist, so it is the
-        hue ops themselves -- which is also what the flag's name (remove_H) says.
-        Popping nothing at all would silently ignore --no-inv-aug for the whole
-        diff vocabulary.
+        as it has always been. For the R-keyed vocabularies those names do not exist
+        ("aligned" has no Posterize/Solarize at all, since neither has a
+        differentiable counterpart), so it is the hue ops themselves -- which is
+        also what the flag's name (remove_H) says. Popping nothing at all would
+        silently ignore --no-inv-aug for those whole vocabularies.
         """
         if not self.remove_H:
             return
         names = (
             ("lighter_H", "darker_H")
-            if self.perturbation_set == "diff"
+            if self._is_corr_vocabulary
             else ("PosterizeTransform", "SolarizeTransform")
         )
         for name in names:
@@ -650,6 +765,7 @@ class RobustValLoop(ValLoop):
 
         # add a "none" perturbation to pdf
         pdf_dict[("none", 0)] = 1.0 - pdf_dict_perturb_prob
+        pdf_dict = self._apply_redundancy_reweighting(pdf_dict)
         self.pdf_dict = pdf_dict
 
         return pdf_dict, final_metrics
@@ -695,6 +811,7 @@ class RobustValLoop(ValLoop):
                 )
             )
 
+        pdf_dict = self._apply_redundancy_reweighting(pdf_dict)
         self.pdf_dict = pdf_dict
 
         return pdf_dict, final_metrics
@@ -738,6 +855,7 @@ class RobustValLoop(ValLoop):
                 )
             )
 
+        pdf_dict = self._apply_redundancy_reweighting(pdf_dict)
         self.pdf_dict = pdf_dict
 
         return pdf_dict, final_metrics
@@ -788,13 +906,12 @@ class RobustValLoop(ValLoop):
 
         if self.n_rounds >= self.warmup_rounds:
             if self.random_aug:
-                # "diff" (grad_corr) trains on the "new" vocabulary -- see
-                # train.py's pipeline wiring -- so this must never rebuild the
-                # train dataloader onto the diff vocabulary: DIFFERENTIABLE_PERTURBATIONS
-                # ops are GPU-batched-only by design and 40-150x slower per-image
-                # on CPU, and self.perturbation_set here is the SA/probe vocabulary,
-                # not what training should sample from.
-                if self.perturbation_set != "diff":
+                # Never rebuild the train dataloader onto "diff":
+                # DIFFERENTIABLE_PERTURBATIONS ops are GPU-batched-only by design
+                # and 40-150x slower per-image on CPU, which is what a training
+                # pipeline does. "aligned" carries the same op names through the
+                # plain CPU classes and is safe here.
+                if self._trains_on_this_vocabulary:
                     apply_random_alpha_training_augmentations(  # noqa: F405
                         self.runner,
                         geometric_only=self.geometric_only,
@@ -817,14 +934,14 @@ class RobustValLoop(ValLoop):
                         )
                     )  # update pdf to sample from
                     self.publish_corr_magnitudes()
-                    # Same reasoning as the random_aug branch above: grad_corr
-                    # ("diff") trains on the "new" vocabulary, and this call must
-                    # not rebuild the train dataloader back onto "diff" -- that's
-                    # the per-image CPU path that made grad_corr training 40-150x
-                    # slower. publish_corr_magnitudes() above already handed the
-                    # probe everything it needs; the training pipeline set up in
-                    # train.py (perturbation_set="new") is left untouched.
-                    if self.perturbation_set != "diff":
+                    # Same reasoning as the random_aug branch above: "diff" is the
+                    # one measurement-only vocabulary, and rebuilding the train
+                    # dataloader onto it is the per-image CPU path that made
+                    # grad_corr training 40-150x slower. Under "aligned" this DOES
+                    # fire, which is the point -- it is what puts the pdf (and so
+                    # the redundancy reweighting applied to it above) in front of
+                    # training at all.
+                    if self._trains_on_this_vocabulary:
                         apply_random_perturbations_train_dataloader_new(  # noqa: F405
                             self.runner,
                             pdf_dict=self.pdf_dict,

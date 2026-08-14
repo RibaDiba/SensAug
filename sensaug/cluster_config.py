@@ -14,4 +14,7 @@ def load_seg_config(path):
         # Optional, and `schedule:` with every value left null parses to None
         # rather than {} -- so `or {}` rather than a plain .get default.
         SCHEDULE=raw.get("schedule") or {},
+        # Optional. None means "don't redirect pretrained-checkpoint URLs" -- the
+        # cluster is assumed to have node-level internet access (e.g. nexus.yaml).
+        PRETRAINED_CACHE_DIR=raw.get("pretrained_cache_dir"),
     )

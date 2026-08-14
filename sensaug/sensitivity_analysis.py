@@ -81,27 +81,30 @@ def adaptive_sensitivity_analysis_new(
     min_level = 0.0
     max_level = 1.0
 
-    if perturbation_set == "diff":
-        # Every differentiable op is photometric, so the geometric/photometric
-        # filters below do not apply to this vocabulary.
-        perturbation_list = DIFF_PERTURBATIONS.items()
-    else:
-        perturbation_list = NEW_PERTURBATIONS.items()
+    # resolve_perturbation_set is the single dispatch point for all three
+    # vocabularies and already applies the geometric/photometric filters, so the
+    # per-set branching that used to live here is gone. It matters for "aligned"
+    # specifically: that set has both kinds of op, so silently ignoring the
+    # filters (as the old "diff" branch did) would sweep all 32.
+    perturbation_list = resolve_perturbation_set(  # noqa: F405
+        perturbation_set,
+        geometric_only=hasattr(cfg, "geometric_only"),
+        photometric_only=hasattr(cfg, "photometric_only"),
+    ).items()
 
-        if hasattr(cfg, "geometric_only"):
-            perturbation_list = NEW_PERTURBATIONS_GEOMETRIC.items()
-
-        if hasattr(cfg, "photometric_only"):
-            perturbation_list = NEW_PERTURBATIONS_PHOTOMETRIC.items()
-
-    verify_perturbation_effective(runner, next(iter(perturbation_list))[0], max_level)
+    verify_perturbation_effective(
+        runner,
+        next(iter(perturbation_list))[0],
+        max_level,
+        perturbation_set=perturbation_set,
+    )
 
     for perturbation, _ in perturbation_list:
         error = tolerance * max_level
 
         # calculate mean IoU and KID for baseline and max perturbation
         max_miou, max_kid, _ = calculate_miou_kid_new(
-            cfg, runner, perturbation, max_level
+            cfg, runner, perturbation, max_level, perturbation_set=perturbation_set
         )
         points = np.array([(min_level, 0.0), (max_level, 2.0)])
 
@@ -116,7 +119,9 @@ def adaptive_sensitivity_analysis_new(
 
         while max_error >= error:
             # calculate mean IoU and KID for perturbation level
-            miou, kid, _ = calculate_miou_kid_new(cfg, runner, perturbation, level)
+            miou, kid, _ = calculate_miou_kid_new(
+                cfg, runner, perturbation, level, perturbation_set=perturbation_set
+            )
             value = objective_function(
                 level, max_level, miou_base - miou, miou_base - max_miou, kid, max_kid
             )
@@ -333,9 +338,12 @@ def objective_function(
     )
 
 
-def calculate_miou_kid_new(cfg, runner, perturbation, level):
+def calculate_miou_kid_new(cfg, runner, perturbation, level, perturbation_set=None):
     apply_perturbations_dataloader(
-        runner, train=False, perturb_levels={perturbation: level}
+        runner,
+        train=False,
+        perturb_levels={perturbation: level},
+        perturbation_set=perturbation_set,
     )
 
     # Assumes Test loop is of type SubsetTestLoop (train_robust.py)

@@ -12,11 +12,29 @@ from mmseg.registry import DATASETS
 from sensaug.dataset.augmentations import *
 
 
-def _perturbation_transform_cfg(p_type, value):
-    """Map a perturbation name + magnitude onto a registered transform cfg."""
+def _perturbation_transform_cfg(p_type, value, perturbation_set: str = None):
+    """Map a perturbation name + magnitude onto a registered transform cfg.
+
+    `perturbation_set` disambiguates. DIFF_PERTURBATIONS and ALIGNED_PERTURBATIONS
+    share all 32 keys and mean different classes under each -- `lighter_R` is the
+    per-image torch wrapper DiffLighterR in one and the plain cv2 LighterR in the
+    other. Dispatching on the name alone would silently resolve every aligned-set
+    sweep onto the diff wrappers, i.e. onto the 40-150x slower path the aligned
+    vocabulary exists to avoid, and nothing downstream would say so: the transform
+    names it inserts are real and _assert_transforms_present would pass.
+
+    Left as None (every pre-existing caller) the old name-based order applies.
+    """
     if p_type in IMAGENETC_NAME_FN_DICT.keys():  # noqa: F405
         return "ImageNetCTransform", dict(
             type="ImageNetCTransform", name=p_type, severity=value
+        )
+    if perturbation_set is not None and p_type in resolve_perturbation_set(  # noqa: F405
+        perturbation_set
+    ):
+        transform_cls, _ = resolve_perturbation_set(perturbation_set)[p_type]  # noqa: F405
+        return transform_cls.__name__, dict(
+            type=transform_cls.__name__, magnitude=value
         )
     if p_type in NEW_PERTURBATIONS.keys():  # noqa: F405
         return p_type, dict(type=p_type, magnitude=value)
@@ -37,7 +55,9 @@ def _perturbation_transform_cfg(p_type, value):
     raise ValueError(f"transform name doesn't match anything: {p_type}")
 
 
-def _build_perturbed_pipeline(dataloader_cfg, perturb_levels: Dict, train: bool):
+def _build_perturbed_pipeline(
+    dataloader_cfg, perturb_levels: Dict, train: bool, perturbation_set: str = None
+):
     """Insert perturbation transforms into dataloader_cfg's pipeline, in place.
 
     Returns the list of transform type names that were inserted.
@@ -59,7 +79,9 @@ def _build_perturbed_pipeline(dataloader_cfg, perturb_levels: Dict, train: bool)
 
     inserted: List[str] = []
     for p_type, value in perturb_levels.items():
-        transform_name, kwargs = _perturbation_transform_cfg(p_type, value)
+        transform_name, kwargs = _perturbation_transform_cfg(
+            p_type, value, perturbation_set=perturbation_set
+        )
         pipeline.insert(insert_index, kwargs)
         inserted.append(transform_name)
 
@@ -104,7 +126,11 @@ def _rebind_train_iterator(runner: Runner):
 
 
 def verify_perturbation_effective(
-    runner: Runner, p_type: str, magnitude: float = 1.0, sample_idx: int = 0
+    runner: Runner,
+    p_type: str,
+    magnitude: float = 1.0,
+    sample_idx: int = 0,
+    perturbation_set: str = None,
 ):
     """Functional self-test: at full magnitude, a perturbation must change pixels.
 
@@ -114,7 +140,9 @@ def verify_perturbation_effective(
     """
     clean_cfg = deepcopy(runner.cfg.val_dataloader)
     pert_cfg = deepcopy(runner.cfg.val_dataloader)
-    _build_perturbed_pipeline(pert_cfg, {p_type: magnitude}, train=False)
+    _build_perturbed_pipeline(
+        pert_cfg, {p_type: magnitude}, train=False, perturbation_set=perturbation_set
+    )
 
     clean = DATASETS.build(clean_cfg.dataset)[sample_idx]["inputs"]
     perturbed = DATASETS.build(pert_cfg.dataset)[sample_idx]["inputs"]
@@ -216,7 +244,10 @@ def create_union_train_set_new(runner: Runner, perturb_levels: Dict = {}):
 
 
 def apply_perturbations_dataloader(
-    runner: Runner, train: bool = False, perturb_levels: Dict = {}
+    runner: Runner,
+    train: bool = False,
+    perturb_levels: Dict = {},
+    perturbation_set: str = None,
 ):
     """General perturation dataloader utility function.
     Changes the perturbations applied on the dataloader, given an existing runner object.
@@ -225,11 +256,17 @@ def apply_perturbations_dataloader(
     The dataloader is rebuilt rather than having its dataset.pipeline reassigned:
     the configs set persistent_workers=True, so worker processes hold their own copy
     of the dataset and never observe an in-place pipeline swap.
+
+    `perturbation_set` names the vocabulary `perturb_levels`' keys are drawn from;
+    see _perturbation_transform_cfg for why the names alone are not enough. Callers
+    resetting to clean (`perturb_levels={}`) need not pass it -- nothing is resolved.
     """
 
     if train:
         dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
-        inserted = _build_perturbed_pipeline(dataloader_cfg, perturb_levels, train=True)
+        inserted = _build_perturbed_pipeline(
+            dataloader_cfg, perturb_levels, train=True, perturbation_set=perturbation_set
+        )
         print_log(
             f"Rebuilding train loop dataloader: {dataloader_cfg.dataset.pipeline}",
             logger="current",
@@ -241,7 +278,12 @@ def apply_perturbations_dataloader(
     # val and test loops are both driven off val_dataloader cfg, as before
     for tag, loop in (("val", runner.val_loop), ("test", runner.test_loop)):
         dataloader_cfg = deepcopy(runner.cfg.val_dataloader)
-        inserted = _build_perturbed_pipeline(dataloader_cfg, perturb_levels, train=False)
+        inserted = _build_perturbed_pipeline(
+            dataloader_cfg,
+            perturb_levels,
+            train=False,
+            perturbation_set=perturbation_set,
+        )
         print_log(
             f"Rebuilding {tag} loop dataloader: {dataloader_cfg.dataset.pipeline}",
             logger="current",
