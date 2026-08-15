@@ -126,7 +126,7 @@ python train.py \
 | `--corr-red-mode` | `squared`, `abs`, `signed` | how a row of R reduces to one score per op. `squared` default |
 | `--corr-lambda-ramp` | `linear`, `constant` | ramp λ from 0 over training (default) vs. full strength from the first R emission |
 | `--corr-keep-within-op` | flag | keep the `lighter_X`/`darker_X` and `_pos`/`_neg` cells in `red(a)`; excluded by default |
-| `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is hardcoded to every 6th round in `sensaug/loops.py` |
+| `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is hardcoded to every 6th round in `sensaug/loops/sensaug_loop.py` |
 
 ## The two pipelines (and their two clocks)
 
@@ -134,10 +134,11 @@ Training runs two independent measurements. They share no clock and no hook poin
 
 | Pipeline | Question it answers | Clock | Code |
 |---|---|---|---|
-| Sensitivity analysis (SA) | which perturbations is the model *worst at*? (weights the training aug PDF) | `round_interval` | `sensaug/loops.py` → `RobustValLoop` |
+| Sensitivity analysis (SA) | which perturbations is the model *worst at*? (weights the training aug PDF) | `round_interval` | `sensaug/loops/sensaug_loop.py` → `RobustValLoop` |
 | Gradient cross-correlation | which perturbations are *redundant with each other*? (the matrix R) | `corr_interval` | `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
 
 - **SA** runs only under `--aug-type=ours`, from the val loop. The SA *curve* is recomputed every 6th round (hardcoded), so its effective cadence is `6 × round_interval`.
+- **Which val loop runs.** `--aug-type=ours` → `RobustValLoop`; `--aug-type=grad_corr` → `GradCorrValLoop`, which subclasses it and adds exactly one thing, Lever 3's redundancy reweighting. The base declares `_apply_redundancy_reweighting` as an identity function and the subclass overrides it, so the three pdf generators and `run()` carry no `if grad_corr` branch. `--aug-type=grad_corr --no-corr-sa` builds neither — mmengine's stock `ValLoop`.
 - **Correlation** is opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag layered on top of another one (`--aug-type=none --grad-corr` is not valid; that flag doesn't exist). It fires from `after_train_iter`, freezing the model and sweeping the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per aug per image. `CollectGradientHook` (priority NORMAL) sweeps; `PerturbationSensitivityAnalysisHookWithGradients` (priority LOW) correlates the sweep it just wrote — the priority ordering is load-bearing. Both are given the same `interval`; the shared gate is `fires_at()` in `grad_hook.py`. For the unaugmented control arm — R measured against a baseline with no training augmentation, which is what the SA-on number gets compared to — pass `--aug-type=grad_corr --no-corr-sa`: that disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.
 
 ## The three augmentation vocabularies
@@ -212,13 +213,31 @@ standardized row sum of R. Lives in `sensaug/redundancy.py` (pure numpy, no mmse
 - Down-weighting is soft and structurally cannot reach zero. At the correlation sizes
   actually observed (mean |r| 0.11–0.22) deletion would not be justified.
 
+### DDP correctness: R must be built on every rank, not just rank 0
+
+`PerturbationSensitivityAnalysisHookWithGradients._emit()`
+(`sensaug/hooks/grad_sens_analysis.py`, **uncommitted on this branch**) used to gate
+the entire R computation behind `is_main_process()`. Under multi-GPU DDP (e.g.
+`job_scripts/train_della_4gpu.sbatch`), `RobustValLoop` rebuilds **each rank's own**
+train dataloader from **that rank's own** `runner.corr_redundancy` — so publishing the
+score on rank 0 alone left ranks 1..N-1 training on an un-reweighted pdf. DDP then
+averages every rank's gradients into one update, so Lever 3's reweighting silently
+reached only `1/world_size` of the actual signal, with nothing in the logs to flag it.
+
+**Fix:** every rank now runs `_emit()`. The pre-`_emit` gather (`merge_rank_buffers`)
+already leaves all ranks holding identical input, and `_emit` is deterministic (fixed
+`bootstrap_seed`, pure numpy), so every rank independently arrives at the same R and
+the same `red(a)`. The `is_main_process()` guards moved *inside* `_emit`, now scoped
+only to the side effects that must not be duplicated: the `corr_log_path` /
+`bootstrap_log_path` read-modify-writes and the TensorBoard logging.
+
 ## Known issue: `--aug-type=grad_corr` jobs burn their SLURM walltime on SA round-evals, not training
 
 Diagnosed from `experiments/grad_corr_grad_corr_2_pspnet_cityscapes_4gpu_gradcorr` (job `11809659`, 6h walltime): the job was killed by SLURM at the time limit ([logs/grad_corr_2.11809659.err](logs/grad_corr_2.11809659.err) — `CANCELLED ... DUE TO TIME LIMIT`), having reached only iter 28000/80000 (35%). Not a crash. Breakdown of the 6h: **actual training ≈ 38 min (~10%)**, one correlation sweep ≈ 4 min (~1%), **SA round-evals ≈ 5h20m (~88%)**.
 
-**Root cause:** for `--aug-type=grad_corr`, `train.py` sets `cfg.val_cfg.perturbation_set = "diff"`. Every SA round (`round_interval`, default `max_iters // 20`) once `self.sa_curve` is non-`None`, `RobustValLoop.run()` (`sensaug/loops.py`) calls `generate_pdf_new()` → `test_perturbed_new()`, which rebuilds the val/test dataloader once per `(perturbation, magnitude)` pair and runs a full mIoU eval over it. For the `"diff"` vocabulary this inserts the CPU per-image `Diff*` transforms (`sensaug/dataset/augmentations.py`, `_make_diff_transform`/`DIFF_PERTURBATIONS`) — but `DIFFERENTIABLE_PERTURBATIONS` ops (`sensaug/dataset/differentiable_augmentations.py`) are **GPU-batched-only by design** and 40-150x slower per-image on CPU. `update_sa_curve()` (every 6th round) sweeps this same way. In the diagnosed run, two of these round-evals (iters 20000 and 24000) each took 1h49m–3h11m; ordinary training iterations run at ~0.08s/iter and are not the bottleneck.
+**Root cause:** for `--aug-type=grad_corr`, `train.py` sets `cfg.val_cfg.perturbation_set = "diff"`. Every SA round (`round_interval`, default `max_iters // 20`) once `self.sa_curve` is non-`None`, `RobustValLoop.run()` (`sensaug/loops/sensaug_loop.py`) calls `generate_pdf_new()` → `test_perturbed_new()`, which rebuilds the val/test dataloader once per `(perturbation, magnitude)` pair and runs a full mIoU eval over it. For the `"diff"` vocabulary this inserts the CPU per-image `Diff*` transforms (`sensaug/dataset/augmentations.py`, `_make_diff_transform`/`DIFF_PERTURBATIONS`) — but `DIFFERENTIABLE_PERTURBATIONS` ops (`sensaug/dataset/differentiable_augmentations.py`) are **GPU-batched-only by design** and 40-150x slower per-image on CPU. `update_sa_curve()` (every 6th round) sweeps this same way. In the diagnosed run, two of these round-evals (iters 20000 and 24000) each took 1h49m–3h11m; ordinary training iterations run at ~0.08s/iter and are not the bottleneck.
 
-**Partial fix already applied (uncommitted, this branch):** `sensaug/loops.py` (`RobustValLoop.run()`, guards around the `apply_random_alpha_training_augmentations`/`apply_random_perturbations_train_dataloader_new` calls) and `train.py` (`build_config`, the `RandomAlphaTrainTransform` `perturbation_set` arg) now force the **train** dataloader to always use `perturbation_set="new"`, never rebuilding it onto `"diff"`. This fixed the training-loop side of the 40-150x slowdown. It does **not** touch the **SA round-eval** side (`test_perturbed_new`/`update_sa_curve`/`generate_pdf_new`, still on `"diff"` when `--aug-type=grad_corr`) — that remains the open bug above.
+**Partial fix already applied (uncommitted, this branch):** `sensaug/loops/sensaug_loop.py` (`RobustValLoop.run()`, guards around the `apply_random_alpha_training_augmentations`/`apply_random_perturbations_train_dataloader_new` calls) and `train.py` (`build_config`, the `RandomAlphaTrainTransform` `perturbation_set` arg) now force the **train** dataloader to always use `perturbation_set="new"`, never rebuilding it onto `"diff"`. This fixed the training-loop side of the 40-150x slowdown. It does **not** touch the **SA round-eval** side (`test_perturbed_new`/`update_sa_curve`/`generate_pdf_new`, still on `"diff"` when `--aug-type=grad_corr`) — that remains the open bug above.
 
 **Why "just switch the SA loop to `\"new\"` too" doesn't work:** `NEW_PERTURBATIONS` and `DIFFERENTIABLE_PERTURBATIONS` are **disjoint vocabularies** — different op names and different magnitude scales. `RobustValLoop.publish_corr_magnitudes()` guards against publishing a `"new"`-keyed snapshot for an R-keyed probe, specifically because a mismatched snapshot would make every op in `CollectGradientHook` silently fall back to the fixed reference magnitude (`0.5`, `grad_hook.py`) instead of the SA-informed one. Switching the SA loop to `"new"` would fix the walltime problem but **silently disable `--corr-magnitude-mode mode`'s adaptive probing for the whole run**.
 
@@ -300,7 +319,13 @@ datasets:
 | `sensaug/hooks/grad_sens_analysis.py` | `PerturbationSensitivityAnalysisHookWithGradients` — builds the cross-correlation matrix R from the sweep, and publishes `red(a)` |
 | `sensaug/redundancy.py` | `compute_red` / `reweight` — Lever 3's mechanism. Pure numpy, no mmseg |
 | `scripts/calibrate_lambda.py` | offline λ sweep against logged `corr_matrix_log.json` files |
-| `sensaug/loops.py` | Custom train/val loops (RobustValLoop, etc.) — **the SA pipeline** |
+| `scripts/compute_grad_corr.py` | recompute R for an already-trained checkpoint without retraining — drives the grad_corr hooks off a loaded model + val dataloader; SLURM wrapper is `job_scripts/compute_grad_corr.sbatch` |
+| `scripts/calibrate_kid_magnitudes.py` | pick a per-op probe magnitude via KID (Kernel Inception Distance) so every op carries a comparable distortion budget, for checkpoints with no SA-published magnitude to draw from |
+| `scripts/run_grad_corr.sh` | reference invocation chaining the two scripts above against a finished experiment |
+| `sensaug/loops/sensaug_loop.py` | `RobustValLoop` — **the SA pipeline**. `--aug-type=ours` runs this |
+| `sensaug/loops/grad_corr_loop.py` | `GradCorrValLoop` — `RobustValLoop` + Lever 3's redundancy down-weighting. `--aug-type=grad_corr` runs this |
+| `sensaug/loops/train_loops.py` | `RobustIterBasedTrainLoop`, `SubsetTestLoop`, `SubsetValLoop` — loops a real training job runs |
+| `sensaug/loops/test_loops.py` | `DebugAugLoop`, `VisualizeSampleLoop`, `KIDTestLoop` — development/inspection only, no metrics |
 | `sensaug/custom_configs/mmseg/` | Per-backbone MMSeg config files |
 | `job_scripts/train_della.sbatch` | Della SLURM job script |
 

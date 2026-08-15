@@ -373,7 +373,7 @@ def build_config(args):
 
     # The two pipelines' clocks, resolved independently of each other. round_interval
     # drives the SA pipeline (RobustValLoop; its SA-curve recompute is every 6th of
-    # these rounds, in sensaug/loops.py). corr_interval drives the gradient
+    # these rounds, in sensaug/loops/sensaug_loop.py). corr_interval drives the gradient
     # cross-correlation pipeline. Neither is derived from the other.
     round_interval = resolve_interval(
         args.round_interval, "round_interval", cfg.train_cfg.max_iters // N_ROUNDS
@@ -412,7 +412,13 @@ def build_config(args):
 
     if sa_loop:
         eval_ratio = 0.25 if "acdc" not in args.dataset.lower() else 1.0
-        cfg.val_cfg.type = "RobustValLoop"
+        # GradCorrValLoop is RobustValLoop plus Lever 3's redundancy
+        # down-weighting -- the only thing it adds. It is a separate registry name
+        # rather than a flag on RobustValLoop so that the SA arm cannot be handed
+        # correlation-pipeline kwargs it has no consumer for.
+        cfg.val_cfg.type = (
+            "GradCorrValLoop" if args.aug_type == "grad_corr" else "RobustValLoop"
+        )
         # "aligned", not "diff": same 32 op names either way, but the CPU classes
         # rather than the per-image torch wrappers. The SA round-eval inserts these
         # into the val dataloader once per (op, level) pair, and on the diff
@@ -434,8 +440,13 @@ def build_config(args):
         cfg.val_cfg.geometric_only = args.geometric_only
         cfg.val_cfg.photometric_only = args.photometric_only
         cfg.val_cfg.weighted_augs = args.weighted_augs
-        cfg.val_cfg.corr_lambda = args.corr_lambda
-        cfg.val_cfg.corr_lambda_ramp = args.corr_lambda_ramp
+        # Lever 3's two knobs only exist on GradCorrValLoop. Setting them
+        # unconditionally would attach kwargs RobustValLoop does not accept, and
+        # under --no-corr-sa (sa_loop False) there is no custom val loop at all --
+        # mmengine builds the stock ValLoop and would raise on them.
+        if args.aug_type == "grad_corr":
+            cfg.val_cfg.corr_lambda = args.corr_lambda
+            cfg.val_cfg.corr_lambda_ramp = args.corr_lambda_ramp
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio

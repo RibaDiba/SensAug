@@ -106,7 +106,7 @@ There are many command-line arguments in the train.py script, which you can list
 | `--round_interval` | int | `max_iters // 20` | Iterations between robustness re-evaluations — the **SA pipeline's clock**. Overrides `schedule.round_interval` in the cluster config. See [Scheduling](#scheduling-two-independent-pipelines) |
 | `--no-corr-sa` | flag | False | Under `--aug-type=grad_corr`, disable the SA loop — trains exactly like `none` while still running the correlation measurement. This is the control arm |
 | `--corr-interval` | int | `max_iters // 4` | Iterations between gradient sweeps and R emissions — the **correlation pipeline's clock**. Only meaningful under `--aug-type=grad_corr`. Overrides `schedule.corr_interval` in the cluster config |
-| `--sa_interval` | int | None | ⚠️ Currently unused — parsed but never read. The SA-curve recompute cadence is hardcoded to every 6th round in `sensaug/loops.py` |
+| `--sa_interval` | int | None | ⚠️ Currently unused — parsed but never read. The SA-curve recompute cadence is hardcoded to every 6th round in `sensaug/loops/sensaug_loop.py` |
 | `--adamw` | flag | False | Use AdamW optimizer instead of default SGD |
 | `--amp` | flag | False | Enable automatic mixed-precision (AMP) training |
 | `--auto-scale-lr` | flag | False | Auto-scale learning rate based on batch size |
@@ -120,7 +120,7 @@ Training runs **two separate measurement pipelines**, on two clocks that have no
 
 | Pipeline | What it measures | Clock | Where it lives |
 |---|---|---|---|
-| **Sensitivity analysis (SA)** | Which perturbations the model is currently *worst at* — used to weight the training augmentation PDF | `schedule.round_interval` / `--round_interval` (default `max_iters // 20`) | `sensaug/loops.py` (`RobustValLoop`) |
+| **Sensitivity analysis (SA)** | Which perturbations the model is currently *worst at* — used to weight the training augmentation PDF | `schedule.round_interval` / `--round_interval` (default `max_iters // 20`) | `sensaug/loops/sensaug_loop.py` (`RobustValLoop`) |
 | **Gradient cross-correlation** | Which perturbations are *redundant with each other* — the correlation matrix R | `schedule.corr_interval` / `--corr-interval` (default `max_iters // 4`) | `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
 
 ```yaml
@@ -134,7 +134,7 @@ Leave a value `null` (or omit the `schedule:` block entirely) to take the defaul
 
 Notes on each:
 
-- **SA pipeline.** Runs only under `--aug-type=ours`. Every `round_interval` iterations it re-evaluates perturbation robustness and rebuilds the training sampling PDF. The SA *curve* itself is recomputed every 6th round (hardcoded in `sensaug/loops.py`), so the effective SA-curve cadence is `6 × round_interval`.
+- **SA pipeline.** Runs only under `--aug-type=ours`. Every `round_interval` iterations it re-evaluates perturbation robustness and rebuilds the training sampling PDF. The SA *curve* itself is recomputed every 6th round (hardcoded in `sensaug/loops/sensaug_loop.py`), so the effective SA-curve cadence is `6 × round_interval`.
 - **Correlation pipeline.** Opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag you layer on top of another one (there is no standalone `--grad-corr` flag; `--aug-type=none --grad-corr` is not valid). Every `corr_interval` iterations it freezes the model, sweeps the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per augmentation per image, and correlates that sweep into R. It fires from `after_train_iter`, so it never depends on a val round happening. The final training iteration always fires, so the converged model's R exists even when `max_iters` is not a multiple of `corr_interval`.
 
 R is a claim about the augmentation operators themselves, not about the `ours` training loop, so the pipeline also needs an unaugmented control arm to compare against. That's `--no-corr-sa`: it disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.

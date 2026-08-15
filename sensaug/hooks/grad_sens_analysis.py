@@ -32,7 +32,7 @@ itself, so R was computed inside the sensitivity-analysis pipeline's val epoch a
 could only be emitted on an SA round. The two measure different things -- SA asks
 which perturbations the model is worst at, R asks which perturbations are
 redundant with each other -- so they now keep separate clocks and neither is
-reachable from the other. See sensaug/loops.py for the SA pipeline, which this
+reachable from the other. See sensaug/loops/sensaug_loop.py for the SA pipeline, which this
 module deliberately does not touch.
 
 Scope: R covers the differentiable ops only. Pruning based on R is future work --
@@ -446,13 +446,24 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
 
         checkpoint = training_progress(runner)
 
-        # Gather before rank 0 builds R: each rank probed a different shard.
+        # Gather before R is built: each rank probed a different shard.
         window = buffer
         if self.gather_ranks and get_world_size() > 1:
             window = merge_rank_buffers(all_gather_object(buffer), self.names)
 
-        if is_main_process():
-            self._emit(runner, checkpoint, window)
+        # EVERY rank builds R, not just rank 0. The gather above leaves all ranks
+        # holding identical input and _emit is deterministic (fixed bootstrap_seed,
+        # pure numpy), so they all arrive at the same redundancy score.
+        #
+        # That is load-bearing rather than tidy: RobustValLoop rebuilds each rank's
+        # OWN train dataloader from that rank's OWN pdf, so a score published on
+        # rank 0 alone left ranks 1..N-1 sampling an un-reweighted pdf. DDP averages
+        # all of their gradients into one update, so the reweighting reached only
+        # 1/world_size of it -- silently, since rank 0 is also the rank that logs.
+        #
+        # The rank-0 guards now sit on the side effects inside _emit (log files,
+        # TensorBoard) instead of on the computation that feeds training.
+        self._emit(runner, checkpoint, window)
 
         # Clear on EVERY rank (not just rank 0, or the other ranks' buffers grow
         # without bound), and only at an emission (so a window is one model state,
@@ -513,20 +524,26 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             "magnitude_mode": magnitude_info.get("mode"),
             "magnitudes": magnitude_info.get("per_op"),
         }
-        # Read-modify-write, so the file stays ONE json array across a run's
-        # checkpoints (and across a resume, matching the append-only gradient log
-        # -- see grad_hook.before_run). The array is at most one record per
-        # checkpoint, so rewriting it whole costs nothing.
-        records = []
-        if os.path.exists(self.corr_log_path):
-            with open(self.corr_log_path) as f:
-                records = json.load(f)
-        # The run's FIRST R, for the drift panel -- taken from the file rather than
-        # cached on self, so a --resume still diffs against the true first emission
-        # of the run instead of the first one after the restart.
-        first_r = _first_primary(records)
-        records.append(_jsonable(record))
-        _write_json_atomic(self.corr_log_path, records)
+        # Rank 0 owns the file. Every rank reaches here now, and a read-modify-write
+        # from world_size processes against one path interleaves and drops records.
+        # first_r stays None off rank 0: its only consumer is the TensorBoard drift
+        # panel, which is rank-0 only for the same reason.
+        first_r = None
+        if is_main_process():
+            # Read-modify-write, so the file stays ONE json array across a run's
+            # checkpoints (and across a resume, matching the append-only gradient
+            # log -- see grad_hook.before_run). The array is at most one record per
+            # checkpoint, so rewriting it whole costs nothing.
+            records = []
+            if os.path.exists(self.corr_log_path):
+                with open(self.corr_log_path) as f:
+                    records = json.load(f)
+            # The run's FIRST R, for the drift panel -- taken from the file rather
+            # than cached on self, so a --resume still diffs against the true first
+            # emission of the run instead of the first one after the restart.
+            first_r = _first_primary(records)
+            records.append(_jsonable(record))
+            _write_json_atomic(self.corr_log_path, records)
 
         n_survivors = n_cells = None
         cell_stats = None
@@ -546,25 +563,30 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         )
         if n_cells:
             summary += f" fdr_survivors={n_survivors}/{n_cells}"
-        print_log(summary, logger="current")
 
-        self._log_to_tensorboard(
-            runner,
-            step=int(runner.iter),
-            checkpoint=checkpoint,
-            d_grad=d_grad,
-            r_primary=r_primary,
-            r_raw=r_raw,
-            first_r=first_r,
-            loadings=loadings,
-            dropped_names=dropped_names,
-            n_images=n_images,
-            n_probes=n_probes,
-            n_survivors=n_survivors,
-            n_cells=n_cells,
-            cell_stats=cell_stats,
-            magnitude_info=magnitude_info,
-        )
+        # Reporting only. Every rank computed the same numbers, so letting all of
+        # them log would print world_size identical lines and write world_size sets
+        # of TensorBoard scalars under the same tags into the same event directory.
+        if is_main_process():
+            print_log(summary, logger="current")
+
+            self._log_to_tensorboard(
+                runner,
+                step=int(runner.iter),
+                checkpoint=checkpoint,
+                d_grad=d_grad,
+                r_primary=r_primary,
+                r_raw=r_raw,
+                first_r=first_r,
+                loadings=loadings,
+                dropped_names=dropped_names,
+                n_images=n_images,
+                n_probes=n_probes,
+                n_survivors=n_survivors,
+                n_cells=n_cells,
+                cell_stats=cell_stats,
+                magnitude_info=magnitude_info,
+            )
 
         if np.isfinite(max_loading) and max_loading > _LOADING_ALARM:
             print_log(
@@ -644,8 +666,12 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             "null_r": null,
             "cells": cells,
         }
-        with open(self.bootstrap_log_path, "a") as f:
-            f.write(json.dumps(_jsonable(record)) + "\n")
+        # The CIs above are computed on every rank -- `survives` gates the
+        # redundancy score, so every rank needs it -- but only rank 0 appends, or
+        # the file collects world_size copies of every record.
+        if is_main_process():
+            with open(self.bootstrap_log_path, "a") as f:
+                f.write(json.dumps(_jsonable(record)) + "\n")
 
         upper = np.triu_indices(keep.size, k=1)
         return (

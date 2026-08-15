@@ -16,7 +16,8 @@ every op, which is not commensurable across them: at 0.5, ``blur`` moves a pixel
 at most 78/255 while ``noise`` moves it by 251/255, so R correlated ops held at
 arbitrary relative strengths. The magnitude is now taken from the per-op
 distribution the SA loop publishes to ``runner.corr_magnitudes`` (see
-sensaug/corr_magnitudes.py for the modes, sensaug/loops.py for the publisher).
+sensaug/corr_magnitudes.py for the modes, sensaug/loops/sensaug_loop.py for the
+publisher).
 The snapshot is read ONCE per sweep, so one R is always one magnitude regime, and
 falls back to ``ref_magnitude`` whenever no snapshot exists -- before the first
 post-warmup SA round, and for the whole run when the SA loop is disabled. Every
@@ -33,7 +34,7 @@ redundancy with convergence drift. The sweep is also *cheaper*: the streaming pr
 re-probed the val shard ~10x over a run, where four sweeps cover it four times.
 
 The sweep runs from ``after_train_iter`` on its OWN iteration clock, deliberately
-independent of the sensitivity-analysis pipeline in sensaug/loops.py. It used to
+independent of the sensitivity-analysis pipeline in sensaug/loops/. It used to
 fire from ``after_val_epoch``, which under ``--aug-type=ours`` is called by
 RobustValLoop itself -- so the correlation measurement was nested inside the SA
 measurement, could only happen on an SA round, and did not exist at all for any

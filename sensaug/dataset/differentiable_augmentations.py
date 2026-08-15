@@ -55,7 +55,7 @@ V_DARKEN_FLOOR = 10.0 / 255.0
 # the two are numerically indistinguishable -- measured against the 67-tap
 # kernel, the difference is exactly zero for sigma <= 0.5 and 2.4e-7 (float32
 # round-off) at sigma = 1.0 -- but 67 taps cost 26x more per pixel, which is
-# what made the CPU per-image SA round-eval path (sensaug.loops.RobustValLoop
+# what made the CPU per-image SA round-eval path (sensaug.loops.sensaug_loop.RobustValLoop
 # -> the Diff* transforms in sensaug.dataset.augmentations) take hours per
 # round. Together with the separable convolution in `blur`, this is ~240x
 # faster per full-resolution image with no change to the numbers.
