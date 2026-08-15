@@ -88,8 +88,8 @@ def adaptive_sensitivity_analysis_new(
     # filters (as the old "diff" branch did) would sweep all 32.
     perturbation_list = resolve_perturbation_set(  # noqa: F405
         perturbation_set,
-        geometric_only=hasattr(cfg, "geometric_only"),
-        photometric_only=hasattr(cfg, "photometric_only"),
+        geometric_only=getattr(cfg, "geometric_only", False),
+        photometric_only=getattr(cfg, "photometric_only", False),
     ).items()
 
     verify_perturbation_effective(
