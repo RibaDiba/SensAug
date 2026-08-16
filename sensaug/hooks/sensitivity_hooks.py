@@ -81,8 +81,7 @@ class AugSegVisualizationHook(SegVisualizationHook):
                     (output.gt_sem_seg.shape[1], output.gt_sem_seg.shape[0]),
                     interpolation=cv2.INTER_LINEAR,
                 )
-                # img = [img, img_aug]
-                img = [img_aug, img_aug]
+                img = [img, img_aug]
                 window_name = f"{mode}_{os.path.basename(img_path)}"
 
                 self._visualizer.add_datasample(
