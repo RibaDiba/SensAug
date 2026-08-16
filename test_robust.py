@@ -17,7 +17,7 @@ from sensaug.dataset.augmentations import (
     FastRGBTransform,
     FastBlurTransform,
     FastNoiseTransform,
-    NEW_PERTURBATIONS,
+    LEGACY20_OPS,
     IMAGENETC_NAME_FN_DICT,
 )
 from sensaug.analysis import eval_results_to_csv

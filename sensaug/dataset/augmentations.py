@@ -25,18 +25,13 @@ from sensaug.dataset.utils.non_geometric_transforms import (
 )
 
 from sensaug.dataset.utils.cropping import *
-from sensaug.dataset.differentiable_augmentations import (
-    img_to_rgb01,
-    rgb01_to_img,
-)
 
-# The merged 32-op vocabulary, aliased to the old name: DIFF_PERTURBATIONS below
-# generates one registered pipeline transform per key, so this is what makes the
-# whole "diff" perturbation set -- and therefore --aug-type=grad_corr -- cover
-# the AutoAugment-family ops too.
+# The merged 32-op GPU vocabulary. Imported here only so NON_DIFF32_OPS can be
+# checked against it at import time -- the ops themselves are applied by
+# sensaug.dataset.gpu_augment, never through this module's pipeline transforms.
 from sensaug.dataset.differentiable_augmentations_aa import (
     GEOMETRIC_OP_KEYS,
-    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS as DIFF32_OPS,
 )
 from sensaug.dataset.parameters import COMBINATION_PARAMETERS
 from sensaug.dataset.imagenet_c import (
@@ -48,6 +43,32 @@ from sensaug.dataset.imagenet_c import (
     frost,
     fog,
 )
+
+#: Every valid `perturbation_set` value. See resolve_perturbation_set.
+PERTURBATION_SETS = ("legacy20", "non-diff32", "diff32")
+
+#: The one set whose ops are applied batched on GPU (sensaug.dataset.gpu_augment)
+#: rather than as pipeline transforms. Anything that builds a dataloader pipeline
+#: has to branch on this.
+GPU_PERTURBATION_SET = "diff32"
+
+
+def _reject_gpu_set(name: str, where: str) -> None:
+    """Fail loudly when a GPU-set name reaches a CPU pipeline transform.
+
+    Silence here is the specific failure this refactor removed: the GPU set and
+    the CPU 32-op set share all 32 keys, so a name-based lookup resolves either
+    one without complaint and the only symptom is a run that is quietly 40-150x
+    slower per image, or -- worse -- one arm augmenting differently from another.
+    """
+    if name == GPU_PERTURBATION_SET:
+        raise ValueError(
+            f"{where} was given perturbation_set={name!r}, which is applied "
+            "batched on GPU by sensaug.dataset.gpu_augment and has no pipeline "
+            "transform. This transform should not have been inserted at all; see "
+            "runner_utils' GPU dispatch."
+        )
+
 
 MAX_COLOR = 1.0
 MAX_BLUR = 49
@@ -893,15 +914,19 @@ class RandomAlphaTrainTransform(BaseTransform):
         self,
         geometric_only: bool = False,
         photometric_only: bool = False,
-        perturbation_set: str = "new",
+        perturbation_set: str = "legacy20",
     ):
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
-        # "new" -> NEW_PERTURBATIONS, "diff" -> the differentiable ops the gradient
-        # cross-correlation pipeline measures. A string rather than the dict itself
-        # because this goes through an mmengine Config, which cannot serialize
-        # classes. Validated eagerly so a bad value fails at build time, not on the
-        # first sampled image inside a dataloader worker.
+        # One of the CPU sets -- "legacy20" or "non-diff32". A string rather than
+        # the dict itself because this goes through an mmengine Config, which
+        # cannot serialize classes. Validated eagerly so a bad value fails at build
+        # time, not on the first sampled image inside a dataloader worker.
+        #
+        # Never "diff32": those ops are applied batched on GPU by
+        # sensaug.dataset.gpu_augment, and this transform is never inserted into
+        # the pipeline for that set. The guard below is what says so out loud.
+        _reject_gpu_set(perturbation_set, type(self).__name__)
         self.perturbation_set = perturbation_set
         resolve_perturbation_set(perturbation_set, geometric_only, photometric_only)
 
@@ -934,16 +959,18 @@ class RandomAlphaTrainTransform(BaseTransform):
 @TRANSFORMS.register_module()
 class RandomTrainTransformNew(BaseTransform):
     """
-    Randomly selects a perturbation from NEW PERTURBATIONS list.
-    Then, uses a beta distribution to mix the perturbed image with the original image.
+    Randomly selects a perturbation from one of the CPU registries, weighted by
+    the SA-derived pdf. Then, uses a beta distribution to mix the perturbed image
+    with the original image.
     """
 
-    def __init__(self, pdf_dict: dict, perturbation_set: str = "new"):
+    def __init__(self, pdf_dict: dict, perturbation_set: str = "legacy20"):
         self.pdf_dict: dict = pdf_dict
-        # Which registry the pdf's op names are drawn from -- "new" for
-        # NEW_PERTURBATIONS, "diff" for the differentiable ops. The two share no
-        # names, so a mismatch is a KeyError on the first augmented image rather
-        # than anything subtle. See resolve_perturbation_set.
+        # Which CPU registry the pdf's op names are drawn from. "legacy20" and
+        # "non-diff32" share no names, so a mismatch is a KeyError on the first
+        # augmented image rather than anything subtle. See
+        # resolve_perturbation_set; "diff32" never reaches here.
+        _reject_gpu_set(perturbation_set, type(self).__name__)
         self.perturbation_set = perturbation_set
         self._perturbations = resolve_perturbation_set(perturbation_set)
 
@@ -1504,7 +1531,7 @@ class Noise(BaseTransform):
         return f"{self.__class__.__name__}(sigma={self.sigma})"
 
 
-NEW_PERTURBATIONS_PHOTOMETRIC = {
+LEGACY20_OPS_PHOTOMETRIC = {
     "BrightnessTransform": (BrightnessTransform, True),
     "NegativeBrightnessTransform": (NegativeBrightnessTransform, True),
     "ColorTransform": (ColorTransform, True),
@@ -1517,7 +1544,7 @@ NEW_PERTURBATIONS_PHOTOMETRIC = {
     "SolarizeTransform": (SolarizeTransform, True),
 }
 
-NEW_PERTURBATIONS_GEOMETRIC = {
+LEGACY20_OPS_GEOMETRIC = {
     "ShearX": (ShearX, True),
     "ShearY": (ShearY, True),
     "NegativeShearX": (NegativeShearX, True),
@@ -1530,130 +1557,52 @@ NEW_PERTURBATIONS_GEOMETRIC = {
     "NegativeRotate": (NegativeRotate, True),
 }
 
-NEW_PERTURBATIONS = NEW_PERTURBATIONS_PHOTOMETRIC | NEW_PERTURBATIONS_GEOMETRIC
+LEGACY20_OPS = LEGACY20_OPS_PHOTOMETRIC | LEGACY20_OPS_GEOMETRIC
 
 
-# --- differentiable-op pipeline wrappers -------------------------------------
-#
-# The sensitivity analysis can only measure an augmentation that exists as a
-# registered pipeline transform: it works by inserting one into the val
-# dataloader and re-evaluating (loops.RobustValLoop.test_perturbed_new ->
-# runner_utils.apply_perturbations_dataloader). The ops in
-# sensaug.dataset.differentiable_augmentations are plain torch functions, so SA
-# structurally could not see them -- which is why the SA curve was keyed by an
-# entirely disjoint vocabulary (NEW_PERTURBATIONS above) from the one the
-# gradient probe differentiates, and `sa_curve["lighter_R"]` never existed.
-#
-# These wrappers close that gap. SA and the probe now score the SAME function,
-# not two implementations that share a name, and the SA levels land natively in
-# the probe's magnitude units ([0, 1]) with no rescaling -- unlike the legacy
-# PERTURBATIONS vocabulary, whose blur level is a kernel size in [0, 49] and
-# whose noise level is a sigma in [0, 50].
-
-
-class _DiffAugTransform(BaseTransform):
-    """Base for the generated per-op wrappers. Subclasses set ``OP_NAME``.
-
-    Takes ``magnitude`` (not ``delta``/``sigma``) so the constructor signature
-    matches NEW_PERTURBATIONS' classes -- that is what lets RandomTrainTransformNew
-    and the SA loop swap registries with a lookup change instead of a special case.
-
-    These ops do not change image shape, so ``ori_shape`` is deliberately left
-    alone (unlike Blur/Noise above, which rewrite it redundantly).
-    """
-
-    OP_NAME: str = ""
-
-    def __init__(self, magnitude: float):
-        self.magnitude = float(magnitude)
-        self.op = DIFFERENTIABLE_PERTURBATIONS[self.OP_NAME]
-
-    def transform(self, results: dict) -> dict:
-        # no_grad: inside a dataloader worker there is nothing to differentiate,
-        # and the graph would otherwise be built and discarded per sample.
-        with torch.no_grad():
-            perturbed = self.op(img_to_rgb01(results["img"]), self.magnitude)
-        results["img"] = rgb01_to_img(perturbed)
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(magnitude={self.magnitude})"
-
-
-def _make_diff_transform(name: str):
-    """Generate + register one wrapper class for `name`.
-
-    Generated rather than hand-written because 14 near-identical classes would
-    drift. The class is bound into module globals under its generated name so
-    pickle can find it: dataloader workers started with `spawn` (rather than
-    Linux's default `fork`) pickle the dataset, and a class unreachable by
-    qualified name would fail there and nowhere else.
-    """
-    cls_name = "Diff" + "".join(part.capitalize() for part in name.split("_"))
-    cls = type(
-        cls_name,
-        (_DiffAugTransform,),
-        {
-            "OP_NAME": name,
-            "__doc__": f"MMSeg pipeline wrapper for the differentiable `{name}` op.",
-        },
-    )
-    globals()[cls_name] = cls
-    return TRANSFORMS.register_module()(cls)
-
-
-# Mirrors NEW_PERTURBATIONS' {name: (transform_cls, bool)} shape. The trailing
-# flag is unused there too (every read site does `transform_cls, _ = ...`); it is
-# carried so the two registries are interchangeable at every lookup site.
-DIFF_PERTURBATIONS = {
-    name: (_make_diff_transform(name), True) for name in DIFFERENTIABLE_PERTURBATIONS
+# The 32 GPU ops, split the same way the CPU registries are. Values here are the
+# raw callables `(images, magnitude) -> images`, NOT the
+# `(transform_cls, bool)` pairs the two CPU registries carry -- these ops are
+# applied batched on GPU by sensaug.dataset.gpu_augment and never exist as
+# pipeline transforms. resolve_perturbation_set documents the consequence.
+DIFF32_OPS_GEOMETRIC = {
+    name: op for name, op in DIFF32_OPS.items() if name in GEOMETRIC_OP_KEYS
 }
-
-# Mirrors NEW_PERTURBATIONS' geometric/photometric split. Everything ported from
-# the reference repo is photometric; only the AutoAugment-family rotate/shear/
-# translate ops are geometric, so the split is keyed off that module's own
-# classification rather than re-derived here.
-DIFF_PERTURBATIONS_GEOMETRIC = {
-    name: value for name, value in DIFF_PERTURBATIONS.items() if name in GEOMETRIC_OP_KEYS
-}
-DIFF_PERTURBATIONS_PHOTOMETRIC = {
-    name: value
-    for name, value in DIFF_PERTURBATIONS.items()
-    if name not in GEOMETRIC_OP_KEYS
+DIFF32_OPS_PHOTOMETRIC = {
+    name: op for name, op in DIFF32_OPS.items() if name not in GEOMETRIC_OP_KEYS
 }
 
 
-# --- the aligned vocabulary ---------------------------------------------------
+# --- the non-differentiable 32-op vocabulary ----------------------------------
 #
-# The same 32 ops the gradient probe differentiates, but played through the plain
-# CPU transform classes above instead of the DIFF_PERTURBATIONS wrappers around
-# the torch ops.
+# The same 32 op NAMES the gradient probe differentiates, played through the plain
+# CPU transform classes above. The CPU counterpart of DIFF32_OPS.
 #
-# Why it exists: the correlation matrix R is indexed by DIFFERENTIABLE_PERTURBATIONS
-# names while the training pdf is indexed by whatever `perturbation_set` resolves
-# to, and those were disjoint -- "new" is 20 PascalCase names, R's axes are 32
-# snake_case ones, zero overlap. Anything that wants to act on R per-op (weighting
-# the training pdf by a redundancy score, say) needs one vocabulary on both sides.
-# Going through "diff" instead would satisfy that, but DIFFERENTIABLE_PERTURBATIONS
-# ops are GPU-batched-only by design and 40-150x slower applied per-image on CPU,
-# which is what the pipeline and the SA round-eval both do.
+# No --aug-type routes here any more: `ours`, `default` and `grad_corr` all train
+# and run SA on "diff32", so that every compared arm applies exactly the function
+# the probe measures. This set is kept because it is the reference the CPU/GPU
+# equivalence test compares against, and because it remains selectable for a
+# deliberate CPU run.
 #
 # The 1:1 name correspondence is not a coincidence to be re-derived: the
 # differentiable registries were written to mirror these classes (see
-# differentiable_augmentations.py's DIFFERENTIABLE_PERTURBATIONS comment and
+# differentiable_augmentations.py's registry comment and
 # differentiable_augmentations_aa.py's registry comment). The parity assertion
 # below is what keeps them from drifting.
 #
-# NOT the same magnitude scale as the differentiable op of the same name -- the
-# two registries agree on WHICH op each name denotes, never on what magnitude 0.5
-# of it means (blur is the starkest: cv2's kernel-size-derived implicit sigma here
-# vs. sigma directly there). A per-op score read off R transfers; a magnitude does
-# not.
+# NOT the same magnitude scale as the differentiable op of the same name. The two
+# registries agree on WHICH op each name denotes, never on what magnitude 0.5 of
+# it means. 24 of the 32 are calibrated; 8 are not -- `blur` (cv2's
+# kernel-size-derived implicit sigma 7.70 here vs sigma 1.00 there, at m=1.0),
+# `noise` (0.196 vs 1.00), and brightness/contrast/color +-, which differ in FORM
+# rather than scale (see the TODO(calibration) table in
+# differentiable_augmentations_aa.py). A per-op score read off R transfers between
+# the two; a magnitude does not.
 #
-# Posterize/Solarize are absent: they are in NEW_PERTURBATIONS but have no
+# Posterize/Solarize are absent: they are in LEGACY20_OPS but have no
 # differentiable counterpart, so R cannot see them, so they do not belong in the
 # vocabulary R is meant to govern.
-ALIGNED_PERTURBATIONS = {
+NON_DIFF32_OPS = {
     # base 14 -- Shu et al.'s RGB/HSV/blur/noise ops
     "lighter_R": (LighterR, True),
     "darker_R": (DarkerR, True),
@@ -1669,7 +1618,7 @@ ALIGNED_PERTURBATIONS = {
     "darker_V": (DarkerV, True),
     "blur": (Blur, True),
     "noise": (Noise, True),
-    # AutoAugment family -- these 18 ARE the NEW_PERTURBATIONS classes, reached
+    # AutoAugment family -- these 18 ARE the LEGACY20_OPS classes, reached
     # under their differentiable-registry names.
     "rotate_pos": (Rotate, True),
     "rotate_neg": (NegativeRotate, True),
@@ -1694,60 +1643,67 @@ ALIGNED_PERTURBATIONS = {
 # Index-compatibility with R's axes is the entire premise; an op added to one
 # registry and not the other would silently drop out of every per-op score
 # (missing name -> no redundancy signal) rather than fail. Fail at import instead.
-assert set(ALIGNED_PERTURBATIONS) == set(DIFFERENTIABLE_PERTURBATIONS), (
-    "ALIGNED_PERTURBATIONS and DIFFERENTIABLE_PERTURBATIONS have diverged: "
-    f"only in aligned={sorted(set(ALIGNED_PERTURBATIONS) - set(DIFFERENTIABLE_PERTURBATIONS))}, "
-    f"only in differentiable={sorted(set(DIFFERENTIABLE_PERTURBATIONS) - set(ALIGNED_PERTURBATIONS))}"
+assert set(NON_DIFF32_OPS) == set(DIFF32_OPS), (
+    "NON_DIFF32_OPS and DIFF32_OPS have diverged: "
+    f"only in non-diff32={sorted(set(NON_DIFF32_OPS) - set(DIFF32_OPS))}, "
+    f"only in diff32={sorted(set(DIFF32_OPS) - set(NON_DIFF32_OPS))}"
 )
 
-ALIGNED_PERTURBATIONS_GEOMETRIC = {
+NON_DIFF32_OPS_GEOMETRIC = {
     name: value
-    for name, value in ALIGNED_PERTURBATIONS.items()
+    for name, value in NON_DIFF32_OPS.items()
     if name in GEOMETRIC_OP_KEYS
 }
-ALIGNED_PERTURBATIONS_PHOTOMETRIC = {
+NON_DIFF32_OPS_PHOTOMETRIC = {
     name: value
-    for name, value in ALIGNED_PERTURBATIONS.items()
+    for name, value in NON_DIFF32_OPS.items()
     if name not in GEOMETRIC_OP_KEYS
 }
-
 
 def resolve_perturbation_set(
     name: str, geometric_only: bool = False, photometric_only: bool = False
 ) -> dict:
     """Select a perturbation registry by name, honouring the geometric/photometric
-    filters. Both registries share the {op_name: (transform_cls, bool)} shape, so
-    callers need only swap the lookup.
+    filters.
 
-    Called at runtime (not at import) because DIFF_PERTURBATIONS is defined below
-    the transforms that use it.
+    Three sets, differing on which op names are in play and how they are applied:
+
+    - ``"legacy20"``  -- 20 PascalCase names, CPU transform classes. The historical
+      set; keys ARE the registered mmseg type names.
+    - ``"non-diff32"`` -- the 32 R-indexed snake_case names, CPU transform classes.
+    - ``"diff32"``    -- the same 32 names as GPU-batched torch ops, applied by
+      sensaug.dataset.gpu_augment rather than by any pipeline transform.
+
+    VALUE SHAPES DIFFER. The two CPU sets map a name to ``(transform_cls, bool)``;
+    ``diff32`` maps a name to the raw callable ``(images, magnitude) -> images``.
+    Callers that only need the KEYS (the SA sweep, the pdf samplers) work against
+    all three. Callers that need a transform class are CPU-only by construction
+    and must never be handed ``diff32`` -- `_perturbation_transform_cfg` raises
+    rather than unpacking a callable into a class.
     """
-    if name == "new":
+    if name == "legacy20":
         if geometric_only:
-            return NEW_PERTURBATIONS_GEOMETRIC
+            return LEGACY20_OPS_GEOMETRIC
         if photometric_only:
-            return NEW_PERTURBATIONS_PHOTOMETRIC
-        return NEW_PERTURBATIONS
+            return LEGACY20_OPS_PHOTOMETRIC
+        return LEGACY20_OPS
 
-    if name == "diff":
-        # This used to raise on geometric_only, on the grounds that every
-        # differentiable op was photometric. That stopped being true when the
-        # AutoAugment-family rotate/shear/translate ops joined the vocabulary.
+    if name == "non-diff32":
         if geometric_only:
-            return DIFF_PERTURBATIONS_GEOMETRIC
+            return NON_DIFF32_OPS_GEOMETRIC
         if photometric_only:
-            return DIFF_PERTURBATIONS_PHOTOMETRIC
-        return DIFF_PERTURBATIONS
+            return NON_DIFF32_OPS_PHOTOMETRIC
+        return NON_DIFF32_OPS
 
-    if name == "aligned":
+    if name == GPU_PERTURBATION_SET:
         if geometric_only:
-            return ALIGNED_PERTURBATIONS_GEOMETRIC
+            return DIFF32_OPS_GEOMETRIC
         if photometric_only:
-            return ALIGNED_PERTURBATIONS_PHOTOMETRIC
-        return ALIGNED_PERTURBATIONS
+            return DIFF32_OPS_PHOTOMETRIC
+        return DIFF32_OPS
 
     raise ValueError(
-        f"unknown perturbation_set {name!r}, expected 'new', 'diff' or 'aligned'"
+        f"unknown perturbation_set {name!r}, expected one of {PERTURBATION_SETS}"
     )
 
 # @TRANSFORMS.register_module()

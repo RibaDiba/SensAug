@@ -10,21 +10,42 @@ from mmseg.registry import DATASETS
 
 # Local imports
 from sensaug.dataset.augmentations import *
+from sensaug.dataset.gpu_augment import (
+    clear_spec,
+    set_eval_spec,
+    set_train_spec,
+)
+
+
+def _is_gpu_set(perturbation_set) -> bool:
+    """Whether this set's ops are applied batched on GPU rather than by inserting
+    a transform into a dataloader pipeline.
+
+    Every `apply_*` below branches on this FIRST. The GPU set shares all 32 keys
+    with the CPU 32-op set, so anything reached by name alone would resolve to a
+    CPU transform and silently augment differently from what the probe measures.
+    """
+    return perturbation_set == GPU_PERTURBATION_SET  # noqa: F405
 
 
 def _perturbation_transform_cfg(p_type, value, perturbation_set: str = None):
     """Map a perturbation name + magnitude onto a registered transform cfg.
 
-    `perturbation_set` disambiguates. DIFF_PERTURBATIONS and ALIGNED_PERTURBATIONS
-    share all 32 keys and mean different classes under each -- `lighter_R` is the
-    per-image torch wrapper DiffLighterR in one and the plain cv2 LighterR in the
-    other. Dispatching on the name alone would silently resolve every aligned-set
-    sweep onto the diff wrappers, i.e. onto the 40-150x slower path the aligned
-    vocabulary exists to avoid, and nothing downstream would say so: the transform
-    names it inserts are real and _assert_transforms_present would pass.
-
+    `perturbation_set` disambiguates: "legacy20" and "non-diff32" are different
+    vocabularies, and a name found in one is not necessarily meant for the other.
     Left as None (every pre-existing caller) the old name-based order applies.
+
+    Never reached for the GPU set -- those ops have no pipeline transform at all,
+    and the callers below return before building a pipeline. The explicit raise is
+    a tripwire for a future caller that forgets to branch.
     """
+    if _is_gpu_set(perturbation_set):
+        raise ValueError(
+            f"perturbation_set={perturbation_set!r} has no pipeline transforms; "
+            "its ops are applied batched on GPU by sensaug.dataset.gpu_augment. "
+            "The caller should have taken the GPU branch instead of building a "
+            "perturbed pipeline."
+        )
     if p_type in IMAGENETC_NAME_FN_DICT.keys():  # noqa: F405
         return "ImageNetCTransform", dict(
             type="ImageNetCTransform", name=p_type, severity=value
@@ -36,15 +57,15 @@ def _perturbation_transform_cfg(p_type, value, perturbation_set: str = None):
         return transform_cls.__name__, dict(
             type=transform_cls.__name__, magnitude=value
         )
-    if p_type in NEW_PERTURBATIONS.keys():  # noqa: F405
+    if p_type in LEGACY20_OPS.keys():  # noqa: F405
         return p_type, dict(type=p_type, magnitude=value)
-    if p_type in DIFF_PERTURBATIONS.keys():  # noqa: F405
-        # Unlike NEW_PERTURBATIONS, the key is NOT the registered type name here
-        # (`lighter_R` -> `DiffLighterR`), so the class name has to be read off the
+    if p_type in NON_DIFF32_OPS.keys():  # noqa: F405
+        # Unlike LEGACY20_OPS, the key is NOT the registered type name here
+        # (`lighter_R` -> `LighterR`), so the class name has to be read off the
         # registry rather than reused. Returning the key would register a transform
         # that does not exist and trip _assert_transforms_present, which compares
         # against `t.__class__.__name__`.
-        transform_cls, _ = DIFF_PERTURBATIONS[p_type]  # noqa: F405
+        transform_cls, _ = NON_DIFF32_OPS[p_type]  # noqa: F405
         return transform_cls.__name__, dict(
             type=transform_cls.__name__, magnitude=value
         )
@@ -138,6 +159,26 @@ def verify_perturbation_effective(
     because the adaptive search can select magnitudes small enough to vanish under
     uint8 rounding, which would make a strict pixel-difference check flaky.
     """
+    if _is_gpu_set(perturbation_set):
+        # Nothing is inserted into a pipeline on this path, so the dataloader
+        # comparison below cannot say anything. Check the op itself instead: the
+        # equivalent failure is an op that silently returns its input.
+        op = resolve_perturbation_set(perturbation_set)[p_type]  # noqa: F405
+        probe = torch.rand(1, 3, 32, 32)
+        with torch.no_grad():
+            perturbed = op(probe, float(magnitude))
+        if perturbed.shape == probe.shape and torch.allclose(probe, perturbed):
+            raise RuntimeError(
+                f"Perturbation {p_type} at magnitude {magnitude} left its input "
+                f"unchanged. Sensitivity analysis would measure clean performance "
+                f"for this perturbation. Refusing to produce a meaningless SA curve."
+            )
+        print_log(
+            f"GPU perturbation verified: {p_type}@{magnitude} alters input data",
+            logger="current",
+        )
+        return
+
     clean_cfg = deepcopy(runner.cfg.val_dataloader)
     pert_cfg = deepcopy(runner.cfg.val_dataloader)
     _build_perturbed_pipeline(
@@ -176,7 +217,7 @@ def create_union_test_set_new(runner: Runner, perturb_levels: Dict = {}):
 
     # create one dataset for each perturbation type
     for p_type, level in perturb_levels.items():
-        transform_cls, is_parameterized = NEW_PERTURBATIONS[p_type]
+        transform_cls, is_parameterized = LEGACY20_OPS[p_type]
         transform = transform_cls(magnitude=level)
 
         # make dataset cfg
@@ -219,7 +260,7 @@ def create_union_train_set_new(runner: Runner, perturb_levels: Dict = {}):
 
     # create one dataset for each perturbation type
     for p_type, level in perturb_levels.items():
-        transform_cls, is_parameterized = NEW_PERTURBATIONS[p_type]  # noqa: F405
+        transform_cls, is_parameterized = LEGACY20_OPS[p_type]  # noqa: F405
         transform = transform_cls(magnitude=level)
 
         # make dataset cfg
@@ -260,7 +301,37 @@ def apply_perturbations_dataloader(
     `perturbation_set` names the vocabulary `perturb_levels`' keys are drawn from;
     see _perturbation_transform_cfg for why the names alone are not enough. Callers
     resetting to clean (`perturb_levels={}`) need not pass it -- nothing is resolved.
+
+    Under the GPU set no dataloader is rebuilt at all: the perturbation becomes
+    state on the model's data preprocessor. That is the whole point -- the SA
+    round-eval used to rebuild the val dataloader once per (op, level) pair, and
+    each rebuild dragged the per-image CPU path along with it.
     """
+    if _is_gpu_set(perturbation_set):
+        if not perturb_levels:
+            clear_spec(runner, training=train)
+            return
+        if train:
+            # No caller does this: the training policy is a distribution, set by
+            # apply_random_*_train_* below, not a single pinned perturbation. If
+            # one ever wants it, decide there whether the pdf jitter applies.
+            raise NotImplementedError(
+                "pinning a single perturbation on the TRAIN path is not supported "
+                "for the GPU set; use apply_random_alpha_training_augmentations or "
+                "apply_random_perturbations_train_dataloader_new"
+            )
+        if len(perturb_levels) != 1:
+            raise ValueError(
+                "the GPU eval path applies one op at a time; got "
+                f"{len(perturb_levels)} in perturb_levels={perturb_levels!r}"
+            )
+        ((op_name, magnitude),) = perturb_levels.items()
+        set_eval_spec(runner, op_name, magnitude)
+        print_log(
+            f"GPU eval perturbation: {op_name}@{float(magnitude):.4g}",
+            logger="current",
+        )
+        return
 
     if train:
         dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
@@ -292,8 +363,18 @@ def apply_perturbations_dataloader(
 
 
 def apply_random_perturbations_train_dataloader_new(
-    runner: Runner, pdf_dict: Dict, perturbation_set: str = "new"
+    runner: Runner, pdf_dict: Dict, perturbation_set: str = "legacy20"
 ):
+    if _is_gpu_set(perturbation_set):
+        # The pdf becomes preprocessor state; the dataloader is left alone. Note
+        # this is why the GPU set does not need the dataloader rebuilt on every SA
+        # round -- the pdf can change without touching the workers at all.
+        set_train_spec(runner, pdf_dict=pdf_dict)
+        print_log(
+            f"GPU train pdf updated ({len(pdf_dict)} entries)", logger="current"
+        )
+        return
+
     dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
 
     pipeline = [
@@ -333,8 +414,17 @@ def apply_random_alpha_training_augmentations(
     runner: Runner,
     geometric_only=False,
     photometric_only=False,
-    perturbation_set: str = "new",
+    perturbation_set: str = "legacy20",
 ):
+    if _is_gpu_set(perturbation_set):
+        set_train_spec(
+            runner,
+            geometric_only=geometric_only,
+            photometric_only=photometric_only,
+        )
+        print_log("GPU train policy set to uniform", logger="current")
+        return
+
     dataloader_cfg = deepcopy(runner.cfg.train_dataloader)
 
     pipeline = dataloader_cfg.dataset.pipeline
@@ -365,7 +455,7 @@ def apply_random_alpha_training_augmentations(
 
 
 def apply_random_perturbations_test_dataloader(
-    runner: Runner, pdf_dict: Dict, perturbation_set: str = "new"
+    runner: Runner, pdf_dict: Dict, perturbation_set: str = "legacy20"
 ):
     """Applies the random perturbation dataloader based on a given PDF dictionary.
     Specifically, applies 'RandomTrainTransform' from bp.robustness.augmentations to the current

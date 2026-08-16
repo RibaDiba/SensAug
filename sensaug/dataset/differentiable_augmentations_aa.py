@@ -2,7 +2,7 @@
 
 Companion to sensaug.dataset.differentiable_augmentations, which covers the 8
 atomic RGB/HSV/blur/noise ops. This module adds the 9 AutoAugment-family ops the
-legacy NEW_PERTURBATIONS vocabulary already exposes as CPU per-image mmseg
+legacy LEGACY20_OPS vocabulary already exposes as CPU per-image mmseg
 transforms -- 5 geometric (rotate, shear x/y, translate x/y) and 4 photometric
 (brightness, contrast, sharpness, color) -- as differentiable GPU-batched
 functions, so the gradient cross-correlation pipeline can measure
@@ -11,7 +11,7 @@ d loss / d magnitude for them the same way it does for the existing 14.
 Deliberately a SEPARATE module, not an extension of the sibling one: those ops
 are a port of azshue/adversarial_data_augmentation's diffaug.py and stay
 faithful to it. These are a different lineage (the AutoAugment op family, via
-this repo's own NEW_PERTURBATIONS classes) and are built on kornia's affine and
+this repo's own LEGACY20_OPS classes) and are built on kornia's affine and
 enhance primitives rather than hand-written math.
 
 Tensor contract (identical to the sibling module, carried over verbatim):
@@ -68,7 +68,7 @@ Tensor = torch.Tensor
 # --- magnitude calibration ---------------------------------------------------
 #
 # Every constant below is MIRRORED from the corresponding
-# sensaug.dataset.augmentations NEW_PERTURBATIONS class, so that a magnitude of
+# sensaug.dataset.augmentations LEGACY20_OPS class, so that a magnitude of
 # m in [0, 1] means the same visual amount of perturbation here as it does
 # there, and the new columns of the correlation matrix R sit on the same footing
 # as the existing ones. None of them are chosen freely.
@@ -172,7 +172,7 @@ __all__ = [
     "geometric_affine_matrix",
     "warp_image_and_label",
     "AUTOAUGMENT_DIFFERENTIABLE_PERTURBATIONS",
-    "ALL_DIFFERENTIABLE_PERTURBATIONS",
+    "DIFF32_OPS",
     "GEOMETRIC_OP_KEYS",
     "PHOTOMETRIC_OP_KEYS",
     "ROTATE_MAX_DEG",
@@ -481,7 +481,7 @@ def geometric_affine_matrix(
 #
 # Signed pairs, direction baked into the key and magnitude left unsigned --
 # mirroring both the sibling module's lighter_R/darker_R pattern and the
-# NEW_PERTURBATIONS Rotate/NegativeRotate pattern. Positive and negative are
+# LEGACY20_OPS Rotate/NegativeRotate pattern. Positive and negative are
 # separate augmentations rather than one signed axis because the paper treats
 # them as such, and because the legacy photometric classes give them different
 # scales, so they are genuinely not one another's mirror image.
@@ -558,11 +558,11 @@ assert GEOMETRIC_OP_KEYS | PHOTOMETRIC_OP_KEYS == set(
 # perturbation. The numbers will look plausible and large. warp_image_and_label
 # above is the piece that fixes this; wiring it into those two call sites is
 # deliberately not done here.
-ALL_DIFFERENTIABLE_PERTURBATIONS: Dict[str, object] = {
+DIFF32_OPS: Dict[str, object] = {
     **DIFFERENTIABLE_PERTURBATIONS,
     **AUTOAUGMENT_DIFFERENTIABLE_PERTURBATIONS,
 }
 
-assert len(ALL_DIFFERENTIABLE_PERTURBATIONS) == len(DIFFERENTIABLE_PERTURBATIONS) + len(
+assert len(DIFF32_OPS) == len(DIFFERENTIABLE_PERTURBATIONS) + len(
     AUTOAUGMENT_DIFFERENTIABLE_PERTURBATIONS
 ), "a new op name collides with one of the base module's -- the merge would shadow it"

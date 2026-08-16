@@ -128,7 +128,7 @@ def render_matrix(
     Args:
         r: (A, A) correlation matrix. NaN is a real value here (a dropped op), and
             is rendered as absent rather than as zero.
-        names: length-A op names, in the canonical DIFFERENTIABLE_PERTURBATIONS
+        names: length-A op names, in the canonical DIFF32_OPS
             order. Never reorder or cluster -- a moving axis would destroy the
             checkpoint-to-checkpoint comparability the whole figure exists for.
         mark: (A, A) bool. The only cells that get a printed number and a ring --

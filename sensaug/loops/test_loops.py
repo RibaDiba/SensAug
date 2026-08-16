@@ -25,7 +25,7 @@ from mmseg.registry import LOOPS
 import torch
 from torchmetrics.image.kid import KernelInceptionDistance
 
-# Local imports -- NEW_PERTURBATIONS and apply_perturbations_dataloader arrive
+# Local imports -- LEGACY20_OPS and apply_perturbations_dataloader arrive
 # through these, as they always have.
 from sensaug.sensitivity_analysis import *  # noqa: F401,F403
 from sensaug.runner_utils import *  # noqa: F401,F403
@@ -165,7 +165,7 @@ class DebugAugLoop(TestLoop):
         self.runner.call_hook("before_test_epoch")
         self.runner.model.eval()
 
-        perturbation_list = list(NEW_PERTURBATIONS.items())  # noqa: F405
+        perturbation_list = list(LEGACY20_OPS.items())  # noqa: F405
 
         magnitudes = [0.25, 0.50, 0.75, 1.0]
         sample = None

@@ -57,6 +57,7 @@ valid-pixel scale factor, so they are not fully independent draws.
 
 import os
 import json
+import contextlib
 from copy import deepcopy
 
 import numpy as np
@@ -69,11 +70,14 @@ from mmseg.registry import HOOKS
 from mmengine.hooks import Hook
 
 # Local imports
-# The merged 32-op vocabulary (the base module's 14 + the 18 AutoAugment-family
-# ops), aliased to the old name so every sweep site below is unchanged. See
-# ALL_DIFFERENTIABLE_PERTURBATIONS for the label caveat on the geometric ops.
+# The merged 32-op vocabulary: the base module's 14 plus the 18 AutoAugment-family
+# ops. `geometric_affine_matrix` / `warp_image_and_label` are the same pair
+# sensaug.dataset.gpu_augment uses to keep image and label together -- shared on
+# purpose, so the probe and the training pipeline cannot warp by different amounts.
 from sensaug.dataset.differentiable_augmentations_aa import (
-    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS,
+    geometric_affine_matrix,
+    warp_image_and_label,
 )
 from sensaug.corr_magnitudes import (
     MAGNITUDE_MODES,
@@ -131,6 +135,53 @@ class ProbeError(RuntimeError):
     Distinct from a transient failure (OOM, dataloader hiccup) so that the sweep
     can let it propagate instead of degrading it into a silently skipped batch.
     """
+
+
+def _gather_gt(data_samples, op_name: str) -> torch.Tensor:
+    """(B, 1, H, W) ground-truth label batch for a geometric op's label warp.
+
+    Raises rather than falling back to an unwarped label: an image warped without
+    its label yields a loss dominated by misalignment, and the resulting R column
+    looks like a real measurement. That silent version of this bug is exactly what
+    the warp exists to remove.
+    """
+    labels = []
+    for sample in data_samples:
+        gt = getattr(sample, "gt_sem_seg", None)
+        if gt is None:
+            raise ProbeError(
+                f"op {op_name!r} is geometric and needs to warp the label alongside "
+                "the image, but this batch carries no gt_sem_seg."
+            )
+        labels.append(gt.data)
+    shapes = {tuple(x.shape) for x in labels}
+    if len(shapes) != 1:
+        raise ProbeError(
+            f"op {op_name!r} needs a stackable label batch to warp; got mixed "
+            f"shapes {sorted(shapes)}."
+        )
+    return torch.stack(labels, dim=0)
+
+
+@contextlib.contextmanager
+def _swapped_gt(data_samples, labels):
+    """Temporarily install `labels` as the batch's ground truth.
+
+    Restored on the way out because `_probe_batch` reuses one `data_samples` list
+    across all 32 ops -- a geometric op that left its warped label behind would
+    corrupt every op measured after it.
+    """
+    if labels is None:
+        yield
+        return
+    originals = [sample.gt_sem_seg.data for sample in data_samples]
+    try:
+        for sample, label in zip(data_samples, labels):
+            sample.gt_sem_seg.data = label
+        yield
+    finally:
+        for sample, original in zip(data_samples, originals):
+            sample.gt_sem_seg.data = original
 
 
 @HOOKS.register_module()
@@ -276,7 +327,7 @@ class CollectGradientHook(Hook):
         # Shared buffer, stashed on the runner so the correlation hook can read
         # it. One entry per sweep batch per op, each a (B,) array -- batch
         # boundaries are load-bearing for the cluster bootstrap, so do NOT flatten.
-        self.grad_buffer = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
+        self.grad_buffer = {name: [] for name in DIFF32_OPS}
         runner.aug_grad_buffer = self.grad_buffer
 
         self._seed_snapshot = self._load_seed_snapshot()
@@ -380,7 +431,7 @@ class CollectGradientHook(Hook):
             source = "seeded_snapshot"
 
         n_batches = n_images = 0
-        swept_magnitudes = {name: [] for name in DIFFERENTIABLE_PERTURBATIONS}
+        swept_magnitudes = {name: [] for name in DIFF32_OPS}
         try:
             for data in self._probe_loader:
                 try:
@@ -499,7 +550,7 @@ class CollectGradientHook(Hook):
         if self.per_image_delta:
             magnitudes = resolve_magnitudes(
                 snapshot,
-                list(DIFFERENTIABLE_PERTURBATIONS),
+                list(DIFF32_OPS),
                 batch_size,
                 self.magnitude_mode,
                 self.ref_magnitude,
@@ -510,14 +561,14 @@ class CollectGradientHook(Hook):
             # cannot carry a per-image magnitude. Kept on the fixed reference.
             magnitudes = {
                 name: np.full(1, self.ref_magnitude, dtype=np.float64)
-                for name in DIFFERENTIABLE_PERTURBATIONS
+                for name in DIFF32_OPS
             }
 
         grads = {
             name: self._grad_for_op(
                 name, model, op, rgb01, mean, std, data_samples, magnitudes[name]
             )
-            for name, op in DIFFERENTIABLE_PERTURBATIONS.items()
+            for name, op in DIFF32_OPS.items()
         }
         return grads, magnitudes
 
@@ -530,6 +581,12 @@ class CollectGradientHook(Hook):
 
         `magnitude` is the (B,) array of probe magnitudes for this op, already
         resolved from the SA snapshot by the caller.
+
+        Geometric ops warp the LABEL alongside the image. Without that, rotating
+        an image while leaving its label map in place makes the loss report how far
+        the warp moved pixels -- a fact about geometry, not about the model -- and
+        every geometric column of R measures misalignment instead of sensitivity.
+        Photometric ops move no pixels, so their labels are correct as they are.
         """
         batch_size = rgb01.shape[0]
         if self.per_image_delta:
@@ -547,12 +604,25 @@ class CollectGradientHook(Hook):
                 requires_grad=True,
             )
 
-        perturbed01 = op(rgb01, delta)
+        matrix = geometric_affine_matrix(name, rgb01, delta)
+        if matrix is None:
+            perturbed01 = op(rgb01, delta)
+            warped_labels = None
+        else:
+            # warp_image_and_label reproduces the op's own image warp exactly (both
+            # are `warp_affine(images, matrix)`), so calling it INSTEAD of `op` --
+            # not in addition to it -- leaves the image path unchanged and the
+            # gradient intact, while carrying the label along.
+            perturbed01, warped_labels = warp_image_and_label(
+                rgb01, _gather_gt(data_samples, name), matrix
+            )
+
         # Re-normalize back into the model's expected (normalized) input space.
         perturbed = (perturbed01 * 255.0 - mean) / std
 
-        loss_dict = model.loss(perturbed, data_samples)
-        loss = sum(_sum_loss_value(v) for k, v in loss_dict.items() if "loss" in k)
+        with _swapped_gt(data_samples, warped_labels):
+            loss_dict = model.loss(perturbed, data_samples)
+            loss = sum(_sum_loss_value(v) for k, v in loss_dict.items() if "loss" in k)
 
         # allow_unused defaults to False, so an op that drops delta from the graph
         # entirely already raises here rather than returning None.

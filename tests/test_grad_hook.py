@@ -20,7 +20,7 @@ pytestmark = pytest.mark.requires_mmseg
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # The merged 32-op vocabulary -- what CollectGradientHook actually sweeps.
 from sensaug.dataset.differentiable_augmentations_aa import (
-    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS as DIFFERENTIABLE_PERTURBATIONS,
 )
 from sensaug.hooks import grad_hook
 from sensaug.hooks.grad_hook import CollectGradientHook, ProbeError

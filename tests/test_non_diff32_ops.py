@@ -1,11 +1,12 @@
-"""Tests for ALIGNED_PERTURBATIONS -- the 32 ops R is computed over, played
-through the plain CPU transform classes instead of the differentiable ones.
+"""Tests for NON_DIFF32_OPS -- the 32 ops R is computed over, played through the
+plain CPU transform classes instead of the differentiable ones.
 
-The point of this vocabulary is that a per-op score read off R (a redundancy
-weight, say) can index straight into the training pdf. That only works if the two
-registries agree on the key set forever, and if every key resolves to the CPU
-class rather than the 40-150x slower Diff* wrapper of the same name. Both are what
-these tests pin.
+No --aug-type routes here any more: ours/default/grad_corr all run on "diff32",
+the GPU-batched differentiable ops. This set is kept as the CPU reference the
+equivalence checks compare against, and it stays selectable for a deliberate CPU
+run. What these tests pin is that it keeps the same key set as DIFF32_OPS forever
+-- a key in one and not the other silently drops out of every per-op score rather
+than failing -- and that each key resolves to the CPU transform class.
 
 Requires the full mmseg/mmengine stack (augmentations.py imports the registries),
 so run these in the `sensaug` conda env on a compute node, not on a laptop.
@@ -24,17 +25,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mmseg.registry import TRANSFORMS
 
 from sensaug.dataset.augmentations import (
-    ALIGNED_PERTURBATIONS,
-    ALIGNED_PERTURBATIONS_GEOMETRIC,
-    DIFF_PERTURBATIONS,
+    NON_DIFF32_OPS,
+    NON_DIFF32_OPS_GEOMETRIC,
     HSVPerturbation,
-    NEW_PERTURBATIONS,
+    LEGACY20_OPS,
     RandomTrainTransformNew,
     perturb_hsv,
     resolve_perturbation_set,
 )
 from sensaug.dataset.differentiable_augmentations_aa import (
-    ALL_DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS,
     GEOMETRIC_OP_KEYS,
 )
 from sensaug.runner_utils import _perturbation_transform_cfg
@@ -58,35 +58,37 @@ def test_covers_exactly_the_ops_r_is_computed_over():
     registry and not the other does not raise -- it silently gets no redundancy
     signal and is left at weight 1 forever. The import-time assertion in
     augmentations.py is the real guard; this is its regression test."""
-    assert set(ALIGNED_PERTURBATIONS) == set(ALL_DIFFERENTIABLE_PERTURBATIONS)
-    assert len(ALIGNED_PERTURBATIONS) == 32
+    assert set(NON_DIFF32_OPS) == set(DIFF32_OPS)
+    assert len(NON_DIFF32_OPS) == 32
 
 
 def test_iteration_order_matches_the_matrix_axis_order():
     """PerturbationSensitivityAnalysisHookWithGradients builds R's axes from
     `list(DIFFERENTIABLE_PERTURBATIONS)`. Anything zipping a per-op score against
     this registry positionally rather than by name has to see the same order."""
-    assert list(ALIGNED_PERTURBATIONS) == list(ALL_DIFFERENTIABLE_PERTURBATIONS)
+    assert list(NON_DIFF32_OPS) == list(DIFF32_OPS)
 
 
 def test_mirrors_the_other_registries_dict_shape():
     """All three registries are read through `transform_cls, _ = REGISTRY[name]`,
     so they have to be interchangeable at every lookup site."""
-    for name, value in ALIGNED_PERTURBATIONS.items():
+    for name, value in NON_DIFF32_OPS.items():
         assert isinstance(value, tuple) and len(value) == 2, name
         transform_cls, flag = value
         assert isinstance(transform_cls, type), name
         assert isinstance(flag, bool), name
 
 
-def test_resolves_to_the_cpu_class_not_the_diff_wrapper():
-    """The reason this vocabulary exists. Same 32 keys as DIFF_PERTURBATIONS,
-    every one of them a different class -- the plain cv2/numpy transform rather
-    than the per-image torch wrapper."""
-    for name, (aligned_cls, _) in ALIGNED_PERTURBATIONS.items():
-        diff_cls, _ = DIFF_PERTURBATIONS[name]
-        assert aligned_cls is not diff_cls, name
-        assert not aligned_cls.__name__.startswith("Diff"), name
+def test_resolves_to_a_cpu_transform_class_not_a_gpu_op():
+    """The two 32-key sets differ in VALUE SHAPE, not just in value: this one maps
+    a name to a `(transform_cls, bool)` pair, DIFF32_OPS maps it to a raw callable
+    applied to a batch. Anything that unpacks one as the other is a bug, and
+    resolve_perturbation_set's docstring is the contract."""
+    for name, (cpu_cls, _) in NON_DIFF32_OPS.items():
+        gpu_op = DIFF32_OPS[name]
+        assert isinstance(cpu_cls, type), name
+        assert not isinstance(gpu_op, type), name
+        assert callable(gpu_op), name
 
 
 def test_the_eighteen_autoaugment_ops_are_the_new_perturbations_classes():
@@ -114,18 +116,18 @@ def test_the_eighteen_autoaugment_ops_are_the_new_perturbations_classes():
         "color_neg": "NegativeColorTransform",
     }
     for diff_name, new_name in shared.items():
-        assert ALIGNED_PERTURBATIONS[diff_name][0] is NEW_PERTURBATIONS[new_name][0], (
+        assert NON_DIFF32_OPS[diff_name][0] is LEGACY20_OPS[new_name][0], (
             diff_name
         )
 
 
 def test_posterize_and_solarize_are_deliberately_absent():
-    """They are in NEW_PERTURBATIONS but have no differentiable counterpart, so R
+    """They are in LEGACY20_OPS but have no differentiable counterpart, so R
     cannot see them. Including them would put ops in the sampled vocabulary that no
     per-op score can ever reach."""
-    present = {cls for cls, _ in ALIGNED_PERTURBATIONS.values()}
-    assert NEW_PERTURBATIONS["PosterizeTransform"][0] not in present
-    assert NEW_PERTURBATIONS["SolarizeTransform"][0] not in present
+    present = {cls for cls, _ in NON_DIFF32_OPS.values()}
+    assert LEGACY20_OPS["PosterizeTransform"][0] not in present
+    assert LEGACY20_OPS["SolarizeTransform"][0] not in present
 
 
 def test_every_class_is_registered_and_importable_by_name():
@@ -134,7 +136,7 @@ def test_every_class_is_registered_and_importable_by_name():
     the class findable by qualified name, not just through the registry dict."""
     import sensaug.dataset.augmentations as aug
 
-    for name, (transform_cls, _) in ALIGNED_PERTURBATIONS.items():
+    for name, (transform_cls, _) in NON_DIFF32_OPS.items():
         assert TRANSFORMS.get(transform_cls.__name__) is transform_cls, name
         assert getattr(aug, transform_cls.__name__, None) is transform_cls, name
 
@@ -159,7 +161,7 @@ def test_hsv_wrapper_equals_hsv_perturbation(name, channel, direction, bgr_image
     """The six wrappers add a magnitude-shaped constructor and nothing else. If
     they drifted from HSVPerturbation the legacy SA path and the aligned path would
     be measuring different augmentations under one name."""
-    transform_cls, _ = ALIGNED_PERTURBATIONS[name]
+    transform_cls, _ = NON_DIFF32_OPS[name]
 
     through_wrapper = transform_cls(magnitude=0.4)({"img": bgr_image.copy()})["img"]
     direct = HSVPerturbation(channel=channel, alpha=0.4, direction=direction)(
@@ -194,19 +196,19 @@ def test_hsv_ops_do_not_rewrite_ori_shape(bgr_image):
     deliberately does not, matching HSVPerturbation, whose behaviour the legacy
     non-"_new" SA path depends on."""
     results = {"img": bgr_image.copy(), "ori_shape": (99, 99)}
-    transform_cls, _ = ALIGNED_PERTURBATIONS["lighter_H"]
+    transform_cls, _ = NON_DIFF32_OPS["lighter_H"]
     assert transform_cls(magnitude=0.3)(results)["ori_shape"] == (99, 99)
 
 
 # --- every op behaves like a transform ----------------------------------------
 
 
-@pytest.mark.parametrize("name", sorted(ALIGNED_PERTURBATIONS))
+@pytest.mark.parametrize("name", sorted(NON_DIFF32_OPS))
 def test_constructs_from_a_magnitude_and_round_trips_an_image(name, bgr_image):
     """RandomTrainTransformNew and _perturbation_transform_cfg both build these as
     `cls(magnitude=level)`. An op taking any other signature would raise inside a
     dataloader worker, where the traceback is close to unreadable."""
-    transform_cls, _ = ALIGNED_PERTURBATIONS[name]
+    transform_cls, _ = NON_DIFF32_OPS[name]
 
     out = transform_cls(magnitude=0.4)({"img": bgr_image.copy()})["img"]
 
@@ -215,12 +217,12 @@ def test_constructs_from_a_magnitude_and_round_trips_an_image(name, bgr_image):
     assert np.isfinite(out).all(), name
 
 
-@pytest.mark.parametrize("name", sorted(ALIGNED_PERTURBATIONS))
+@pytest.mark.parametrize("name", sorted(NON_DIFF32_OPS))
 def test_full_magnitude_actually_changes_pixels(name, bgr_image):
     """Mirrors runner_utils.verify_perturbation_effective. An op that is a no-op at
     magnitude 1 contributes a constant row to D_grad, gets dropped by `correlate`,
     and leaves a NaN row in R -- silently, and only visible in the `dropped` list."""
-    transform_cls, _ = ALIGNED_PERTURBATIONS[name]
+    transform_cls, _ = NON_DIFF32_OPS[name]
 
     np.random.seed(0)  # `noise` draws a fresh sample per call
     out = transform_cls(magnitude=1.0)({"img": bgr_image.copy()})["img"]
@@ -228,14 +230,14 @@ def test_full_magnitude_actually_changes_pixels(name, bgr_image):
     assert not np.array_equal(out, bgr_image), f"{name} at magnitude 1.0 is a no-op"
 
 
-@pytest.mark.parametrize("name", sorted(ALIGNED_PERTURBATIONS_GEOMETRIC))
+@pytest.mark.parametrize("name", sorted(NON_DIFF32_OPS_GEOMETRIC))
 def test_geometric_ops_warp_the_label_with_the_image(name, bgr_image, seg_map):
     """The property that makes these safe to TRAIN on, and the one their
     differentiable counterparts lack: aa.py documents that neither _DiffAugTransform
     nor CollectGradientHook._grad_for_op moves gt_seg_map, so the diff geometrics'
     measured dL/dmagnitude is dominated by image-label misalignment. The CPU classes
     warp both, so training on them is not learning from a misregistered target."""
-    transform_cls, _ = ALIGNED_PERTURBATIONS[name]
+    transform_cls, _ = NON_DIFF32_OPS[name]
 
     results = transform_cls(magnitude=0.8)(
         {"img": bgr_image.copy(), "gt_seg_map": seg_map.copy()}
@@ -251,14 +253,12 @@ def test_geometric_ops_warp_the_label_with_the_image(name, bgr_image, seg_map):
 # --- perturbation set selection -----------------------------------------------
 
 
-def test_resolve_perturbation_set_selects_the_aligned_registry():
-    assert resolve_perturbation_set("aligned") is ALIGNED_PERTURBATIONS
+def test_resolve_perturbation_set_selects_the_non_diff32_registry():
+    assert resolve_perturbation_set("non-diff32") is NON_DIFF32_OPS
 
 
-def test_geometric_and_photometric_filters_partition_the_aligned_set():
-    """Unlike the old "diff" branch in adaptive_sensitivity_analysis_new, which
-    ignored these filters on the grounds that every differentiable op was
-    photometric, this set genuinely has both kinds. Silently returning all 32 under
+def test_geometric_and_photometric_filters_partition_the_non_diff32_set():
+    """This set has both kinds of op. Silently returning all 32 under
     --geometric-only would run a differently-scoped experiment than was asked for."""
     geometric = resolve_perturbation_set("aligned", geometric_only=True)
     photometric = resolve_perturbation_set("aligned", photometric_only=True)
@@ -267,7 +267,7 @@ def test_geometric_and_photometric_filters_partition_the_aligned_set():
     assert len(geometric) == 10
     assert len(photometric) == 22
     assert set(geometric).isdisjoint(photometric)
-    assert set(geometric) | set(photometric) == set(ALIGNED_PERTURBATIONS)
+    assert set(geometric) | set(photometric) == set(NON_DIFF32_OPS)
 
 
 def test_unknown_perturbation_set_still_raises():
@@ -278,15 +278,14 @@ def test_unknown_perturbation_set_still_raises():
 # --- cfg resolution is vocabulary-aware ---------------------------------------
 
 
-@pytest.mark.parametrize("name", sorted(ALIGNED_PERTURBATIONS))
-def test_cfg_resolution_honours_the_aligned_vocabulary(name):
-    """THE bug this parameter exists to prevent: "diff" and "aligned" share all 32
-    keys, so dispatching on the name alone sends every aligned sweep to the Diff*
-    wrappers -- the slow per-image path the vocabulary exists to avoid. It would not
-    fail: the names it inserts are real and _assert_transforms_present would pass."""
-    expected_cls, _ = ALIGNED_PERTURBATIONS[name]
+@pytest.mark.parametrize("name", sorted(NON_DIFF32_OPS))
+def test_cfg_resolution_honours_the_non_diff32_vocabulary(name):
+    """The key is not the registered type name here (`lighter_R` -> `LighterR`),
+    so the class name has to come off the registry. Returning the key would name a
+    transform that does not exist and trip _assert_transforms_present."""
+    expected_cls, _ = NON_DIFF32_OPS[name]
     transform_name, cfg = _perturbation_transform_cfg(
-        name, 0.25, perturbation_set="aligned"
+        name, 0.25, perturbation_set="non-diff32"
     )
 
     assert transform_name == expected_cls.__name__
@@ -294,19 +293,29 @@ def test_cfg_resolution_honours_the_aligned_vocabulary(name):
     assert TRANSFORMS.build(cfg).__class__.__name__ == transform_name
 
 
-@pytest.mark.parametrize("name", sorted(ALIGNED_PERTURBATIONS))
-def test_cfg_resolution_without_the_argument_is_unchanged(name):
-    """Every pre-existing caller passes nothing, and must keep getting the Diff*
-    wrapper it got before this parameter was added."""
-    expected_cls, _ = DIFF_PERTURBATIONS[name]
+@pytest.mark.parametrize("name", sorted(NON_DIFF32_OPS))
+def test_cfg_resolution_without_the_argument_falls_back_to_the_cpu_class(name):
+    """With the argument omitted the name-based fallback runs. The Diff* wrappers
+    it used to reach are gone, so a 32-key name now lands on the CPU class -- the
+    only pipeline transform that still exists under that name."""
+    expected_cls, _ = NON_DIFF32_OPS[name]
     assert _perturbation_transform_cfg(name, 0.25)[0] == expected_cls.__name__
 
 
-def test_new_vocabulary_names_are_unaffected_by_the_argument():
-    """NEW_PERTURBATIONS keys are the registered type names themselves, and no
-    aligned key collides with one, so passing perturbation_set must not perturb
+def test_gpu_set_has_no_pipeline_transform():
+    """The GPU set is applied batched after collation, so asking for a pipeline cfg
+    is a caller that forgot to branch. It raises rather than resolving onto the CPU
+    class of the same name, which would silently augment differently from what the
+    probe measures."""
+    with pytest.raises(ValueError, match="no pipeline transforms"):
+        _perturbation_transform_cfg("lighter_R", 0.25, perturbation_set="diff32")
+
+
+def test_legacy20_names_are_unaffected_by_the_argument():
+    """LEGACY20_OPS keys are the registered type names themselves, and no
+    32-op key collides with one, so passing perturbation_set must not perturb
     that path."""
-    for tag in (None, "new", "aligned", "diff"):
+    for tag in (None, "legacy20", "non-diff32"):
         assert _perturbation_transform_cfg(
             "BrightnessTransform", 0.25, perturbation_set=tag
         ) == ("BrightnessTransform", {"type": "BrightnessTransform", "magnitude": 0.25})
@@ -317,12 +326,12 @@ def test_new_vocabulary_names_are_unaffected_by_the_argument():
 # sensaug/redundancy.py is tested standalone in test_redundancy.py, on synthetic
 # input and with no mmseg. These are the few claims that need the actual sampler:
 # the pdf it produces has to be one RandomTrainTransformNew will accept and can
-# draw from over the aligned vocabulary.
+# draw from over the non-diff32 vocabulary.
 
 
 def _aligned_pdf(levels=(0.2, 0.5, 0.8)):
     """A generate_pdf_new-shaped pdf over the aligned vocabulary."""
-    names = list(ALIGNED_PERTURBATIONS)
+    names = list(NON_DIFF32_OPS)
     none_mass = 1.0 / (len(names) + 1)
     per_entry = (1.0 - none_mass) / (len(names) * len(levels))
     pdf = {(name, level): per_entry for name in names for level in levels}
@@ -340,15 +349,15 @@ def test_the_reweighted_pdf_is_accepted_by_the_real_sampler(lam):
     from sensaug.redundancy import compute_red, reweight
 
     rng = np.random.default_rng(0)
-    n = len(ALIGNED_PERTURBATIONS)
+    n = len(NON_DIFF32_OPS)
     r = rng.normal(0, 0.3, size=(n, n))
     r = (r + r.T) / 2
     np.fill_diagonal(r, 1.0)
-    red = compute_red(r, list(ALIGNED_PERTURBATIONS)).as_dict()
+    red = compute_red(r, list(NON_DIFF32_OPS)).as_dict()
 
     pdf = reweight(_aligned_pdf(), red, lam).pdf
 
-    transform = RandomTrainTransformNew(pdf_dict=pdf, perturbation_set="aligned")
+    transform = RandomTrainTransformNew(pdf_dict=pdf, perturbation_set="non-diff32")
     assert transform._probs.sum() == pytest.approx(1.0)
 
 
@@ -359,18 +368,18 @@ def test_the_sampler_draws_the_aligned_vocabulary_and_changes_pixels(bgr_image):
     from sensaug.redundancy import compute_red, reweight
 
     rng = np.random.default_rng(1)
-    n = len(ALIGNED_PERTURBATIONS)
+    n = len(NON_DIFF32_OPS)
     r = rng.normal(0, 0.3, size=(n, n))
     r = (r + r.T) / 2
     np.fill_diagonal(r, 1.0)
-    red = compute_red(r, list(ALIGNED_PERTURBATIONS)).as_dict()
+    red = compute_red(r, list(NON_DIFF32_OPS)).as_dict()
 
     pdf = reweight(_aligned_pdf(levels=(0.9,)), red, 0.5).pdf
     pdf.pop(("none", 0))  # force an augmentation every draw
     total = sum(pdf.values())
     pdf = {k: v / total for k, v in pdf.items()}
 
-    transform = RandomTrainTransformNew(pdf_dict=pdf, perturbation_set="aligned")
+    transform = RandomTrainTransformNew(pdf_dict=pdf, perturbation_set="non-diff32")
 
     np.random.seed(0)
     changed = 0

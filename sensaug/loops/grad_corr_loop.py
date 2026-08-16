@@ -55,7 +55,7 @@ class GradCorrValLoop(RobustValLoop):
         geometric_only: bool = False,
         photometric_only: bool = False,
         weighted_augs: bool = False,
-        perturbation_set: str = "new",
+        perturbation_set: str = "legacy20",
         corr_lambda: float = 0.0,
         corr_lambda_ramp: str = "linear",
         fp16: bool = False,

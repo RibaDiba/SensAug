@@ -427,7 +427,7 @@ def test_warp_image_and_label_preserves_label_rank(batch):
 # --- magnitude sanity check: RENDERS, DOES NOT ASSERT ------------------------
 #
 # Phase 4 is not finished and this test does not pretend otherwise. Comparing
-# the new ops to the legacy NEW_PERTURBATIONS classes programmatically would
+# the new ops to the legacy LEGACY20_OPS classes programmatically would
 # just encode whatever mismatch exists today as the expected answer -- and three
 # of the photometric ops are known to differ in FORM, not only in scale (kornia's
 # additive brightness vs torchvision's multiplicative, kornia's pure-multiply

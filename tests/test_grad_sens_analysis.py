@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # of R. Fixtures here are keyed by op name, so they must cover the same set the
 # hook iterates or stack_probe_buffer raises KeyError on the missing ones.
 from sensaug.dataset.differentiable_augmentations_aa import (
-    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS,
 )
 
 from sensaug.hooks.grad_sens_analysis import (
@@ -38,7 +38,7 @@ from sensaug.hooks.grad_sens_analysis import (
     stack_probe_buffer,
 )
 
-NAMES = list(DIFFERENTIABLE_PERTURBATIONS)
+NAMES = list(DIFF32_OPS)
 N_OPS = len(NAMES)
 
 

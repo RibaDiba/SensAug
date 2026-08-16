@@ -21,11 +21,26 @@ import torch
 
 import sensaug.dataset.datasets as datasets  # noqa:F401
 from sensaug.dataset.augmentations import *  # noqa:F403
+from sensaug.dataset.gpu_augment import (  # noqa:F401
+    GpuAugSegDataPreProcessor,
+    set_train_spec,
+)
 from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
 from sensaug.hooks import *  # noqa:F403
 from sensaug.loops import *  # noqa:F403
 from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
+
+#: The arms that draw from the 32-op bank. All of them run on the GPU set, so
+#: they differ only in how they pick and weight from it -- which is the whole
+#: point of comparing them. "random" is deliberately not here: it is not a
+#: compared arm and stays on the historical 20-op CPU vocabulary.
+GPU_AUG_TYPES = ("ours", "default", "grad_corr")
+
+
+def uses_gpu_augmentation(aug_type: str) -> bool:
+    return aug_type in GPU_AUG_TYPES
+
 
 def dist_print(*args, **kwargs):
     if is_main_process():
@@ -306,33 +321,30 @@ def build_config(args):
         elif augmentation_type == "trivialaugment":
             pipeline.append(dict(type="TrivialAugmentWideTransform"))
         elif augmentation_type in ("random", "ours", "grad_corr", "default"):
-            pipeline.append(
-                dict(
-                    type="RandomAlphaTrainTransform",
-                    geometric_only=args.geometric_only,
-                    photometric_only=args.photometric_only,
-                    # grad_corr/ours/default all train on "aligned": the same 32 ops
-                    # R is computed over, played through the plain CPU transform
-                    # classes. That is what lets a per-op score read off R index
-                    # straight into the training pdf -- "new" is 20 PascalCase names
-                    # against R's 32 snake_case ones, and they overlap on nothing.
-                    # Keeping all three of these arms on the same vocabulary is also
-                    # what makes them comparable to each other in the first place --
-                    # they're meant to differ in how they pick/weight from the set,
-                    # not in which ops are available. "random" is left on "new" on
-                    # purpose: it isn't one of the compared arms.
-                    #
-                    # NOT "diff", which has the right names but the wrong
-                    # implementation: those ops are GPU-batched-only by design (see
-                    # differentiable_augmentations.py) and 40-150x slower applied
-                    # per-image on CPU, which is what this pipeline does.
-                    perturbation_set=(
-                        "aligned"
-                        if augmentation_type in ("grad_corr", "ours", "default")
-                        else "new"
-                    ),
+            # grad_corr/ours/default all train on "diff32": the differentiable ops
+            # themselves, applied batched on GPU after collation. That makes the
+            # function training applies identical to the one the gradient probe
+            # differentiates, so a per-op score read off R indexes straight into
+            # the training pdf and the magnitudes mean the same thing on both
+            # sides. Keeping all three arms on one set is also what makes them
+            # comparable -- they're meant to differ in how they pick and weight
+            # from the bank, not in which ops exist or what a magnitude buys.
+            #
+            # "random" stays on "legacy20" on purpose: it isn't a compared arm.
+            #
+            # The GPU set has no pipeline transform at all -- see
+            # sensaug/dataset/gpu_augment.py -- so nothing is appended for it here.
+            # The training policy is installed on the data preprocessor instead,
+            # by the SA loop via runner_utils' GPU dispatch.
+            if augmentation_type == "random":
+                pipeline.append(
+                    dict(
+                        type="RandomAlphaTrainTransform",
+                        geometric_only=args.geometric_only,
+                        photometric_only=args.photometric_only,
+                        perturbation_set="legacy20",
+                    )
                 )
-            )
         elif augmentation_type == "idbh":
             pipeline.append(dict(type="IDBHTransform", version="cifar10-weak"))
         elif augmentation_type == "vip":
@@ -419,14 +431,12 @@ def build_config(args):
         cfg.val_cfg.type = (
             "GradCorrValLoop" if args.aug_type == "grad_corr" else "RobustValLoop"
         )
-        # "aligned", not "diff": same 32 op names either way, but the CPU classes
-        # rather than the per-image torch wrappers. The SA round-eval inserts these
-        # into the val dataloader once per (op, level) pair, and on the diff
-        # vocabulary that was the dominant cost of a grad_corr run. ours also trains
-        # on "aligned" now (see the pipeline-construction block above), so its SA
-        # phase must probe the same vocabulary its uniform warmup phase used.
+        # "diff32": the SA round-eval probes exactly the ops training applies and
+        # the probe differentiates. On the GPU set the round-eval sets preprocessor
+        # state instead of rebuilding the val dataloader once per (op, level) pair,
+        # which is what made this phase the dominant cost of a grad_corr run.
         cfg.val_cfg.perturbation_set = (
-            "aligned" if args.aug_type in ("grad_corr", "ours") else "new"
+            "diff32" if args.aug_type in ("grad_corr", "ours") else "legacy20"
         )
         cfg.val_cfg.ratio = eval_ratio
         cfg.val_cfg.sa_curve_path = "sensaug/testing/test_levels_voc.json"
@@ -510,6 +520,14 @@ def build_config(args):
     cfg.geometric_only = args.geometric_only
     cfg.photometric_only = args.photometric_only
 
+    # The GPU set has no pipeline transform: its ops are applied batched, after
+    # collation, by a SegDataPreProcessor subclass. Swapping the type here covers
+    # every backbone at once -- each one declares its own data_preprocessor in
+    # sensaug/custom_configs/mmseg/_base_/models/, and they differ only in
+    # mean/std, which is carried through untouched.
+    if uses_gpu_augmentation(args.aug_type):
+        cfg.model.data_preprocessor.type = "GpuAugSegDataPreProcessor"
+
     cfg.randomness = dict(seed=0, diff_rank_seed=False)
 
     # Let's have a look at the final config used for training
@@ -531,6 +549,23 @@ def train(args):
     set_manual_seed(0)  # set seed
     runner.val_loop  # initialize val loop
     runner.test_loop
+
+    # Install the initial uniform training policy for the GPU arms.
+    #
+    # This is what RandomAlphaTrainTransform used to do by sitting in the pipeline
+    # from iteration 0: training augments uniformly over the bank until the SA loop
+    # has enough rounds to publish a pdf, at which point RobustValLoop replaces
+    # this policy with that pdf. Doing it here rather than in the loop matters for
+    # two reasons -- `default` builds no SA loop at all and would otherwise train
+    # completely unaugmented, and `ours`/`grad_corr` would train clean through
+    # their warmup rounds instead of uniformly augmented.
+    if uses_gpu_augmentation(args.aug_type):
+        set_train_spec(
+            runner,
+            geometric_only=args.geometric_only,
+            photometric_only=args.photometric_only,
+        )
+
     runner.train()
 
 

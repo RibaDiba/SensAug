@@ -59,7 +59,7 @@ from mmengine.hooks import Hook
 # The merged 32-op vocabulary -- these are the axes of R. Aliased to the old
 # name so nothing else in this module changes.
 from sensaug.dataset.differentiable_augmentations_aa import (
-    ALL_DIFFERENTIABLE_PERTURBATIONS as DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS,
 )
 from sensaug.hooks.grad_hook import fires_at, training_progress
 from sensaug.redundancy import MODES, compute_red, summarise
@@ -427,7 +427,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         self.corr_log_path = None
         self.bootstrap_log_path = None
         self.redundancy_log_path = None
-        self.names = list(DIFFERENTIABLE_PERTURBATIONS)
+        self.names = list(DIFF32_OPS)
 
     def after_train_iter(
         self, runner: Runner, batch_idx: int, data_batch=None, outputs=None

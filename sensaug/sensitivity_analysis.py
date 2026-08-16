@@ -22,7 +22,7 @@ from scipy.interpolate import PchipInterpolator
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
-from sensaug.dataset.augmentations import *  # PERTURBATIONS, NEW_PERTURBATIONS, GEOMETRIC_TRANSFORMS
+from sensaug.dataset.augmentations import *  # PERTURBATIONS, LEGACY20_OPS, GEOMETRIC_TRANSFORMS
 from sensaug.runner_utils import (
     apply_perturbations_dataloader,
     verify_perturbation_effective,
@@ -45,31 +45,8 @@ MASKS = "gtFine/val"
 BASE_DATASET = "leftImg8bit/val"
 
 
-def adaptive_sensitivity_analysis_diff(cfg, runner, num_levels, tolerance):
-    """SA over the DIFFERENTIABLE ops -- the vocabulary the gradient
-    cross-correlation pipeline measures.
-
-    Exists so the SA curve and the matrix R are keyed by the same augmentations.
-    They previously were not: SA ran over NEW_PERTURBATIONS (Brightness/Color/
-    Shear/...) while the probe differentiated DIFFERENTIABLE_PERTURBATIONS
-    (lighter_R/blur/noise/...), two vocabularies with ZERO overlap, so no SA
-    magnitude could ever be looked up for an op R covered.
-
-    Deliberately reuses the "_new" adaptive machinery rather than the legacy
-    `adaptive_sensitivity_analysis`, even though that one iterates the same 14
-    names: the legacy path's levels are in raw units (blur = kernel size in
-    [0, 49], noise = sigma in [0, 50]) which would each need rescaling into the
-    probe's [0, 1], and it hard-requires metrics["kid"]. Here min/max level are
-    already 0.0/1.0 -- the probe's own magnitude units -- and calculate_miou_kid_new
-    tolerates a missing KID.
-    """
-    return adaptive_sensitivity_analysis_new(
-        cfg, runner, num_levels, tolerance, perturbation_set="diff"
-    )
-
-
 def adaptive_sensitivity_analysis_new(
-    cfg, runner, num_levels, tolerance, perturbation_set="new"
+    cfg, runner, num_levels, tolerance, perturbation_set="legacy20"
 ):
     predictor = pchip_interpolator
     perturbation_levels: Dict[str, List[float]] = {}
@@ -83,9 +60,9 @@ def adaptive_sensitivity_analysis_new(
 
     # resolve_perturbation_set is the single dispatch point for all three
     # vocabularies and already applies the geometric/photometric filters, so the
-    # per-set branching that used to live here is gone. It matters for "aligned"
-    # specifically: that set has both kinds of op, so silently ignoring the
-    # filters (as the old "diff" branch did) would sweep all 32.
+    # per-set branching that used to live here is gone. Only the KEYS are used
+    # below, which is what lets this work against all three despite "diff32"
+    # mapping its names to raw callables rather than to transform classes.
     perturbation_list = resolve_perturbation_set(  # noqa: F405
         perturbation_set,
         geometric_only=getattr(cfg, "geometric_only", False),

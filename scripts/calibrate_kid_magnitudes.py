@@ -45,7 +45,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchmetrics.image.kid import KernelInceptionDistance
 
 from sensaug.dataset.differentiable_augmentations_aa import (
-    ALL_DIFFERENTIABLE_PERTURBATIONS,
+    DIFF32_OPS,
 )
 
 IMG_EXTENSIONS = {"png", "jpg"}
@@ -134,10 +134,10 @@ def parse_args():
 
 def parse_op_at_magnitude(spec):
     op, _, magnitude_str = spec.partition("@")
-    if op not in ALL_DIFFERENTIABLE_PERTURBATIONS:
+    if op not in DIFF32_OPS:
         raise ValueError(
             f"unknown op {op!r} in --target-kid-from; choose from "
-            f"{sorted(ALL_DIFFERENTIABLE_PERTURBATIONS)}"
+            f"{sorted(DIFF32_OPS)}"
         )
     return op, float(magnitude_str)
 
@@ -148,7 +148,7 @@ def kid_at(kid_metric, dataloader, op_name, magnitude, device):
     (reset_real_features=False), the same accumulate/reset/compute pattern
     sensaug/metrics/kid.py::KID.compute uses.
     """
-    op = ALL_DIFFERENTIABLE_PERTURBATIONS[op_name]
+    op = DIFF32_OPS[op_name]
     kid_metric.reset()
     with torch.no_grad():
         for batch in dataloader:
@@ -213,11 +213,11 @@ def main():
         for batch in dataloader:
             kid_metric.update(batch.to(device).permute(0, 3, 1, 2), real=True)
 
-    ops = args.ops if args.ops else sorted(ALL_DIFFERENTIABLE_PERTURBATIONS)
-    unknown = [op for op in ops if op not in ALL_DIFFERENTIABLE_PERTURBATIONS]
+    ops = args.ops if args.ops else sorted(DIFF32_OPS)
+    unknown = [op for op in ops if op not in DIFF32_OPS]
     if unknown:
         raise ValueError(
-            f"unknown ops {unknown}; choose from {sorted(ALL_DIFFERENTIABLE_PERTURBATIONS)}"
+            f"unknown ops {unknown}; choose from {sorted(DIFF32_OPS)}"
         )
 
     if args.target_kid is not None:
