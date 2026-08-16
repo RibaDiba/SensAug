@@ -25,6 +25,14 @@ from sensaug.dataset.utils.non_geometric_transforms import (
 )
 
 from sensaug.dataset.utils.cropping import *
+
+# The merged 32-op GPU vocabulary. Imported here only so NON_DIFF32_OPS can be
+# checked against it at import time -- the ops themselves are applied by
+# sensaug.dataset.gpu_augment, never through this module's pipeline transforms.
+from sensaug.dataset.differentiable_augmentations_aa import (
+    GEOMETRIC_OP_KEYS,
+    DIFF32_OPS as DIFF32_OPS,
+)
 from sensaug.dataset.parameters import COMBINATION_PARAMETERS
 from sensaug.dataset.imagenet_c import (
     motion_blur,
@@ -35,6 +43,32 @@ from sensaug.dataset.imagenet_c import (
     frost,
     fog,
 )
+
+#: Every valid `perturbation_set` value. See resolve_perturbation_set.
+PERTURBATION_SETS = ("legacy20", "non-diff32", "diff32")
+
+#: The one set whose ops are applied batched on GPU (sensaug.dataset.gpu_augment)
+#: rather than as pipeline transforms. Anything that builds a dataloader pipeline
+#: has to branch on this.
+GPU_PERTURBATION_SET = "diff32"
+
+
+def _reject_gpu_set(name: str, where: str) -> None:
+    """Fail loudly when a GPU-set name reaches a CPU pipeline transform.
+
+    Silence here is the specific failure this refactor removed: the GPU set and
+    the CPU 32-op set share all 32 keys, so a name-based lookup resolves either
+    one without complaint and the only symptom is a run that is quietly 40-150x
+    slower per image, or -- worse -- one arm augmenting differently from another.
+    """
+    if name == GPU_PERTURBATION_SET:
+        raise ValueError(
+            f"{where} was given perturbation_set={name!r}, which is applied "
+            "batched on GPU by sensaug.dataset.gpu_augment and has no pipeline "
+            "transform. This transform should not have been inserted at all; see "
+            "runner_utils' GPU dispatch."
+        )
+
 
 MAX_COLOR = 1.0
 MAX_BLUR = 49
@@ -876,9 +910,25 @@ class RandomAlphaTrainTransform(BaseTransform):
     Randomly chooses both augmentation class (uniform) and augmentation intensity (uniform).
     """
 
-    def __init__(self, geometric_only: bool = False, photometric_only: bool = False):
+    def __init__(
+        self,
+        geometric_only: bool = False,
+        photometric_only: bool = False,
+        perturbation_set: str = "legacy20",
+    ):
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
+        # One of the CPU sets -- "legacy20" or "non-diff32". A string rather than
+        # the dict itself because this goes through an mmengine Config, which
+        # cannot serialize classes. Validated eagerly so a bad value fails at build
+        # time, not on the first sampled image inside a dataloader worker.
+        #
+        # Never "diff32": those ops are applied batched on GPU by
+        # sensaug.dataset.gpu_augment, and this transform is never inserted into
+        # the pipeline for that set. The guard below is what says so out loud.
+        _reject_gpu_set(perturbation_set, type(self).__name__)
+        self.perturbation_set = perturbation_set
+        resolve_perturbation_set(perturbation_set, geometric_only, photometric_only)
 
     def transform(self, results: dict) -> dict:
         results["img"] = np.ascontiguousarray(results["img"].copy())
@@ -888,16 +938,10 @@ class RandomAlphaTrainTransform(BaseTransform):
 
         num_transforms = 1
 
-        perturbation_list = (
-            NEW_PERTURBATIONS_GEOMETRIC
-            if self.geometric_only
-            else (
-                NEW_PERTURBATIONS_PHOTOMETRIC
-                if self.photometric_only
-                else NEW_PERTURBATIONS
-            )
+        perturbations = resolve_perturbation_set(
+            self.perturbation_set, self.geometric_only, self.photometric_only
         )
-        perturbation_list = list(perturbation_list.keys()) + ["none"]
+        perturbation_list = list(perturbations.keys()) + ["none"]
 
         for _ in range(num_transforms):
             # sample perturbation
@@ -905,7 +949,7 @@ class RandomAlphaTrainTransform(BaseTransform):
             perturbation_level = np.random.uniform(low=0, high=1, size=None)
 
             if perturbation_type != "none":
-                transform_cls, _ = NEW_PERTURBATIONS[perturbation_type]
+                transform_cls, _ = perturbations[perturbation_type]
                 transform = transform_cls(magnitude=perturbation_level)
                 results = transform(results)
 
@@ -915,21 +959,42 @@ class RandomAlphaTrainTransform(BaseTransform):
 @TRANSFORMS.register_module()
 class RandomTrainTransformNew(BaseTransform):
     """
-    Randomly selects a perturbation from NEW PERTURBATIONS list.
-    Then, uses a beta distribution to mix the perturbed image with the original image.
+    Randomly selects a perturbation from one of the CPU registries, weighted by
+    the SA-derived pdf. Then, uses a beta distribution to mix the perturbed image
+    with the original image.
     """
 
-    def __init__(self, pdf_dict: dict):
+    def __init__(self, pdf_dict: dict, perturbation_set: str = "legacy20"):
         self.pdf_dict: dict = pdf_dict
+        # Which CPU registry the pdf's op names are drawn from. "legacy20" and
+        # "non-diff32" share no names, so a mismatch is a KeyError on the first
+        # augmented image rather than anything subtle. See
+        # resolve_perturbation_set; "diff32" never reaches here.
+        _reject_gpu_set(perturbation_set, type(self).__name__)
+        self.perturbation_set = perturbation_set
+        self._perturbations = resolve_perturbation_set(perturbation_set)
+
+        # keys are (perturbation, level) pairs, so they cannot be passed to
+        # np.random.choice directly -- it only accepts 1-D populations. Sample an
+        # index into the key list instead.
+        self._keys = list(pdf_dict.keys())
+        self._probs = np.asarray(list(pdf_dict.values()), dtype=np.float64)
+
+        total = self._probs.sum()
+        if not np.isclose(total, 1.0, atol=1e-6):
+            raise ValueError(
+                f"RandomTrainTransformNew pdf_dict probabilities sum to {total}, not 1.0"
+            )
+        self._probs /= total
 
     def transform(self, results: dict) -> dict:
         num_transforms = 1
 
         for _ in range(num_transforms):
             # sample perturbation
-            perturbation, level = np.random.choice(
-                list(self.pdf_dict.keys()), size=None, p=list(self.pdf_dict.values())
-            )
+            perturbation, level = self._keys[
+                np.random.choice(len(self._keys), size=None, p=self._probs)
+            ]
 
             if perturbation != "none":
                 # generate some gaussian noise for level
@@ -937,7 +1002,7 @@ class RandomTrainTransformNew(BaseTransform):
                     level + np.random.normal(0, scale=0.1), a_min=0, a_max=1
                 )
 
-                transform_cls, _ = NEW_PERTURBATIONS[perturbation]
+                transform_cls, _ = self._perturbations[perturbation]
                 transform = transform_cls(magnitude=level)
                 results = transform(results)
 
@@ -1064,28 +1129,9 @@ class HSVPerturbation(BaseTransform):
         Returns:
             PIL Image or Tensor: Image with modified red channel
         """
-
-        max_val = 180 if self.channel == 0 else 255
-
-        img = results["img"]
-        img = self.rgb2hsv(img)
-        if self.channel == 2 and self.direction == 0:
-            img[..., self.channel] = (
-                img[..., self.channel]
-                - self.alpha * img[..., self.channel]
-                + 10 * self.alpha
-            )
-        else:
-            img[..., self.channel] = (
-                img[..., self.channel]
-                - self.alpha * img[..., self.channel]
-                + max_val * self.direction * self.alpha
-            )
-        img = self.hsv2rgb(img)
-
-        results["img"] = img.astype(np.uint8)
-
-        return results
+        return perturb_hsv(
+            results, channel=self.channel, alpha=self.alpha, direction=self.direction
+        )
 
     def __repr__(self) -> str:
         return (
@@ -1268,6 +1314,36 @@ def perturb_rgb(results, channel, alpha, direction):
     return results
 
 
+def perturb_hsv(results, channel, alpha, direction):
+    """HSV counterpart of `perturb_rgb`. channel 0/1/2 -> H/S/V, direction 0/1 ->
+    darker/lighter.
+
+    Lifted verbatim out of HSVPerturbation.transform so the two channel-specific
+    special cases live in exactly one place: hue saturates at 180 under cv2's
+    8-bit HSV (not 255), and darkening V rails toward a small positive floor
+    rather than to 0, which would collapse the image to black and make the op
+    indistinguishable from any other V darkening at high magnitude.
+
+    Unlike `perturb_rgb` this does NOT rewrite results["ori_shape"] -- preserving
+    HSVPerturbation's behaviour, which the legacy non-"_new" SA path in
+    sensitivity_analysis.py/gpr_sa.py/bopt_sa.py constructs by name.
+    """
+    max_val = 180 if channel == 0 else 255
+
+    img = cv2.cvtColor(results["img"], cv2.COLOR_BGR2HSV)
+    if channel == 2 and direction == 0:
+        img[..., channel] = img[..., channel] - alpha * img[..., channel] + 10 * alpha
+    else:
+        img[..., channel] = (
+            img[..., channel] - alpha * img[..., channel] + max_val * direction * alpha
+        )
+    img = cv2.cvtColor(img, cv2.COLOR_HSV2BGR)
+
+    results["img"] = img.astype(np.uint8)
+
+    return results
+
+
 @TRANSFORMS.register_module()
 class LighterR(BaseTransform):
     """Applies RGB perturbation to an image."""
@@ -1340,6 +1416,80 @@ class DarkerB(BaseTransform):
         return results
 
 
+# The HSV half of the same vocabulary. HSVPerturbation already implemented these
+# six, but keyed by (channel, alpha, direction) -- a signature the pdf-driven
+# samplers cannot call, since RandomTrainTransformNew and _make_diff_transform
+# both construct a transform as `cls(magnitude=level)`. These are the thin
+# magnitude-signature wrappers that make lighter_H..darker_V addressable the same
+# way lighter_R..darker_B already are.
+
+
+@TRANSFORMS.register_module()
+class LighterH(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=0, alpha=self.magnitude, direction=1)
+
+
+@TRANSFORMS.register_module()
+class DarkerH(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=0, alpha=self.magnitude, direction=0)
+
+
+@TRANSFORMS.register_module()
+class LighterS(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=1, alpha=self.magnitude, direction=1)
+
+
+@TRANSFORMS.register_module()
+class DarkerS(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=1, alpha=self.magnitude, direction=0)
+
+
+@TRANSFORMS.register_module()
+class LighterV(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=2, alpha=self.magnitude, direction=1)
+
+
+@TRANSFORMS.register_module()
+class DarkerV(BaseTransform):
+    """Applies HSV perturbation to an image."""
+
+    def __init__(self, magnitude: float):
+        self.magnitude = abs(magnitude)
+
+    def transform(self, results: dict) -> dict:
+        return perturb_hsv(results, channel=2, alpha=self.magnitude, direction=0)
+
+
 @TRANSFORMS.register_module()
 class Blur(BaseTransform):
     """Applies Gaussian blur perturbation assuming sigma in both X and Y directions are equal."""
@@ -1381,7 +1531,7 @@ class Noise(BaseTransform):
         return f"{self.__class__.__name__}(sigma={self.sigma})"
 
 
-NEW_PERTURBATIONS_PHOTOMETRIC = {
+LEGACY20_OPS_PHOTOMETRIC = {
     "BrightnessTransform": (BrightnessTransform, True),
     "NegativeBrightnessTransform": (NegativeBrightnessTransform, True),
     "ColorTransform": (ColorTransform, True),
@@ -1394,7 +1544,7 @@ NEW_PERTURBATIONS_PHOTOMETRIC = {
     "SolarizeTransform": (SolarizeTransform, True),
 }
 
-NEW_PERTURBATIONS_GEOMETRIC = {
+LEGACY20_OPS_GEOMETRIC = {
     "ShearX": (ShearX, True),
     "ShearY": (ShearY, True),
     "NegativeShearX": (NegativeShearX, True),
@@ -1407,7 +1557,154 @@ NEW_PERTURBATIONS_GEOMETRIC = {
     "NegativeRotate": (NegativeRotate, True),
 }
 
-NEW_PERTURBATIONS = NEW_PERTURBATIONS_PHOTOMETRIC | NEW_PERTURBATIONS_GEOMETRIC
+LEGACY20_OPS = LEGACY20_OPS_PHOTOMETRIC | LEGACY20_OPS_GEOMETRIC
+
+
+# The 32 GPU ops, split the same way the CPU registries are. Values here are the
+# raw callables `(images, magnitude) -> images`, NOT the
+# `(transform_cls, bool)` pairs the two CPU registries carry -- these ops are
+# applied batched on GPU by sensaug.dataset.gpu_augment and never exist as
+# pipeline transforms. resolve_perturbation_set documents the consequence.
+DIFF32_OPS_GEOMETRIC = {
+    name: op for name, op in DIFF32_OPS.items() if name in GEOMETRIC_OP_KEYS
+}
+DIFF32_OPS_PHOTOMETRIC = {
+    name: op for name, op in DIFF32_OPS.items() if name not in GEOMETRIC_OP_KEYS
+}
+
+
+# --- the non-differentiable 32-op vocabulary ----------------------------------
+#
+# The same 32 op NAMES the gradient probe differentiates, played through the plain
+# CPU transform classes above. The CPU counterpart of DIFF32_OPS.
+#
+# No --aug-type routes here any more: `ours`, `default` and `grad_corr` all train
+# and run SA on "diff32", so that every compared arm applies exactly the function
+# the probe measures. This set is kept because it is the reference the CPU/GPU
+# equivalence test compares against, and because it remains selectable for a
+# deliberate CPU run.
+#
+# The 1:1 name correspondence is not a coincidence to be re-derived: the
+# differentiable registries were written to mirror these classes (see
+# differentiable_augmentations.py's registry comment and
+# differentiable_augmentations_aa.py's registry comment). The parity assertion
+# below is what keeps them from drifting.
+#
+# NOT the same magnitude scale as the differentiable op of the same name. The two
+# registries agree on WHICH op each name denotes, never on what magnitude 0.5 of
+# it means. 24 of the 32 are calibrated; 8 are not -- `blur` (cv2's
+# kernel-size-derived implicit sigma 7.70 here vs sigma 1.00 there, at m=1.0),
+# `noise` (0.196 vs 1.00), and brightness/contrast/color +-, which differ in FORM
+# rather than scale (see the TODO(calibration) table in
+# differentiable_augmentations_aa.py). A per-op score read off R transfers between
+# the two; a magnitude does not.
+#
+# Posterize/Solarize are absent: they are in LEGACY20_OPS but have no
+# differentiable counterpart, so R cannot see them, so they do not belong in the
+# vocabulary R is meant to govern.
+NON_DIFF32_OPS = {
+    # base 14 -- Shu et al.'s RGB/HSV/blur/noise ops
+    "lighter_R": (LighterR, True),
+    "darker_R": (DarkerR, True),
+    "lighter_G": (LighterG, True),
+    "darker_G": (DarkerG, True),
+    "lighter_B": (LighterB, True),
+    "darker_B": (DarkerB, True),
+    "lighter_H": (LighterH, True),
+    "darker_H": (DarkerH, True),
+    "lighter_S": (LighterS, True),
+    "darker_S": (DarkerS, True),
+    "lighter_V": (LighterV, True),
+    "darker_V": (DarkerV, True),
+    "blur": (Blur, True),
+    "noise": (Noise, True),
+    # AutoAugment family -- these 18 ARE the LEGACY20_OPS classes, reached
+    # under their differentiable-registry names.
+    "rotate_pos": (Rotate, True),
+    "rotate_neg": (NegativeRotate, True),
+    "shear_x_pos": (ShearX, True),
+    "shear_x_neg": (NegativeShearX, True),
+    "shear_y_pos": (ShearY, True),
+    "shear_y_neg": (NegativeShearY, True),
+    "translate_x_pos": (TranslateX, True),
+    "translate_x_neg": (NegativeTranslateX, True),
+    "translate_y_pos": (TranslateY, True),
+    "translate_y_neg": (NegativeTranslateY, True),
+    "brightness_pos": (BrightnessTransform, True),
+    "brightness_neg": (NegativeBrightnessTransform, True),
+    "contrast_pos": (ContrastTransform, True),
+    "contrast_neg": (NegativeContrastTransform, True),
+    "sharpness_pos": (SharpnessTransform, True),
+    "sharpness_neg": (NegativeSharpnessTransform, True),
+    "color_pos": (ColorTransform, True),
+    "color_neg": (NegativeColorTransform, True),
+}
+
+# Index-compatibility with R's axes is the entire premise; an op added to one
+# registry and not the other would silently drop out of every per-op score
+# (missing name -> no redundancy signal) rather than fail. Fail at import instead.
+assert set(NON_DIFF32_OPS) == set(DIFF32_OPS), (
+    "NON_DIFF32_OPS and DIFF32_OPS have diverged: "
+    f"only in non-diff32={sorted(set(NON_DIFF32_OPS) - set(DIFF32_OPS))}, "
+    f"only in diff32={sorted(set(DIFF32_OPS) - set(NON_DIFF32_OPS))}"
+)
+
+NON_DIFF32_OPS_GEOMETRIC = {
+    name: value
+    for name, value in NON_DIFF32_OPS.items()
+    if name in GEOMETRIC_OP_KEYS
+}
+NON_DIFF32_OPS_PHOTOMETRIC = {
+    name: value
+    for name, value in NON_DIFF32_OPS.items()
+    if name not in GEOMETRIC_OP_KEYS
+}
+
+def resolve_perturbation_set(
+    name: str, geometric_only: bool = False, photometric_only: bool = False
+) -> dict:
+    """Select a perturbation registry by name, honouring the geometric/photometric
+    filters.
+
+    Three sets, differing on which op names are in play and how they are applied:
+
+    - ``"legacy20"``  -- 20 PascalCase names, CPU transform classes. The historical
+      set; keys ARE the registered mmseg type names.
+    - ``"non-diff32"`` -- the 32 R-indexed snake_case names, CPU transform classes.
+    - ``"diff32"``    -- the same 32 names as GPU-batched torch ops, applied by
+      sensaug.dataset.gpu_augment rather than by any pipeline transform.
+
+    VALUE SHAPES DIFFER. The two CPU sets map a name to ``(transform_cls, bool)``;
+    ``diff32`` maps a name to the raw callable ``(images, magnitude) -> images``.
+    Callers that only need the KEYS (the SA sweep, the pdf samplers) work against
+    all three. Callers that need a transform class are CPU-only by construction
+    and must never be handed ``diff32`` -- `_perturbation_transform_cfg` raises
+    rather than unpacking a callable into a class.
+    """
+    if name == "legacy20":
+        if geometric_only:
+            return LEGACY20_OPS_GEOMETRIC
+        if photometric_only:
+            return LEGACY20_OPS_PHOTOMETRIC
+        return LEGACY20_OPS
+
+    if name == "non-diff32":
+        if geometric_only:
+            return NON_DIFF32_OPS_GEOMETRIC
+        if photometric_only:
+            return NON_DIFF32_OPS_PHOTOMETRIC
+        return NON_DIFF32_OPS
+
+    if name == GPU_PERTURBATION_SET:
+        if geometric_only:
+            return DIFF32_OPS_GEOMETRIC
+        if photometric_only:
+            return DIFF32_OPS_PHOTOMETRIC
+        return DIFF32_OPS
+
+    raise ValueError(
+        f"unknown perturbation_set {name!r}, expected one of {PERTURBATION_SETS}"
+    )
 
 # @TRANSFORMS.register_module()
 # class PackSegInputs(BaseTransform):

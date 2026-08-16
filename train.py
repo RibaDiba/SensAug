@@ -21,11 +21,26 @@ import torch
 
 import sensaug.dataset.datasets as datasets  # noqa:F401
 from sensaug.dataset.augmentations import *  # noqa:F403
+from sensaug.dataset.gpu_augment import (  # noqa:F401
+    GpuAugSegDataPreProcessor,
+    set_train_spec,
+)
 from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
 from sensaug.hooks import *  # noqa:F403
 from sensaug.loops import *  # noqa:F403
 from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
+
+#: The arms that draw from the 32-op bank. All of them run on the GPU set, so
+#: they differ only in how they pick and weight from it -- which is the whole
+#: point of comparing them. "random" is deliberately not here: it is not a
+#: compared arm and stays on the historical 20-op CPU vocabulary.
+GPU_AUG_TYPES = ("ours", "default", "grad_corr")
+
+
+def uses_gpu_augmentation(aug_type: str) -> bool:
+    return aug_type in GPU_AUG_TYPES
+
 
 def dist_print(*args, **kwargs):
     if is_main_process():
@@ -79,6 +94,19 @@ def trigger_visualization_hook(cfg, args):
     return cfg
 
 
+def resolve_interval(cli_value, key, default):
+    """Resolve one pipeline's clock: CLI flag > cluster config `schedule:` > default.
+
+    All three are iteration counts. The checks are explicit `is not None` rather
+    than `or`, so a deliberate 0 reaches the hook that validates it and fails
+    loudly, instead of silently falling through to the default.
+    """
+    if cli_value is not None:
+        return cli_value
+    configured = SCHEDULE.get(key)
+    return default if configured is None else configured
+
+
 def natural_keys(text):
     """
     alist.sort(key=natural_keys) sorts in human order
@@ -112,6 +140,42 @@ def apply_acdc_train_eval(cfg, split="all"):
     cfg.test_dataloader = cfg.val_dataloader
 
     return cfg
+
+
+def _localize_pretrained_checkpoint(cfg, backbone):
+    """Redirect backbone.init_cfg checkpoint URLs to PRETRAINED_CACHE_DIR.
+
+    Compute nodes on Della have no internet access, so any config whose backbone
+    init_cfg points at a download.openmmlab.com URL (segformer, pspnet-rsb,
+    convnext, swin) crashes deep inside model.init_weights() with a DNS error.
+    Fails fast here instead, before Runner/NCCL/dataloaders spin up, if the local
+    copy hasn't been staged yet via scripts/download_pretrained_checkpoints.py.
+    """
+    if not PRETRAINED_CACHE_DIR or "model" not in cfg:
+        return
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "Pretrained" and str(
+            node.get("checkpoint", "")
+        ).startswith("http"):
+            url = node["checkpoint"]
+            local_path = os.path.join(PRETRAINED_CACHE_DIR, os.path.basename(url))
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"Pretrained checkpoint not cached locally: {url}\n"
+                    f"Expected at: {local_path}\n"
+                    "Compute nodes have no internet access -- fetch it first from a "
+                    "login node (or your machine + rsync) with:\n"
+                    f"  python scripts/download_pretrained_checkpoints.py --backbone {backbone}"
+                )
+            node["checkpoint"] = local_path
+            return
+        for v in node.values():
+            _walk(v)
+
+    _walk(cfg.model)
 
 
 def build_config(args):
@@ -172,6 +236,7 @@ def build_config(args):
     cfg.launcher = args.launcher
     cfg.pretrained = None
     cfg.model.pretrained = None
+    _localize_pretrained_checkpoint(cfg, args.backbone)
 
     # enable automatic-mixed-precision training
     if args.amp:
@@ -210,9 +275,15 @@ def build_config(args):
     cfg.default_hooks.checkpoint.save_best = PRIMARY_METRIC
     cfg.default_hooks.checkpoint.max_keep_ckpts = 3
 
-    if args.aug_type == "default":  # use default augmentations from config
-        pipeline = cfg.train_dataloader.dataset.pipeline
-    elif args.aug_type == "none":  # use no augmentations
+    # grad_corr with the SA loop turned off trains exactly like `none`: the
+    # correlation pipeline is a measurement, and with no SA there is nothing to
+    # drive a training augmentation pdf. This is the control arm -- an R measured
+    # against an unaugmented baseline is what the SA-on number gets compared to.
+    plain_pipeline = args.aug_type == "none" or (
+        args.aug_type == "grad_corr" and args.no_corr_sa
+    )
+
+    if plain_pipeline:  # use no augmentations
         excluded_augmentations = [
             "PhotoMetricDistortion",
             "RandomFlip",
@@ -249,14 +320,31 @@ def build_config(args):
             pipeline.append(dict(type="RandAugmentTransform"))
         elif augmentation_type == "trivialaugment":
             pipeline.append(dict(type="TrivialAugmentWideTransform"))
-        elif augmentation_type == "random" or augmentation_type == "ours":
-            pipeline.append(
-                dict(
-                    type="RandomAlphaTrainTransform",
-                    geometric_only=args.geometric_only,
-                    photometric_only=args.photometric_only,
+        elif augmentation_type in ("random", "ours", "grad_corr", "default"):
+            # grad_corr/ours/default all train on "diff32": the differentiable ops
+            # themselves, applied batched on GPU after collation. That makes the
+            # function training applies identical to the one the gradient probe
+            # differentiates, so a per-op score read off R indexes straight into
+            # the training pdf and the magnitudes mean the same thing on both
+            # sides. Keeping all three arms on one set is also what makes them
+            # comparable -- they're meant to differ in how they pick and weight
+            # from the bank, not in which ops exist or what a magnitude buys.
+            #
+            # "random" stays on "legacy20" on purpose: it isn't a compared arm.
+            #
+            # The GPU set has no pipeline transform at all -- see
+            # sensaug/dataset/gpu_augment.py -- so nothing is appended for it here.
+            # The training policy is installed on the data preprocessor instead,
+            # by the SA loop via runner_utils' GPU dispatch.
+            if augmentation_type == "random":
+                pipeline.append(
+                    dict(
+                        type="RandomAlphaTrainTransform",
+                        geometric_only=args.geometric_only,
+                        photometric_only=args.photometric_only,
+                        perturbation_set="legacy20",
+                    )
                 )
-            )
         elif augmentation_type == "idbh":
             pipeline.append(dict(type="IDBHTransform", version="cifar10-weak"))
         elif augmentation_type == "vip":
@@ -293,11 +381,17 @@ def build_config(args):
     )
 
     N_ROUNDS = 20
+    N_CORR_EMISSIONS = 4
 
-    round_interval = (
-        args.round_interval
-        if args.round_interval is not None
-        else cfg.train_cfg.max_iters // N_ROUNDS
+    # The two pipelines' clocks, resolved independently of each other. round_interval
+    # drives the SA pipeline (RobustValLoop; its SA-curve recompute is every 6th of
+    # these rounds, in sensaug/loops/sensaug_loop.py). corr_interval drives the gradient
+    # cross-correlation pipeline. Neither is derived from the other.
+    round_interval = resolve_interval(
+        args.round_interval, "round_interval", cfg.train_cfg.max_iters // N_ROUNDS
+    )
+    corr_interval = resolve_interval(
+        args.corr_interval, "corr_interval", cfg.train_cfg.max_iters // N_CORR_EMISSIONS
     )
     cfg.train_cfg.val_interval = round_interval
 
@@ -320,9 +414,30 @@ def build_config(args):
     args.save_vis = True
     args.show = False
 
-    if args.aug_type == "ours":
+    # grad_corr reuses the SA machinery, but over the DIFFERENTIABLE vocabulary so
+    # the SA curve and the matrix R are keyed by the same augmentations. Disabled
+    # with --no-corr-sa, which leaves the stock val loop and probes at the fixed
+    # reference magnitude.
+    sa_loop = args.aug_type == "ours" or (
+        args.aug_type == "grad_corr" and not args.no_corr_sa
+    )
+
+    if sa_loop:
         eval_ratio = 0.25 if "acdc" not in args.dataset.lower() else 1.0
-        cfg.val_cfg.type = "RobustValLoop"
+        # GradCorrValLoop is RobustValLoop plus Lever 3's redundancy
+        # down-weighting -- the only thing it adds. It is a separate registry name
+        # rather than a flag on RobustValLoop so that the SA arm cannot be handed
+        # correlation-pipeline kwargs it has no consumer for.
+        cfg.val_cfg.type = (
+            "GradCorrValLoop" if args.aug_type == "grad_corr" else "RobustValLoop"
+        )
+        # "diff32": the SA round-eval probes exactly the ops training applies and
+        # the probe differentiates. On the GPU set the round-eval sets preprocessor
+        # state instead of rebuilding the val dataloader once per (op, level) pair,
+        # which is what made this phase the dominant cost of a grad_corr run.
+        cfg.val_cfg.perturbation_set = (
+            "diff32" if args.aug_type in ("grad_corr", "ours") else "legacy20"
+        )
         cfg.val_cfg.ratio = eval_ratio
         cfg.val_cfg.sa_curve_path = "sensaug/testing/test_levels_voc.json"
         cfg.val_cfg.uniform = args.uniform
@@ -335,6 +450,13 @@ def build_config(args):
         cfg.val_cfg.geometric_only = args.geometric_only
         cfg.val_cfg.photometric_only = args.photometric_only
         cfg.val_cfg.weighted_augs = args.weighted_augs
+        # Lever 3's two knobs only exist on GradCorrValLoop. Setting them
+        # unconditionally would attach kwargs RobustValLoop does not accept, and
+        # under --no-corr-sa (sa_loop False) there is no custom val loop at all --
+        # mmengine builds the stock ValLoop and would raise on them.
+        if args.aug_type == "grad_corr":
+            cfg.val_cfg.corr_lambda = args.corr_lambda
+            cfg.val_cfg.corr_lambda_ramp = args.corr_lambda_ramp
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio
@@ -344,6 +466,48 @@ def build_config(args):
         # NOTE: LoveDA doesn't converge very well on default lr; we should reduce it by 1 order mag
         if "loveda" in args.dataset.lower():
             cfg.optimizer.lr *= 0.1
+
+    if args.aug_type == "grad_corr":
+        # Gradient-based augmentation cross-correlation. Every `emit_interval`
+        # iters CollectGradientHook freezes the model and sweeps the whole clean
+        # val set for d loss / d magnitude, then
+        # PerturbationSensitivityAnalysisHookWithGradients correlates that sweep
+        # into R. Both gate on the SAME interval, so they are built from one
+        # variable rather than two that could drift apart.
+        #
+        # --corr-sync-sa just hands them the SA loop's clock instead of their own.
+        # No special gate is needed: fires_at() counts runner.iter + 1, which is the
+        # value IterBasedTrainLoop tests against val_interval right after this hook
+        # point, so passing round_interval lands the sweep on exactly the iterations
+        # that are SA rounds.
+        #
+        # ORDERING, and it matters: RobustIterBasedTrainLoop calls val_loop.run()
+        # AFTER run_iter, so a synced sweep fires BEFORE the SA round it is synced
+        # to updates the pdf. It therefore probes at the previous round's
+        # magnitudes -- which is the right semantics (those are the magnitudes that
+        # were in effect over the window being measured) but is not obvious.
+        emit_interval = round_interval if args.corr_sync_sa else corr_interval
+
+        # The priorities are load-bearing, not cosmetic: both hooks act in
+        # after_train_iter, and the correlation hook must see the sweep the
+        # collector just wrote. NORMAL (50) runs before LOW (70).
+        cfg.custom_hooks = (cfg.get("custom_hooks") or []) + [
+            dict(
+                type="CollectGradientHook",
+                interval=emit_interval,
+                sweep_batch_size=1,
+                magnitude_mode=args.corr_magnitude_mode,
+                magnitudes_path=args.corr_magnitudes,
+                priority="NORMAL",
+            ),
+            dict(
+                type="PerturbationSensitivityAnalysisHookWithGradients",
+                interval=emit_interval,
+                red_mode=args.corr_red_mode,
+                mask_within_op=not args.corr_keep_within_op,
+                priority="LOW",
+            ),
+        ]
 
     if args.adamw:
         lr = cfg.optimizer.lr
@@ -355,6 +519,14 @@ def build_config(args):
 
     cfg.geometric_only = args.geometric_only
     cfg.photometric_only = args.photometric_only
+
+    # The GPU set has no pipeline transform: its ops are applied batched, after
+    # collation, by a SegDataPreProcessor subclass. Swapping the type here covers
+    # every backbone at once -- each one declares its own data_preprocessor in
+    # sensaug/custom_configs/mmseg/_base_/models/, and they differ only in
+    # mean/std, which is carried through untouched.
+    if uses_gpu_augmentation(args.aug_type):
+        cfg.model.data_preprocessor.type = "GpuAugSegDataPreProcessor"
 
     cfg.randomness = dict(seed=0, diff_rank_seed=False)
 
@@ -377,6 +549,23 @@ def train(args):
     set_manual_seed(0)  # set seed
     runner.val_loop  # initialize val loop
     runner.test_loop
+
+    # Install the initial uniform training policy for the GPU arms.
+    #
+    # This is what RandomAlphaTrainTransform used to do by sitting in the pipeline
+    # from iteration 0: training augments uniformly over the bank until the SA loop
+    # has enough rounds to publish a pdf, at which point RobustValLoop replaces
+    # this policy with that pdf. Doing it here rather than in the loop matters for
+    # two reasons -- `default` builds no SA loop at all and would otherwise train
+    # completely unaugmented, and `ours`/`grad_corr` would train clean through
+    # their warmup rounds instead of uniformly augmented.
+    if uses_gpu_augmentation(args.aug_type):
+        set_train_spec(
+            runner,
+            geometric_only=args.geometric_only,
+            photometric_only=args.photometric_only,
+        )
+
     runner.train()
 
 
@@ -393,6 +582,8 @@ if __name__ == "__main__":
     DATA_ROOT_LOOKUP    = _seg["DATA_ROOT_LOOKUP"]
     SUPPORTED_DATASETS  = _seg["SUPPORTED_DATASETS"]
     SUPPORTED_BACKBONES = _seg["SUPPORTED_BACKBONES"]
+    SCHEDULE            = _seg["SCHEDULE"]
+    PRETRAINED_CACHE_DIR = _seg["PRETRAINED_CACHE_DIR"]
 
     parser = argparse.ArgumentParser(description="main")
     parser.add_argument(
@@ -420,6 +611,9 @@ if __name__ == "__main__":
         choices=[
             "none",
             "ours",
+            # SA over the differentiable ops + the gradient cross-correlation
+            # pipeline. See --no-corr-sa for the control arm.
+            "grad_corr",
             "default",
             "random",
             "autoaugment",
@@ -496,7 +690,9 @@ if __name__ == "__main__":
         "--round_interval",
         type=int,
         default=None,
-        help="interval of iterations to re-evaluate perturbation robustness. sa_interval mod round_interval must equal 0.",
+        help="interval of iterations to re-evaluate perturbation robustness (the SA "
+        "pipeline's clock). Overrides schedule.round_interval in the cluster config. "
+        "Defaults to max_iters // 20.",
     )
     parser.add_argument(
         "--descending-MA",
@@ -506,6 +702,96 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--uniform", action="store_true", default=False, help="use uniform augmentation"
+    )
+    parser.add_argument(
+        "--no-corr-sa",
+        action="store_true",
+        default=False,
+        help="under --aug-type=grad_corr, disable the sensitivity-analysis loop. "
+        "Training then runs unaugmented and the gradient probe uses the fixed "
+        "reference magnitude (0.5) for every op instead of the SA-derived "
+        "distribution. This is the control arm for the correlation matrix.",
+    )
+    parser.add_argument(
+        "--corr-magnitude-mode",
+        type=str,
+        default="mode",
+        choices=["mode", "sampled_shared", "sampled_independent", "fixed"],
+        help="how each op's probe magnitude is drawn from its SA distribution. "
+        "'mode' (default) uses the modal level, constant across the batch. "
+        "'sampled_shared' draws per image with one shared quantile across ops. "
+        "'sampled_independent' lets each op draw on its own (attenuates R). "
+        "'fixed' always uses the reference magnitude. Ignored without a snapshot.",
+    )
+    parser.add_argument(
+        "--corr-magnitudes",
+        type=str,
+        default=None,
+        help="path to a corr_magnitudes.json written by an earlier run. Its last "
+        "snapshot seeds the probe magnitudes, so an --no-corr-sa control arm can be "
+        "measured at the SAME magnitudes as the SA-on run it is compared against. "
+        "Without it the control probes at the fixed 0.5 and the two matrices are "
+        "not directly comparable. A live SA snapshot supersedes it.",
+    )
+    parser.add_argument(
+        "--corr-sync-sa",
+        action="store_true",
+        default=False,
+        help="fire the gradient sweep on the SA loop's clock (--round_interval) "
+        "instead of its own --corr-interval. The sweep still runs from "
+        "after_train_iter, which is BEFORE that round's val loop updates the pdf, "
+        "so it probes at the previous round's magnitudes.",
+    )
+    parser.add_argument(
+        "--corr-interval",
+        type=int,
+        default=None,
+        help="interval of iterations between gradient sweeps and cross-correlation "
+        "matrix emissions. Overrides schedule.corr_interval in the cluster config. "
+        "Independent of --round_interval. Defaults to max_iters // 4. Ignored when "
+        "--corr-sync-sa is set.",
+    )
+    parser.add_argument(
+        "--corr-lambda",
+        type=float,
+        default=0.0,
+        help="strength of the redundancy down-weighting applied to the training "
+        "pdf: q(a) proportional to pdf(a) * exp(-lambda * red(a)), where red(a) is "
+        "the standardized row sum of the correlation matrix R. 0 (the default) "
+        "leaves the pdf bit-identical and is the control arm. Because red(a) is "
+        "standardized, lambda means the same thing across runs and checkpoints: on "
+        "the logged matrices 0.25 gives a max/min spread of 2.3-3.1x, 0.5 gives "
+        "5-10x, and 1.0 is already extreme. Needs an R-keyed vocabulary, i.e. "
+        "--aug-type=grad_corr.",
+    )
+    parser.add_argument(
+        "--corr-red-mode",
+        type=str,
+        default="squared",
+        choices=["squared", "abs", "signed"],
+        help="how a row of R reduces to one redundancy score per op. 'squared' "
+        "(default) is closure-proof and independent of any op's sign convention. "
+        "'abs' and 'signed' are ablation arms -- note 'signed' PROTECTS an "
+        "anti-correlated pair rather than down-weighting it.",
+    )
+    parser.add_argument(
+        "--corr-lambda-ramp",
+        type=str,
+        default="linear",
+        choices=["linear", "constant"],
+        help="whether lambda ramps from 0 to --corr-lambda over training (default) "
+        "or applies at full strength from the first emission. R measured early "
+        "describes a model that barely discriminates between augmentations yet, so "
+        "the ramp acts least on the least trustworthy measurement.",
+    )
+    parser.add_argument(
+        "--corr-keep-within-op",
+        action="store_true",
+        default=False,
+        help="keep the lighter/darker and _pos/_neg cells in red(a). They are "
+        "excluded by default: the two directions of one op measure a "
+        "parameterization convention, not redundancy between augmentations anyone "
+        "would have chosen independently.",
     )
     parser.add_argument(
         "--adamw",
@@ -555,6 +841,14 @@ if __name__ == "__main__":
     # Set up working dir to save files and logs.
     if "ours" not in args.exp_name and args.aug_type == "ours":
         args.exp_name = args.exp_name + "_ours"
+
+    # Same treatment for grad_corr, so the SA-on and SA-off arms can never land in
+    # the same work_dir -- they write the same log files, and a silent collision
+    # would interleave two incomparable sets of R matrices in corr_matrix_log.json.
+    if args.aug_type == "grad_corr":
+        suffix = "gradcorr_nosa" if args.no_corr_sa else "gradcorr"
+        if suffix not in args.exp_name:
+            args.exp_name = args.exp_name + "_" + suffix
 
     if "LOCAL_RANK" not in os.environ:
         os.environ["LOCAL_RANK"] = str(args.local_rank)

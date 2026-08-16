@@ -16,7 +16,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
 from scipy.stats import linregress
-from sensaug.dataset.augmentations import NEW_PERTURBATIONS
+from sensaug.dataset.augmentations import LEGACY20_OPS
 
 matplotlib.use("Agg")
 sns.set_theme(style="ticks")
@@ -24,7 +24,7 @@ sns.set_theme(style="ticks")
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 
-SEEN_PERTURBATIONS = list(NEW_PERTURBATIONS.keys())
+SEEN_PERTURBATIONS = list(LEGACY20_OPS.keys())
 
 UNSEEN_PERTURBATIONS = [
     "motionblur",

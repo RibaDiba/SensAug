@@ -81,8 +81,7 @@ class AugSegVisualizationHook(SegVisualizationHook):
                     (output.gt_sem_seg.shape[1], output.gt_sem_seg.shape[0]),
                     interpolation=cv2.INTER_LINEAR,
                 )
-                # img = [img, img_aug]
-                img = [img_aug, img_aug]
+                img = [img, img_aug]
                 window_name = f"{mode}_{os.path.basename(img_path)}"
 
                 self._visualizer.add_datasample(
@@ -330,7 +329,7 @@ class PerturbationSensitivityAnalysisHookNew(Hook):
                 miou_record[p_type] = []
 
                 for level in levels:
-                    transform_cls, _ = NEW_PERTURBATIONS[p_type]
+                    transform_cls, _ = LEGACY20_OPS[p_type]
                     transform = transform_cls(magnitude=level)
                     apply_perturbations_dataloader_new(
                         runner, train=False, transform=transform
@@ -400,7 +399,7 @@ class WeightedPerturbationSensitivityAnalysisHookNew(Hook):
                 miou_record[p_type] = {}
 
                 for level in levels:
-                    transform_cls, _ = NEW_PERTURBATIONS[p_type]
+                    transform_cls, _ = LEGACY20_OPS[p_type]
                     transform = transform_cls(magnitude=level)
                     apply_perturbations_dataloader_new(
                         runner, train=False, transform=transform

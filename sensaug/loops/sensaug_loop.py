@@ -1,26 +1,48 @@
+"""The sensitivity-analysis pipeline: `RobustValLoop`.
+
+This is the loop `--aug-type=ours` runs. Every `round_interval` iterations it
+re-evaluates how badly the model does under each perturbation, turns that into a
+sampling pdf over (perturbation, magnitude) pairs, and rebuilds the train
+dataloader to sample augmentations from it. The SA *curve* itself is recomputed
+every 6th round (hardcoded in `run()`), so its effective cadence is
+`6 x round_interval`.
+
+`--aug-type=grad_corr` runs `GradCorrValLoop` (`grad_corr_loop.py`), which is a
+strict superset of this: same SA machinery, plus Lever 3's redundancy
+down-weighting of the pdf it produces. The one extension point between them is
+`_apply_redundancy_reweighting`, a no-op here.
+
+The gradient cross-correlation measurement itself lives entirely in
+`sensaug/hooks/` and runs off its own clock -- the two pipelines share no clock
+and no hook point.
+"""
+
 import os
-import cv2
 import json
-import logging
 from pprint import pprint
 from copy import deepcopy
 
 from scipy.stats import betabinom
 
 from mmengine.logging import print_log
-from mmengine.device import get_device
-from mmengine.runner import ValLoop, TestLoop, IterBasedTrainLoop
+from mmengine.runner import ValLoop
 from mmseg.registry import LOOPS
 from mmengine.dist import is_main_process
 
 # Check Pytorch installation
 import torch
-from torchmetrics.image.kid import KernelInceptionDistance
 
 # Local imports
 # from sensaug.dataset.augmentations import *
-from sensaug.sensitivity_analysis import *
-from sensaug.runner_utils import *
+from sensaug.sensitivity_analysis import *  # noqa: F401,F403
+from sensaug.runner_utils import *  # noqa: F401,F403
+from sensaug.corr_magnitudes import conditional_levels, modal_magnitude
+
+__all__ = [
+    "dict_mean",
+    "RobustValLoop",
+    "RobustBaselineValLoop",
+]
 
 
 def dict_mean(dict_list):
@@ -28,354 +50,6 @@ def dict_mean(dict_list):
     for key in dict_list[0].keys():
         mean_dict[key] = sum(d[key] for d in dict_list) / len(dict_list)
     return mean_dict
-
-
-@LOOPS.register_module()
-class RobustIterBasedTrainLoop(IterBasedTrainLoop):
-    def __init__(
-        self,
-        runner,
-        dataloader,
-        max_iters: int,
-        val_begin: int = 1,
-        val_interval: int = 1000,
-        init_sa=False,
-        dynamic_intervals=None,
-    ) -> None:
-        super().__init__(
-            runner, dataloader, max_iters, val_begin, val_interval, dynamic_intervals
-        )
-
-        self.init_sa = init_sa
-
-    def run(self) -> None:
-        """Launch training."""
-        self.runner.call_hook("before_train")
-        # In iteration-based training loop, we treat the whole training process
-        # as a big epoch and execute the corresponding hook.
-        self.runner.call_hook("before_train_epoch")
-        if self._iter > 0 and self._iter < self._max_iters:
-            print_log(
-                f"Advance dataloader {self._iter} steps to skip data "
-                "that has already been trained",
-                logger="current",
-                level=logging.WARNING,
-            )
-            for _ in range(self._iter):
-                next(self.dataloader_iterator)
-
-        if self.init_sa:
-            print_log("Initializing sensitivity analysis curve", logger="current")
-            self.runner.val_loop.run()
-        else:
-            print_log(
-                f"Not initializing sensitivity analysis curve. Training will resume at iteration {self._iter}. ",
-                logger="current",
-            )
-
-        while self._iter < self._max_iters and not self.stop_training:
-            self.runner.model.train()
-
-            data_batch = next(self.dataloader_iterator)
-            self.run_iter(data_batch)
-
-            self._decide_current_val_interval()
-            if (
-                self.runner.val_loop is not None
-                and self._iter >= self.val_begin
-                and (
-                    self._iter % self.val_interval == 0 or self._iter == self._max_iters
-                )
-            ):
-                self.runner.val_loop.run()
-
-        self.runner.call_hook("after_train_epoch")
-        self.runner.call_hook("after_train")
-        return self.runner.model
-
-
-@LOOPS.register_module()
-class KIDTestLoop(TestLoop):
-    """Custom loop for test, uses a subset."""
-
-    def __init__(self, runner, dataloader, evaluator, fp16: bool = False) -> None:
-        super().__init__(runner, dataloader, evaluator, fp16)
-
-        assert "corruption_dataloader" in self.runner.cfg.keys(), (
-            "corruption dataloader cfg not found"
-        )
-
-        self.kid = None
-        self.max_iters = int(len(self.dataloader))
-        self.update_kid()
-        self.kid.reset()  # reset KID metric obj
-        assert self.kid is not None, "KID not initialized"
-
-    def update_kid(self):
-        self.kid = KernelInceptionDistance(
-            subsets=self.max_iters,
-            subset_size=8,
-            reset_real_features=False,
-            normalize=False,
-        ).to(get_device())
-
-        # use the corruption dataloader
-        dataloader_cfg = deepcopy(self.runner.cfg.corruption_dataloader)
-
-        diff_rank_seed = self.runner._randomness_cfg.get("diff_rank_seed", False)
-        corruption_dataloader = self.runner.build_dataloader(
-            dataloader_cfg, seed=self.runner.seed, diff_rank_seed=diff_rank_seed
-        )
-
-        # update KID with corruption dataloader samples (e.g., one transform from ImageNet-C)
-        for idx, data_batch in enumerate(corruption_dataloader):
-            data_batch_inputs = torch.stack(data_batch["inputs"], dim=0).to(
-                get_device()
-            )
-            self.kid.update(data_batch_inputs, real=True)
-
-    def run(self) -> dict:
-        """Launch test."""
-
-        self.runner.call_hook("before_test")
-        self.runner.call_hook("before_test_epoch")
-        self.runner.model.eval()
-
-        self.kid.reset()  # reset KID metric obj
-
-        for idx, data_batch in enumerate(self.dataloader):
-            self.run_iter(idx, data_batch)
-            data_batch_inputs = torch.stack(data_batch["inputs"], dim=0).to(
-                get_device()
-            )
-            self.kid.update(data_batch_inputs, real=False)
-
-        total_samples = len(self.dataloader.dataset)
-        kid_result = self.kid.compute()
-
-        # compute metrics
-        metrics = self.evaluator.evaluate(total_samples)
-        self.runner.call_hook("after_test_epoch", metrics=metrics)
-        self.runner.call_hook("after_test")
-
-        metrics["kid"] = kid_result
-
-        return metrics
-
-
-@LOOPS.register_module()
-class VisualizeSampleLoop(TestLoop):
-    """Custom loop for test, uses a subset."""
-
-    def __init__(self, runner, dataloader, evaluator, fp16: bool = False) -> None:
-        super().__init__(runner, dataloader, evaluator, fp16)
-
-        self.img_savedir = os.path.join(runner.work_dir, "img_samples")
-        os.makedirs(self.img_savedir, exist_ok=True)
-
-    def run(self) -> dict:
-        """Launch test."""
-
-        max_iter = 1
-
-        self.runner.call_hook("before_test")
-        self.runner.call_hook("before_test_epoch")
-        self.runner.model.eval()
-
-        for idx, data_batch in enumerate(self.dataloader):
-            if idx >= max_iter:
-                break
-
-            batchsize = len(data_batch["inputs"])
-            for i in range(batchsize):
-                sample_n = idx * batchsize + i
-                filename = os.path.join(self.img_savedir, f"sample_{sample_n}.jpg")
-                cv2.imwrite(filename, data_batch["inputs"][i].permute(1, 2, 0).numpy())
-                print(f"saved to: {filename}")
-                break
-            # self.run_iter(idx, data_batch)
-
-        # total_samples = int(max_iter * self.dataloader.batch_size)
-
-        # compute metrics
-        # metrics = self.evaluator.evaluate(total_samples)
-        # self.runner.call_hook('after_test_epoch', metrics=metrics)
-        # self.runner.call_hook('after_test')
-
-        # return metrics
-
-
-@LOOPS.register_module()
-class DebugAugLoop(TestLoop):
-    """Custom loop for test, uses a subset."""
-
-    def __init__(self, runner, dataloader, evaluator, fp16: bool = False) -> None:
-        super().__init__(runner, dataloader, evaluator, fp16)
-
-        self.img_savedir = os.path.join(runner.work_dir, "img_samples")
-        os.makedirs(self.img_savedir, exist_ok=True)
-
-    def run(self) -> dict:
-        """Launch test."""
-
-        self.runner.call_hook("before_test")
-        self.runner.call_hook("before_test_epoch")
-        self.runner.model.eval()
-
-        perturbation_list = list(NEW_PERTURBATIONS.items())
-
-        magnitudes = [0.25, 0.50, 0.75, 1.0]
-        sample = None
-
-        for pname, _ in perturbation_list:
-            for m in magnitudes:
-                apply_perturbations_dataloader(
-                    self.runner, train=False, perturb_levels={pname: m}
-                )
-                print(f"== pname: {pname} || magnitude: {m}")
-
-                for idx, data_batch in enumerate(self.dataloader):
-                    sample = data_batch
-                    break
-
-                filename = os.path.join(self.img_savedir, f"sample_{pname}_{m}.jpg")
-                cv2.imwrite(filename, sample["inputs"][0].permute(1, 2, 0).numpy())
-                print(f"saved to: {filename}")
-
-
-@LOOPS.register_module()
-class SubsetValLoop(ValLoop):
-    """Custom loop for test, uses a subset."""
-
-    def __init__(
-        self, runner, dataloader, evaluator, ratio=0.5, fp16: bool = False
-    ) -> None:
-        super().__init__(runner, dataloader, evaluator, fp16)
-
-        self.ratio = ratio
-        self.dataloader_iter = iter(self.dataloader)
-
-    def run(self) -> dict:
-        """Launch validation."""
-        self.runner.call_hook("before_val")
-        self.runner.call_hook("before_val_epoch")
-        self.runner.model.eval()
-
-        max_iter = int(len(self.dataloader) * self.ratio)
-
-        dataloader_iter = iter(self.dataloader)
-        idx = 0
-        while idx < max_iter:
-            data_batch = next(dataloader_iter)
-            self.run_iter(idx, data_batch)
-            idx += 1
-
-        total_samples = int(max_iter * self.dataloader.batch_size)
-
-        # compute metrics
-        metrics = self.evaluator.evaluate(total_samples)
-        self.runner.call_hook("after_val_epoch", metrics=metrics)
-        self.runner.call_hook("after_val")
-        return metrics
-
-
-@LOOPS.register_module()
-class SubsetTestLoop(TestLoop):
-    """Custom loop for test, uses a subset."""
-
-    def __init__(
-        self, runner, dataloader, evaluator, ratio=0.5, fp16: bool = False
-    ) -> None:
-        super().__init__(runner, dataloader, evaluator, fp16)
-
-        self.ratio = ratio
-        # self.root_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.kid = None
-        self.update_kid()
-
-    def update_kid(self):
-        max_iter = int(len(self.dataloader) * self.ratio)
-        # max_iter = int(len(self.dataloader))
-
-        self.kid = KernelInceptionDistance(
-            subsets=max_iter,
-            subset_size=4,
-            reset_real_features=False,
-            normalize=False,
-        ).to(get_device())
-
-        # set test performance on
-        dataloader_iter = iter(self.dataloader)
-        idx = 0
-        while idx < max_iter:
-            data_batch = next(dataloader_iter)
-            data_batch_inputs = torch.stack(data_batch["inputs"], dim=0).to(
-                get_device()
-            )
-            self.kid.update(data_batch_inputs, real=True)
-            idx += 1
-
-        self.kid.reset()  # reset KID metric obj
-
-    def run(self) -> dict:
-        """Launch test."""
-
-        max_iter = int(len(self.dataloader) * self.ratio)
-
-        self.runner.call_hook("before_test")
-        self.runner.call_hook("before_test_epoch")
-        self.runner.model.eval()
-
-        self.kid.reset()  # reset KID metric obj
-
-        dataloader_iter = iter(self.dataloader)
-        idx = 0
-        while idx < max_iter:
-            data_batch = next(dataloader_iter)
-            self.run_iter(idx, data_batch)
-            data_batch_inputs = torch.stack(data_batch["inputs"], dim=0).to(
-                get_device()
-            )
-            self.kid.update(data_batch_inputs, real=False)
-            idx += 1
-
-        total_samples = int(max_iter * self.dataloader.batch_size)
-        kid_result = self.kid.compute()
-
-        # compute metrics
-        metrics = self.evaluator.evaluate(total_samples)
-        self.runner.call_hook("after_test_epoch", metrics=metrics)
-        self.runner.call_hook("after_test")
-
-        metrics["kid"] = kid_result
-
-        return metrics
-
-    def run_eval_only(self) -> dict:
-        """Launch test."""
-
-        max_iter = int(len(self.dataloader) * self.ratio)
-        self.runner.model.eval()
-        self.kid.reset()  # reset KID metric obj
-
-        dataloader_iter = iter(self.dataloader)
-        idx = 0
-        while idx < max_iter:
-            data_batch = next(dataloader_iter)
-            self.run_iter(idx, data_batch)
-            data_batch_inputs = torch.stack(data_batch["inputs"], dim=0).to(
-                get_device()
-            )
-            self.kid.update(data_batch_inputs, real=False)
-            idx += 1
-
-        total_samples = int(max_iter * self.dataloader.batch_size)
-        kid_result = self.kid.compute()
-        # compute metrics
-        metrics = self.evaluator.evaluate(total_samples)
-        metrics["kid"] = kid_result
-
-        return metrics
 
 
 @LOOPS.register_module()
@@ -397,6 +71,7 @@ class RobustValLoop(ValLoop):
         geometric_only: bool = False,
         photometric_only: bool = False,
         weighted_augs: bool = False,
+        perturbation_set: str = "legacy20",
         fp16: bool = False,
     ) -> None:
         super().__init__(runner, dataloader, evaluator, fp16)
@@ -424,6 +99,25 @@ class RobustValLoop(ValLoop):
         self.photometric_only = photometric_only
         self.weighted_augs = weighted_augs
 
+        # Which augmentation vocabulary SA measures. "legacy20" is the historical
+        # LEGACY20_OPS set; "non-diff32" and "diff32" are both keyed by the 32 op
+        # names the gradient cross-correlation pipeline differentiates, so that the
+        # SA curve and the matrix R describe the SAME augmentations (they
+        # previously shared no names at all, so no SA magnitude could be looked up
+        # for any op in R).
+        #
+        # "diff32" is what every compared arm (ours/default/grad_corr) uses: the
+        # differentiable ops themselves, applied batched on GPU by
+        # sensaug.dataset.gpu_augment. That makes the function SA probes, the
+        # function training applies, and the function the gradient probe
+        # differentiates literally the same one -- previously they were at best two
+        # implementations sharing a name, and 8 of the 32 were not even calibrated
+        # against each other.
+        self.perturbation_set = perturbation_set
+        self.corr_magnitudes_path = os.path.join(
+            runner.cfg.work_dir, "corr_magnitudes.json"
+        )
+
         with open(sa_curve_path, "r") as f:
             sa_curve_str = f.read()
             self.eval_sa_curve = json.loads(sa_curve_str)
@@ -444,12 +138,41 @@ class RobustValLoop(ValLoop):
             sa_curve_str = f.read()
             self.sa_curve = json.loads(sa_curve_str)
 
+    def _apply_redundancy_reweighting(self, pdf_dict: dict) -> dict:
+        """The SA arm's pdf is used exactly as generated.
+
+        This is the single extension point GradCorrValLoop overrides to apply
+        Lever 3. It is a no-op here rather than a `if self.corr_lambda` branch
+        because nothing publishes `runner.corr_redundancy` unless the gradient
+        cross-correlation hooks are registered, and only `--aug-type=grad_corr`
+        registers them -- so on this arm there is never anything to reweight by.
+
+        Called by all three pdf generators, so the override composes with
+        `--uniform` and `--weighted-augs` rather than silently applying to only one
+        of them.
+        """
+        return pdf_dict
+
+    @property
+    def _is_corr_vocabulary(self) -> bool:
+        """Whether this vocabulary's op names are the ones R is indexed by.
+
+        True for both "non-diff32" and "diff32" -- they share all 32 keys and differ
+        only in how each key is applied. Anything handed to the gradient probe or
+        read back from it keys off this, never off the implementation.
+        """
+        return self.perturbation_set in ("non-diff32", "diff32")
+
     def update_sa_curve(self):
         # if get_rank() == 0:
         print_log("Running sensitivity analysis...", logger="current")
         val_dataloader_cfg = deepcopy(self.runner.cfg.val_dataloader)
-        self.sa_curve = adaptive_sensitivity_analysis_new(
-            val_dataloader_cfg, self.runner, num_levels=5, tolerance=0.05
+        self.sa_curve = adaptive_sensitivity_analysis_new(  # noqa: F405
+            val_dataloader_cfg,
+            self.runner,
+            num_levels=5,
+            tolerance=0.05,
+            perturbation_set=self.perturbation_set,
         )
 
         assert self.sa_curve is not None, "SA curve is None after broadcasting"
@@ -476,8 +199,14 @@ class RobustValLoop(ValLoop):
 
             for _, level in enumerate(levels):
                 # evaluate on current SA curve to choose PDF
-                apply_perturbations_dataloader(
-                    self.runner, train=False, perturb_levels={p_type: level}
+                apply_perturbations_dataloader(  # noqa: F405
+                    self.runner,
+                    train=False,
+                    perturb_levels={p_type: level},
+                    # "non-diff32" and "diff32" share all 32 keys; without this the
+                    # round-eval resolves every one of them onto the per-image
+                    # torch wrappers regardless of which vocabulary is in play.
+                    perturbation_set=self.perturbation_set,
                 )
                 metrics = self._run_eval(ratio=self.ratio)
                 miou = metrics["mIoU"]
@@ -510,7 +239,7 @@ class RobustValLoop(ValLoop):
 
             for i, level in enumerate(levels):
                 # evaluate on current SA curve to choose PDF
-                apply_perturbations_dataloader(
+                apply_perturbations_dataloader(  # noqa: F405
                     self.runner, train=False, perturb_levels={p_type: level}
                 )
                 metrics = self._run_eval(ratio=self.ratio)
@@ -531,14 +260,115 @@ class RobustValLoop(ValLoop):
 
         return miou_record, final_metrics
 
+    def publish_corr_magnitudes(self):
+        """Hand this round's per-op magnitude distributions to the gradient
+        cross-correlation probe.
+
+        Only meaningful for an R-keyed vocabulary ("non-diff32" or "diff32"): the probe
+        differentiates DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by
+        LEGACY20_OPS names would match nothing and every op would silently
+        fall back to the fixed reference magnitude. Skipped outright rather than
+        published-and-ignored, so `runner.corr_magnitudes` is never a misleading
+        non-empty dict.
+
+        Under "diff32" the magnitude is exact: SA derives the level on the very op
+        the probe then applies it to. Under "non-diff32" the names still match but
+        the SCALES do not for 8 of the 32 -- the SA level is derived on the CPU op
+        and applied to the differentiable one, and those 8 were never calibrated
+        against each other (blur is the starkest: cv2's kernel-size-derived
+        implicit sigma against sigma itself). There, op identity transfers but the
+        magnitude is approximate.
+
+        Published onto the runner (the same handoff channel CollectGradientHook
+        already uses for `runner.aug_grad_buffer`) rather than pushed: the probe
+        fires on its own clock and simply reads whatever is current, which is what
+        makes "use the latest distribution" work when it fires less often than
+        this loop.
+
+        Lives on the SA base rather than on GradCorrValLoop even though only the
+        grad_corr arm has a live probe: `corr_magnitudes.json` is also the seed
+        file the OFFLINE pipeline reads. scripts/compute_grad_corr.py auto-detects
+        <work-dir>/corr_magnitudes.json when --magnitudes-path is not given, so an
+        `ours` run's snapshot is what lets you recompute R against that run's
+        checkpoint later. Publishing only under grad_corr would leave that path
+        silently falling back to the fixed 0.5 reference magnitude. Nothing on the
+        `ours` code path reads it back -- both consumers are inside
+        CollectGradientHook, which only --aug-type=grad_corr registers.
+
+        Rank-consistency: every rank runs this loop and mmengine all-reduces the
+        evaluator metrics that produce the pdf, so all ranks derive the same
+        snapshot. Only rank 0 writes the file.
+        """
+        if not self._is_corr_vocabulary or not self.pdf_dict:
+            return
+
+        snapshot = conditional_levels(
+            self.pdf_dict, op_names=set(DIFFERENTIABLE_PERTURBATIONS)  # noqa: F405
+        )
+        self.runner.corr_magnitudes = snapshot
+
+        if not is_main_process():
+            return
+
+        record = {
+            "iter": int(self.runner.iter),
+            "round": int(self.n_rounds),
+            "perturbation_set": self.perturbation_set,
+            # The modal level is recorded because it is the probe's default
+            # magnitude; the full distribution is recorded because the sampled
+            # modes need it and because R must be recomputable offline.
+            "magnitudes": {
+                op: dict(entry, mode=modal_magnitude(entry))
+                for op, entry in snapshot.items()
+            },
+        }
+        records = []
+        if os.path.exists(self.corr_magnitudes_path):
+            with open(self.corr_magnitudes_path) as f:
+                records = json.load(f)
+        records.append(record)
+        # Whole-file rewrite via a temp file: a plain truncate+write interrupted
+        # midway would destroy every previous round's snapshot, not just this one.
+        tmp = self.corr_magnitudes_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(records, f, indent=2, allow_nan=False)
+        os.replace(tmp, self.corr_magnitudes_path)
+
+        print_log(
+            f"[corr-magnitudes] round {self.n_rounds} (iter {self.runner.iter}): "
+            f"published {len(snapshot)} ops, modal magnitudes "
+            + ", ".join(
+                f"{op}={modal_magnitude(entry):.3f}"
+                for op, entry in sorted(snapshot.items())
+            ),
+            logger="current",
+        )
+
+    def _remove_H_perturbations(self, miou_record):
+        """Drop the color/photometric ops from the training pdf (`--no-inv-aug`).
+
+        The op names are vocabulary-specific. For "new" this is Posterize/Solarize,
+        as it has always been. For the R-keyed vocabularies those names do not exist
+        ("non-diff32"/"diff32" have no Posterize/Solarize at all, since neither has a
+        differentiable counterpart), so it is the hue ops themselves -- which is
+        also what the flag's name (remove_H) says. Popping nothing at all would
+        silently ignore --no-inv-aug for those whole vocabularies.
+        """
+        if not self.remove_H:
+            return
+        names = (
+            ("lighter_H", "darker_H")
+            if self._is_corr_vocabulary
+            else ("PosterizeTransform", "SolarizeTransform")
+        )
+        for name in names:
+            miou_record.pop(name, None)
+
     def generate_uniform_pdf(self):
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
-        # remove H perturbations from training
-        if self.remove_H:
-            miou_record.pop("PosterizeTransform", None)
-            miou_record.pop("SolarizeTransform", None)
+        self._remove_H_perturbations(miou_record)
 
         # process miou_record into a probability density function
         pdf_dict = {}
@@ -553,6 +383,7 @@ class RobustValLoop(ValLoop):
 
         # add a "none" perturbation to pdf
         pdf_dict[("none", 0)] = 1.0 - pdf_dict_perturb_prob
+        pdf_dict = self._apply_redundancy_reweighting(pdf_dict)
         self.pdf_dict = pdf_dict
 
         return pdf_dict, final_metrics
@@ -563,10 +394,7 @@ class RobustValLoop(ValLoop):
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
-        # remove H perturbations from training
-        if self.remove_H:
-            miou_record.pop("PosterizeTransform", None)
-            miou_record.pop("SolarizeTransform", None)
+        self._remove_H_perturbations(miou_record)
 
         # process miou_record into a probability density function
         pdf_dict = {}
@@ -601,6 +429,7 @@ class RobustValLoop(ValLoop):
                 )
             )
 
+        pdf_dict = self._apply_redundancy_reweighting(pdf_dict)
         self.pdf_dict = pdf_dict
 
         return pdf_dict, final_metrics
@@ -609,10 +438,7 @@ class RobustValLoop(ValLoop):
         assert self.sa_curve is not None, "SA curve is None in RobustValLoop"
         miou_record, final_metrics = self.test_perturbed_new()
 
-        # remove H perturbations from training
-        if self.remove_H:
-            miou_record.pop("PosterizeTransform", None)
-            miou_record.pop("SolarizeTransform", None)
+        self._remove_H_perturbations(miou_record)
 
         # process miou_record into a probability density function
         pdf_dict = {}
@@ -647,6 +473,7 @@ class RobustValLoop(ValLoop):
                 )
             )
 
+        pdf_dict = self._apply_redundancy_reweighting(pdf_dict)
         self.pdf_dict = pdf_dict
 
         return pdf_dict, final_metrics
@@ -697,10 +524,16 @@ class RobustValLoop(ValLoop):
 
         if self.n_rounds >= self.warmup_rounds:
             if self.random_aug:
+                # Every set is trainable now. Under "diff32" this installs a policy
+                # on the model's data preprocessor; under the two CPU sets it
+                # rebuilds the dataloader as before. The guard that used to sit here
+                # excluded the one measurement-only vocabulary, which no longer
+                # exists -- the GPU ops are applied where they were designed to be.
                 apply_random_alpha_training_augmentations(  # noqa: F405
                     self.runner,
                     geometric_only=self.geometric_only,
                     photometric_only=self.photometric_only,
+                    perturbation_set=self.perturbation_set,
                 )
 
             else:
@@ -717,12 +550,21 @@ class RobustValLoop(ValLoop):
                             else self.generate_pdf_new()
                         )
                     )  # update pdf to sample from
+                    self.publish_corr_magnitudes()
+                    # This is what puts the pdf -- and so the redundancy
+                    # reweighting applied to it above -- in front of training.
+                    # Under "diff32" it is a preprocessor state update, so the pdf
+                    # can change every round without rebuilding a dataloader.
                     apply_random_perturbations_train_dataloader_new(  # noqa: F405
-                        self.runner, pdf_dict=self.pdf_dict
+                        self.runner,
+                        pdf_dict=self.pdf_dict,
+                        perturbation_set=self.perturbation_set,
                     )  # type: ignore
 
         # full clean evaluation last
-        apply_perturbations_dataloader(self.runner, train=False, perturb_levels={})
+        apply_perturbations_dataloader(  # noqa: F405
+            self.runner, train=False, perturb_levels={}
+        )
         metrics = self._run_eval(ratio=1.0)
 
         perturb_metrics.update(metrics)
@@ -784,7 +626,9 @@ class RobustBaselineValLoop(RobustValLoop):
         _, perturb_metrics = self.test_perturbed()
 
         # full clean evaluation last
-        apply_perturbations_dataloader(self.runner, train=False, perturb_levels={})
+        apply_perturbations_dataloader(  # noqa: F405
+            self.runner, train=False, perturb_levels={}
+        )
         metrics = self._run_eval(ratio=1.0)
 
         perturb_metrics.update(metrics)

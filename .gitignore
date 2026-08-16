@@ -1,6 +1,7 @@
 # Project-related locations
 data/
 experiments/
+pretrained_checkpoints/
 sensaug/dataset/vip_fractals
 
 # Byte-compiled / optimized / DLL files

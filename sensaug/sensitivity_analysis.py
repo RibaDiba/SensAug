@@ -22,8 +22,11 @@ from scipy.interpolate import PchipInterpolator
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
-from sensaug.dataset.augmentations import *  # PERTURBATIONS, NEW_PERTURBATIONS, GEOMETRIC_TRANSFORMS
-from sensaug.runner_utils import apply_perturbations_dataloader
+from sensaug.dataset.augmentations import *  # PERTURBATIONS, LEGACY20_OPS, GEOMETRIC_TRANSFORMS
+from sensaug.runner_utils import (
+    apply_perturbations_dataloader,
+    verify_perturbation_effective,
+)
 
 # Cityscapes dataset (https://www.cityscapes-dataset.com/downloads/):
 # - gtFine_trainvaltest.zip
@@ -42,7 +45,9 @@ MASKS = "gtFine/val"
 BASE_DATASET = "leftImg8bit/val"
 
 
-def adaptive_sensitivity_analysis_new(cfg, runner, num_levels, tolerance):
+def adaptive_sensitivity_analysis_new(
+    cfg, runner, num_levels, tolerance, perturbation_set="legacy20"
+):
     predictor = pchip_interpolator
     perturbation_levels: Dict[str, List[float]] = {}
     apply_perturbations_dataloader(runner, train=False, perturb_levels={})
@@ -53,20 +58,30 @@ def adaptive_sensitivity_analysis_new(cfg, runner, num_levels, tolerance):
     min_level = 0.0
     max_level = 1.0
 
-    perturbation_list = NEW_PERTURBATIONS.items()
+    # resolve_perturbation_set is the single dispatch point for all three
+    # vocabularies and already applies the geometric/photometric filters, so the
+    # per-set branching that used to live here is gone. Only the KEYS are used
+    # below, which is what lets this work against all three despite "diff32"
+    # mapping its names to raw callables rather than to transform classes.
+    perturbation_list = resolve_perturbation_set(  # noqa: F405
+        perturbation_set,
+        geometric_only=getattr(cfg, "geometric_only", False),
+        photometric_only=getattr(cfg, "photometric_only", False),
+    ).items()
 
-    if hasattr(cfg, "geometric_only"):
-        perturbation_list = NEW_PERTURBATIONS_GEOMETRIC.items()
-
-    if hasattr(cfg, "photometric_only"):
-        perturbation_list = NEW_PERTURBATIONS_PHOTOMETRIC.items()
+    verify_perturbation_effective(
+        runner,
+        next(iter(perturbation_list))[0],
+        max_level,
+        perturbation_set=perturbation_set,
+    )
 
     for perturbation, _ in perturbation_list:
         error = tolerance * max_level
 
         # calculate mean IoU and KID for baseline and max perturbation
         max_miou, max_kid, _ = calculate_miou_kid_new(
-            cfg, runner, perturbation, max_level
+            cfg, runner, perturbation, max_level, perturbation_set=perturbation_set
         )
         points = np.array([(min_level, 0.0), (max_level, 2.0)])
 
@@ -81,7 +96,9 @@ def adaptive_sensitivity_analysis_new(cfg, runner, num_levels, tolerance):
 
         while max_error >= error:
             # calculate mean IoU and KID for perturbation level
-            miou, kid, _ = calculate_miou_kid_new(cfg, runner, perturbation, level)
+            miou, kid, _ = calculate_miou_kid_new(
+                cfg, runner, perturbation, level, perturbation_set=perturbation_set
+            )
             value = objective_function(
                 level, max_level, miou_base - miou, miou_base - max_miou, kid, max_kid
             )
@@ -298,9 +315,12 @@ def objective_function(
     )
 
 
-def calculate_miou_kid_new(cfg, runner, perturbation, level):
+def calculate_miou_kid_new(cfg, runner, perturbation, level, perturbation_set=None):
     apply_perturbations_dataloader(
-        runner, train=False, perturb_levels={perturbation: level}
+        runner,
+        train=False,
+        perturb_levels={perturbation: level},
+        perturbation_set=perturbation_set,
     )
 
     # Assumes Test loop is of type SubsetTestLoop (train_robust.py)
