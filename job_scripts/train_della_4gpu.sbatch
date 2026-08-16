@@ -31,6 +31,16 @@ EXP_NAME="${4:-${AUG_TYPE}_${NAME}_${BACKBONE}_${DATASET}_4gpu${RUN_TAG:+_${RUN_
 WORK_DIR="${WORK_DIR:-./experiments}"
 CONFIG="${CONFIG:-configs/della.yaml}"
 
+# Which function turns the redundancy score into the reweighted training pdf.
+# train.py REQUIRES it on every --aug-type=grad_corr run (there is no default, so
+# an arm is never left unnamed) and warns that it is ignored on every other arm --
+# hence conditional rather than always appended.
+DOWNWEIGHT="${DOWNWEIGHT:-soft-weighting}"
+EXTRA_ARGS=()
+if [ "${AUG_TYPE}" = "grad_corr" ]; then
+    EXTRA_ARGS+=(--corr-downweight-method="${DOWNWEIGHT}")
+fi
+
 cd /projects/PUCHALLA/LLP2024/tumor
 
 # train.py silently resumes when work_dir/last_checkpoint exists -- no --resume needed.
@@ -79,7 +89,8 @@ torchrun \
     --launcher="pytorch" \
     --no-inv-aug \
     --auto-scale-lr \
-    --descending-MA
+    --descending-MA \
+    "${EXTRA_ARGS[@]}"
 # The correlation pipeline is an --aug-type now, not a flag: to enable it here,
 # pass grad_corr as the first positional arg (or set AUG_TYPE), rather than
 # uncommenting a flag.

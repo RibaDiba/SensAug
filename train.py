@@ -29,6 +29,11 @@ from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
 from sensaug.hooks import *  # noqa:F403
 from sensaug.loops import *  # noqa:F403
+# Explicit rather than left to the star import above: this one is READ here, to
+# build the flag's `choices` from the registry so the two cannot drift. A name
+# that exists only by virtue of a star import is invisible to every linter that
+# would otherwise catch it going stale.
+from sensaug.loops.grad_corr_loop import DOWNWEIGHT_METHODS
 from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
 
 #: The arms that draw from the 32-op bank. All of them run on the GPU set, so
@@ -105,6 +110,54 @@ def resolve_interval(cli_value, key, default):
         return cli_value
     configured = SCHEDULE.get(key)
     return default if configured is None else configured
+
+
+def warn_ignored_downweight_method(args):
+    """Warn when `--corr-downweight-method` was supplied but nothing will read it.
+
+    The method is consumed by `GradCorrValLoop` and by nothing else, so on any arm
+    that does not build one the flag is inert. Silently inert is the failure this
+    warns about: the launch command reads as if a redundancy arm were configured,
+    the run trains as the baseline, and the difference surfaces only as a result
+    that inexplicably matches the control.
+
+    Never raises. A flag that has no effect is not a reason to refuse to train --
+    the run is still a perfectly good run of whatever `--aug-type` actually says.
+
+    Called from `train()` AFTER Runner.from_cfg, not from `build_config`, and that
+    ordering is the point: `print_log(logger="current")` only reaches the run's
+    `{work_dir}/<timestamp>/<timestamp>.log` once the runner's logger exists.
+    Warning earlier would put it in stdout alone, i.e. in the SLURM .out file that
+    nobody reads six weeks later while trying to work out what an experiment was.
+    """
+    if args.corr_downweight_method is None:
+        return
+
+    if args.aug_type != "grad_corr":
+        why = (
+            f"--aug-type={args.aug_type} builds no correlation pipeline, so nothing "
+            f"publishes a redundancy score and there is no GradCorrValLoop to apply "
+            f"one. Use --aug-type=grad_corr to enable it."
+        )
+    elif args.no_corr_sa:
+        # Mandatory on every grad_corr run, including this one -- so unlike the
+        # branch above, this fires on a correctly-formed command. It is still worth
+        # saying: --no-corr-sa is the control arm, it builds mmengine's stock
+        # ValLoop, and R is measured there but never fed back into training.
+        why = (
+            "--no-corr-sa disables the sensitivity-analysis loop, so the stock "
+            "ValLoop is built instead of GradCorrValLoop. The correlation matrix is "
+            "still measured; it just does not reweight anything on this arm."
+        )
+    else:
+        return
+
+    print_log(
+        f"[downweight] --corr-downweight-method="
+        f"{args.corr_downweight_method} is set but will NOT be applied: {why}",
+        logger="current",
+        level=logging.WARNING,
+    )
 
 
 def natural_keys(text):
@@ -457,6 +510,11 @@ def build_config(args):
         if args.aug_type == "grad_corr":
             cfg.val_cfg.corr_lambda = args.corr_lambda
             cfg.val_cfg.corr_lambda_ramp = args.corr_lambda_ramp
+            # No `or "exp"` fallback: the CLI gate below makes this non-None on
+            # every grad_corr run, and GradCorrValLoop rejects None outright. An
+            # implicit default here would be a silent arm -- unrecoverable from the
+            # checkpoint, the logs or the work_dir name after the fact.
+            cfg.val_cfg.corr_downweight_method = args.corr_downweight_method
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio
@@ -549,6 +607,11 @@ def train(args):
     set_manual_seed(0)  # set seed
     runner.val_loop  # initialize val loop
     runner.test_loop
+
+    # After the runner exists so it lands in the run's own log file, and after
+    # val_loop so a bad method name has already failed hard rather than being
+    # reported as merely ignored.
+    warn_ignored_downweight_method(args)
 
     # Install the initial uniform training policy for the GPU arms.
     #
@@ -765,6 +828,24 @@ if __name__ == "__main__":
         "--aug-type=grad_corr.",
     )
     parser.add_argument(
+        "--corr-downweight-method",
+        type=str,
+        default=None,
+        choices=sorted(DOWNWEIGHT_METHODS),
+        help="which function turns the redundancy score into the reweighted "
+        "training pdf. 'none' leaves the pdf exactly as the SA loop generated it "
+        "-- R is still measured and logged, just not fed back. 'soft-weighting' "
+        "is the max-entropy tilt q(a) ~ pdf(a)*exp(-lambda*red(a)), soft by "
+        "construction: an op is pushed down but structurally cannot reach zero. "
+        "This is the third axis of the correlation pipeline -- --corr-red-mode "
+        "picks how a row of R reduces to one score per op, --corr-lambda picks "
+        "how hard that score pushes, and this picks the form of the push. "
+        "REQUIRED with --aug-type=grad_corr -- there is deliberately no default, "
+        "so every correlation run names its arm in its own launch command. "
+        "Ignored (with a warning) on every other --aug-type. New methods are "
+        "added to DOWNWEIGHT_METHODS in sensaug/loops/grad_corr_loop.py.",
+    )
+    parser.add_argument(
         "--corr-red-mode",
         type=str,
         default="squared",
@@ -832,6 +913,22 @@ if __name__ == "__main__":
     parser.add_argument("--local_rank", "--local-rank", type=int, default=0)
 
     args = parser.parse_args()
+
+    # A grad_corr run must name its down-weighting arm. Enforced at argparse time
+    # rather than in build_config so it costs nothing: usage + exit 2, before any
+    # config is built, any checkpoint is loaded or any work_dir is created.
+    #
+    # Applies to --no-corr-sa too, even though that arm builds no GradCorrValLoop
+    # and will not read the value (warn_ignored_downweight_method says so at
+    # startup). One rule for every grad_corr invocation is easier to hold than
+    # "required except when", and it keeps every arm's command self-describing.
+    if args.aug_type == "grad_corr" and args.corr_downweight_method is None:
+        parser.error(
+            "--aug-type=grad_corr requires --corr-downweight-method "
+            f"(one of {sorted(DOWNWEIGHT_METHODS)}). It has no default: the "
+            "down-weighting arm is not recoverable from the checkpoint or the "
+            "logs afterwards, so it has to be stated up front."
+        )
 
     if args.exp_name is None:
         args.exp_name = f"ours_{args.backbone}_{args.dataset}"
