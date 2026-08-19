@@ -124,6 +124,7 @@ python train.py \
 | `--corr-interval` | int (iters) | the **correlation pipeline's clock**. Only meaningful under `--aug-type=grad_corr`. Default `max_iters // 4`. Overrides `schedule.corr_interval` |
 | `--corr-lambda` | float | redundancy down-weighting strength (**Lever 3**). `0` (default) leaves the pdf bit-identical — the control arm. See below |
 | `--corr-red-mode` | `squared`, `abs`, `signed` | how a row of R reduces to one score per op. `squared` default |
+| `--corr-downweight-method` | `none`, `soft-weighting` | which function turns `red(a)` into the reweighted pdf. `none` = pdf used as generated (R still measured and logged, just not fed back); `soft-weighting` = the max-entropy tilt. **Required** on every `--aug-type=grad_corr` run (no default — an arm is never left unnamed); a WARNING and otherwise inert on every other arm, `--no-corr-sa` included. See [Adding a down-weighting method](#adding-a-down-weighting-method) |
 | `--corr-lambda-ramp` | `linear`, `constant` | ramp λ from 0 over training (default) vs. full strength from the first R emission |
 | `--corr-keep-within-op` | flag | keep the `lighter_X`/`darker_X` and `_pos`/`_neg` cells in `red(a)`; excluded by default |
 | `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is hardcoded to every 6th round in `sensaug/loops/sensaug_loop.py` |
@@ -203,6 +204,18 @@ standardized row sum of R. Lives in `sensaug/redundancy.py` (pure numpy, no mmse
   `python scripts/calibrate_lambda.py` (offline, no GPU).
 - **λ=0 is bit-identical**, not merely close — it short-circuits. That is what makes
   it usable as the control arm.
+- **The functional form is pluggable, and must be named.** `DOWNWEIGHT_METHODS` in
+  `sensaug/loops/grad_corr_loop.py` maps `--corr-downweight-method` to the function
+  that turns the published score into the pdf. Two arms today: `none` (pdf used as
+  generated) and `soft-weighting` (the max-entropy tilt above, a thin adapter over
+  `redundancy.reweight` so `scripts/calibrate_lambda.py` can still sweep λ offline
+  against it). Adding a third is a function plus a dict line — see
+  [Adding a down-weighting method](#adding-a-down-weighting-method).
+- **`none` and `--corr-lambda=0` reach the same place by different routes.** `none`
+  is the *named* no-down-weighting arm — it ignores λ entirely and says so in the
+  log every round. λ=0 is the *numeric* one, and short-circuits inside
+  `redundancy.reweight` before any method runs. Either is a valid control; `none` is
+  the one that shows up in the launch command.
 - **`("none", 0)` is held fixed.** Only the perturbation mass is redistributed, so
   Lever 3 changes *which* augmentation is sampled, never *how often* augmentation
   happens.
@@ -212,6 +225,55 @@ standardized row sum of R. Lives in `sensaug/redundancy.py` (pure numpy, no mmse
   `red(a)` has near-zero variance.
 - Down-weighting is soft and structurally cannot reach zero. At the correlation sizes
   actually observed (mean |r| 0.11–0.22) deletion would not be justified.
+
+### Adding a down-weighting method
+
+The point of `--corr-downweight-method` is that the list grows. Two steps:
+
+**Step 1** — write the function in `sensaug/loops/grad_corr_loop.py`, next to the
+others:
+
+```python
+def _downweight_my_method(pdf_dict: dict, published: dict, lam: float):
+    """One line on what it does, and why it is a different modelling claim."""
+    ...
+    return ReweightResult(new_pdf, applied=True, reason=None, spread=...)
+```
+
+**Step 2** — add one line to `DOWNWEIGHT_METHODS` in the same file:
+
+```python
+DOWNWEIGHT_METHODS = {
+    "none": _downweight_none,
+    "soft-weighting": _downweight_soft_weighting,
+    "my-method": _downweight_my_method,
+}
+```
+
+That is all. `train.py` builds the flag's `choices` from these keys, the CLI gate and
+`resolve_downweight_method`'s error message list them, and the parametrized contract
+tests in `tests/test_downweight_methods.py` pick the new arm up automatically.
+
+**What a method can rely on**, so a new one doesn't re-derive it:
+
+| | |
+|---|---|
+| `pdf_dict` | `(op, level) -> prob`, summing to 1, straight from whichever of the three pdf generators ran |
+| `published` | the **whole** `runner.corr_redundancy` record, not just its `red` field — so a method built on the structure of R rather than on the row sums needs no signature change |
+| `lam` | already ramped by `--corr-lambda-ramp`; never 0 (the caller short-circuits), so no method re-implements either |
+| return | `redundancy.ReweightResult` — the applied/reason/spread logging in `_apply_redundancy_reweighting` is written against it |
+
+**Two rules that are not optional:**
+
+- **Hold `("none", 0)` fixed.** Reweighting it would let the method change how *often*
+  augmentation happens, which is a different intervention from changing *which*
+  augmentation happens, and the two would be inseparable in the results.
+- **Decline, never raise.** The call happens mid-training on every rank. A method that
+  cannot act returns `applied=False` with a `reason`; the loop logs it. Raising kills
+  the job at round 4.
+
+Both are enforced by the parametrized tests, so a method that breaks them fails
+immediately rather than at analysis time.
 
 ### DDP correctness: R must be built on every rank, not just rank 0
 
