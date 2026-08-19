@@ -1,0 +1,15 @@
+# Keep the build context small and out of the image.
+.git
+.gitignore
+.claude
+data
+experiments
+pretrained_checkpoints
+logs
+logs/*
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info
+tb_logs.tar.gz
