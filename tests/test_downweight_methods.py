@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sensaug.loops.grad_corr_loop import (
     DOWNWEIGHT_METHODS,
+    HARD_PRUNING_METHODS,
     resolve_downweight_method,
 )
 from sensaug.redundancy import NONE_KEY, compute_red, reweight
@@ -64,12 +65,14 @@ def _pdf(levels=(0.2, 0.5, 0.8)):
     return pdf
 
 
-def _published(seed=0):
+def _published(seed=0, r=None):
     """What PerturbationSensitivityAnalysisHookWithGradients.prune_augmentations
     puts on `runner.corr_redundancy`. Methods are handed this record whole, not
     just its "red" field, so one built on the structure of R rather than on a
-    per-op summary can be added without changing the contract."""
-    score = compute_red(_random_r(seed), NAMES)
+    per-op summary can be added without changing the contract -- which is exactly
+    what "r"/"names"/"mask_within_op" below are for, and what 'mRMR' reads."""
+    r = _random_r(seed) if r is None else np.asarray(r, dtype=np.float64)
+    score = compute_red(r, NAMES)
     return {
         "iter": 8000,
         "checkpoint": 0.4,
@@ -78,7 +81,17 @@ def _published(seed=0):
         "red": score.as_dict(),
         "raw": {n: float(v) for n, v in zip(score.names, score.raw)},
         "dropped": score.dropped,
+        "names": list(NAMES),
+        "mask_within_op": True,
+        "r": r,
+        "survives": None,
     }
+
+
+def _ops_with_mass(pdf):
+    """The op names still reachable by sampling. Hard pruning is only visible at
+    this granularity -- an op is removed by zeroing all of its levels at once."""
+    return {op for (op, _level), p in pdf.items() if p > 0}
 
 
 # --- the registry -------------------------------------------------------------
@@ -182,6 +195,167 @@ def test_soft_weighting_actually_moves_the_pdf():
     assert result.spread > 1.0
 
 
+# --- the 'mRMR' arm -----------------------------------------------------------
+
+
+def _shaped_pdf(shape=(0.2, 0.5, 0.3)):
+    """A pdf with a non-flat shape over an op's magnitude levels.
+
+    generate_pdf_new gives an op's levels a beta-binomial shape, and the flat
+    `_pdf` above cannot tell "the shape was preserved" from "the shape was
+    flattened by the reweighting"."""
+    n = len(NAMES)
+    none_mass = 1.0 / (n + 1)
+    pdf = {
+        (name, level): (1.0 - none_mass) * w / n
+        for name in NAMES
+        for level, w in zip((0.2, 0.5, 0.8), shape)
+    }
+    pdf[NONE_KEY] = none_mass
+    return pdf
+
+
+def _r_with_redundant(ops, rho=0.9):
+    """R in which `ops` correlate strongly with everything and nothing else
+    correlates with anything. The ranking has exactly one defensible answer."""
+    r = np.zeros((len(NAMES), len(NAMES)))
+    for op in ops:
+        i = NAMES.index(op)
+        r[i, :] = rho
+        r[:, i] = rho
+    np.fill_diagonal(r, 1.0)
+    return r
+
+
+def test_mrmr_drives_pruned_ops_to_exactly_zero():
+    """The point of the arm. Not "very small" -- 0.0, so the op is unreachable by
+    sampling rather than merely rare."""
+    result = DOWNWEIGHT_METHODS["mRMR"](_pdf(), _published(), 1.0)
+
+    assert result.applied
+    zeroed = [k for k, v in result.pdf.items() if v == 0.0]
+    assert zeroed, "mRMR at lambda=1 must remove something"
+    assert NONE_KEY not in zeroed
+
+
+def test_mrmr_prunes_whole_ops_not_individual_levels():
+    """Redundancy is a property of the op, so every magnitude level of a pruned op
+    goes at once. A partially-pruned op would be a magnitude decision wearing a
+    redundancy decision's name."""
+    pdf = _pdf()
+    result = DOWNWEIGHT_METHODS["mRMR"](pdf, _published(), 1.0)
+
+    by_op = {}
+    for (op, _level), p in result.pdf.items():
+        by_op.setdefault(op, []).append(p)
+    for op, probs in by_op.items():
+        assert all(p > 0 for p in probs) or all(p == 0.0 for p in probs), (
+            f"{op} was pruned at only some of its levels: {probs}"
+        )
+
+
+def test_mrmr_preserves_the_level_shape_of_a_surviving_op():
+    """Only the mass allotted BETWEEN ops moves. A survivor's levels keep their
+    relative weights exactly, the same invariant redundancy.reweight holds."""
+    pdf = _shaped_pdf()
+    result = DOWNWEIGHT_METHODS["mRMR"](pdf, _published(), 1.0)
+
+    survivor = next(iter(_ops_with_mass(result.pdf) - {"none"}))
+    before = [pdf[(survivor, level)] for level in (0.2, 0.5, 0.8)]
+    after = [result.pdf[(survivor, level)] for level in (0.2, 0.5, 0.8)]
+    scale = after[0] / before[0]
+    assert after == pytest.approx([b * scale for b in before])
+    assert scale > 1.0, "the pruned mass has to go somewhere"
+
+
+def test_mrmr_prunes_the_ops_that_are_redundant_with_everything():
+    """The ranking is not just "some ops got removed": with a flat relevance term
+    and an R where only blur/noise correlate with anything, minimum-redundancy
+    selection has one right answer."""
+    published = _published(r=_r_with_redundant(["blur", "noise"]))
+    result = DOWNWEIGHT_METHODS["mRMR"](_pdf(), published, 1.0)
+
+    assert result.applied
+    survivors = _ops_with_mass(result.pdf)
+    assert "blur" not in survivors
+    assert "noise" not in survivors
+
+
+@pytest.mark.parametrize("lam", [0.25, 0.5, 1.0, 2.0])
+def test_mrmr_keeps_fewer_ops_as_lambda_grows(lam):
+    """lambda still reads as "how hard redundancy pushes"; on this arm it pushes
+    ops out of the bank. ceil(A/(1+lambda)) of the A measured ops survive."""
+    result = DOWNWEIGHT_METHODS["mRMR"](_pdf(), _published(), lam)
+    expected = int(np.ceil(len(NAMES) / (1.0 + lam)))
+
+    assert len(_ops_with_mass(result.pdf) - {"none"}) == expected
+
+
+def test_mrmr_budget_is_monotone_in_lambda():
+    counts = [
+        len(_ops_with_mass(DOWNWEIGHT_METHODS["mRMR"](_pdf(), _published(), lam).pdf))
+        for lam in (0.25, 0.5, 1.0, 2.0)
+    ]
+    assert counts == sorted(counts, reverse=True)
+    assert counts[0] > counts[-1]
+
+
+def test_mrmr_declines_when_only_the_row_sums_were_published():
+    """It ranks ops against each other, so the per-op summary is not enough. A
+    record from before "r" was published has to decline, not silently rank on
+    something else."""
+    published = _published()
+    del published["r"]
+
+    result = DOWNWEIGHT_METHODS["mRMR"](_pdf(), published, 0.5)
+
+    assert not result.applied
+    assert "pairwise" in result.reason
+    assert result.pdf == _pdf()
+
+
+def test_mrmr_never_prunes_an_op_with_no_usable_row_in_r():
+    """Absence of evidence buys immunity. Deleting an augmentation on the strength
+    of a measurement that does not exist is the one failure here that cannot be
+    argued for, so an op R dropped upstream survives however hard lambda pushes."""
+    r = _random_r()
+    dropped = NAMES.index("noise")
+    r[dropped, :] = np.nan
+    r[:, dropped] = np.nan
+
+    result = DOWNWEIGHT_METHODS["mRMR"](_pdf(), _published(r=r), 3.0)
+
+    assert result.applied
+    assert "noise" in _ops_with_mass(result.pdf)
+
+
+def test_mrmr_is_deterministic():
+    """Every rank runs this independently off an identical published record (see
+    the DDP note in CLAUDE.md), so a ranking that broke ties non-deterministically
+    would give each rank a different augmentation bank and nothing would say so."""
+    published = _published()
+    first = DOWNWEIGHT_METHODS["mRMR"](_pdf(), published, 1.0)
+    second = DOWNWEIGHT_METHODS["mRMR"](_pdf(), published, 1.0)
+
+    assert first.pdf == second.pdf
+
+
+def test_mrmr_survives_the_json_round_trip():
+    """`corr_redundancy_log.txt` and any offline consumer read R back with every
+    non-finite cell already turned into `None` by _jsonable, which numpy refuses to
+    coerce. Tolerated on the way in rather than crashing a live round."""
+    r = _random_r()
+    r[0, 1] = r[1, 0] = np.nan
+    published = _published(r=r)
+    published["r"] = [
+        [None if not np.isfinite(v) else float(v) for v in row] for row in r
+    ]
+
+    result = DOWNWEIGHT_METHODS["mRMR"](_pdf(), published, 1.0)
+
+    assert result.applied
+
+
 # --- contract shared by every method -----------------------------------------
 
 
@@ -197,14 +371,28 @@ def test_every_method_preserves_normalisation_and_the_none_mass(name):
     assert set(result.pdf) == set(pdf)
 
 
-@pytest.mark.parametrize("name", sorted(DOWNWEIGHT_METHODS))
-def test_every_method_is_soft_never_zero(name):
-    """Down-weighting is soft by construction. An entry driven to exactly 0 would
-    be deletion, which the correlation sizes actually observed here (mean |r| of
-    0.11-0.22) do not justify."""
+@pytest.mark.parametrize(
+    "name", sorted(set(DOWNWEIGHT_METHODS) - set(HARD_PRUNING_METHODS))
+)
+def test_every_soft_method_is_soft_never_zero(name):
+    """Down-weighting is soft by construction unless a method opts out.
+
+    Driving an entry to exactly 0 is deletion, and the correlation sizes actually
+    observed here (mean |r| of 0.11-0.22) do not imply it -- so a method that
+    deletes has to say so by joining HARD_PRUNING_METHODS, and everything else is
+    held to softness automatically the moment it is registered. The opt-out is
+    deliberately a line someone writes rather than a test someone forgets."""
     result = DOWNWEIGHT_METHODS[name](_pdf(), _published(), 1.0)
 
     assert all(v > 0 for v in result.pdf.values())
+
+
+@pytest.mark.parametrize("name", sorted(HARD_PRUNING_METHODS))
+def test_hard_pruning_methods_are_registered(name):
+    """The opt-out set names methods, not aspirations. A stale entry here would
+    silently exempt nothing from the softness contract while looking like it
+    exempted something."""
+    assert name in DOWNWEIGHT_METHODS
 
 
 @pytest.mark.parametrize("name", sorted(DOWNWEIGHT_METHODS))

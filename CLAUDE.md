@@ -122,9 +122,9 @@ python train.py \
 | `--resume` | flag | auto-resume from last checkpoint in work_dir |
 | `--round_interval` | int (iters) | the **SA pipeline's clock**. Default `max_iters // 20`. Overrides `schedule.round_interval` |
 | `--corr-interval` | int (iters) | the **correlation pipeline's clock**. Only meaningful under `--aug-type=grad_corr`. Default `max_iters // 4`. Overrides `schedule.corr_interval` |
-| `--corr-lambda` | float | redundancy down-weighting strength (**Lever 3**). `0` (default) leaves the pdf bit-identical — the control arm. See below |
-| `--corr-red-mode` | `squared`, `abs`, `signed` | how a row of R reduces to one score per op. `squared` default |
-| `--corr-downweight-method` | `none`, `soft-weighting` | which function turns `red(a)` into the reweighted pdf. `none` = pdf used as generated (R still measured and logged, just not fed back); `soft-weighting` = the max-entropy tilt. **Required** on every `--aug-type=grad_corr` run (no default — an arm is never left unnamed); a WARNING and otherwise inert on every other arm, `--no-corr-sa` included. See [Adding a down-weighting method](#adding-a-down-weighting-method) |
+| `--corr-lambda` | float | redundancy down-weighting strength (**Lever 3**). `0` (default) leaves the pdf bit-identical — the control arm. Under `soft-weighting` it is the tilt strength; under `mRMR` it is the prune budget (`ceil(A/(1+λ))` ops survive). See below |
+| `--corr-red-mode` | `squared`, `abs`, `signed` | how R reduces to a redundancy quantity. `squared` default. `soft-weighting` reduces a whole row to one score per op; `mRMR` applies the same reduction cell-by-cell and keeps it pairwise |
+| `--corr-downweight-method` | `none`, `soft-weighting`, `mRMR` | which function turns R into the reweighted pdf. `none` = pdf used as generated (R still measured and logged, just not fed back); `soft-weighting` = the max-entropy tilt; `mRMR` = **hard pruning** — rank the ops by minimum-Redundancy Maximum-Relevance and zero everything outside the budget. **Required** on every `--aug-type=grad_corr` run (no default — an arm is never left unnamed); a WARNING and otherwise inert on every other arm, `--no-corr-sa` included. See [Adding a down-weighting method](#adding-a-down-weighting-method) |
 | `--corr-lambda-ramp` | `linear`, `constant` | ramp λ from 0 over training (default) vs. full strength from the first R emission |
 | `--corr-keep-within-op` | flag | keep the `lighter_X`/`darker_X` and `_pos`/`_neg` cells in `red(a)`; excluded by default |
 | `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is hardcoded to every 6th round in `sensaug/loops/sensaug_loop.py` |
@@ -206,10 +206,11 @@ standardized row sum of R. Lives in `sensaug/redundancy.py` (pure numpy, no mmse
   it usable as the control arm.
 - **The functional form is pluggable, and must be named.** `DOWNWEIGHT_METHODS` in
   `sensaug/loops/grad_corr_loop.py` maps `--corr-downweight-method` to the function
-  that turns the published score into the pdf. Two arms today: `none` (pdf used as
-  generated) and `soft-weighting` (the max-entropy tilt above, a thin adapter over
+  that turns the published score into the pdf. Three arms today: `none` (pdf used as
+  generated), `soft-weighting` (the max-entropy tilt above, a thin adapter over
   `redundancy.reweight` so `scripts/calibrate_lambda.py` can still sweep λ offline
-  against it). Adding a third is a function plus a dict line — see
+  against it), and `mRMR` (hard pruning — see below). Adding a fourth is a function
+  plus a dict line — see
   [Adding a down-weighting method](#adding-a-down-weighting-method).
 - **`none` and `--corr-lambda=0` reach the same place by different routes.** `none`
   is the *named* no-down-weighting arm — it ignores λ entirely and says so in the
@@ -223,8 +224,54 @@ standardized row sum of R. Lives in `sensaug/redundancy.py` (pure numpy, no mmse
   withheld when the shared-factor loading exceeds `_LOADING_ALARM` (0.9) — R is then
   ranking which *images* are hard; when no cell survives the FDR gate; and when
   `red(a)` has near-zero variance.
-- Down-weighting is soft and structurally cannot reach zero. At the correlation sizes
-  actually observed (mean |r| 0.11–0.22) deletion would not be justified.
+- **`soft-weighting` cannot reach zero, `mRMR` is built to.** exp() is strictly
+  positive, so on the tilt an op is pushed down but never deleted — which at the
+  correlation sizes actually observed (mean |r| 0.11–0.22) is the strongest claim the
+  measurement supports. `mRMR` makes the stronger claim deliberately; see below.
+
+### `mRMR`: the hard-pruning arm
+
+`--corr-downweight-method mRMR` ranks the ops by minimum-Redundancy
+Maximum-Relevance and sets everything outside the budget to probability **exactly
+zero**. Lives in `sensaug/loops/grad_corr_loop.py` (`_downweight_mrmr`), not in
+`redundancy.py` — unlike the tilt it has no offline consumer.
+
+- **The ranking is textbook greedy mRMR** and carries no λ. Seed with the most
+  relevant op, then repeatedly take the op maximising `rel(a) − red(a | S)` against
+  the already-selected set `S`. Both terms are standardized across ops, so the
+  difference is dimensionless and neither can dominate by unit choice.
+- **Relevance is the SA loop's own pdf**, summed over an op's magnitude levels —
+  already the pipeline's statement of which perturbations the model is worst at, so
+  it needs no second signal and inherits `--uniform` / `--weighted-augs`. When the pdf
+  is flat (before the SA curve exists, or a whole `--uniform` run) the ranking
+  degenerates gracefully into pure minimum-redundancy selection.
+- **Redundancy is pairwise**, off the same cells `compute_red` sums into `red(a)`,
+  under the same within-op mask, the same FDR gate and the same `--corr-red-mode`
+  reduction. The two arms differ in what they *do* with R, not in what they think R
+  says.
+- **λ is the budget**: `ceil(A/(1+λ))` of the A measured ops survive. λ=0 keeps
+  everything (continuous with the short-circuit, not discontinuous at it), 0.25 keeps
+  ~80%, 0.5 ~67%, 1.0 half, 2.0 a third. It composes with `--corr-lambda-ramp` the
+  same way, so early rounds prune little and the bank narrows as R earns it. Note
+  `scripts/calibrate_lambda.py` calibrates the **tilt's** λ, not this one.
+- **The prune is not latched.** It is re-derived from the current pdf and the current
+  R every round, so an op pruned at one round can return at the next — the
+  alternative commits the run to a decision made off the earliest, least trustworthy R.
+- **An op with no usable row in R is exempt**, never pruned. A heavily FDR-gated R
+  therefore prunes little, and logs that it did.
+- **Read it next to a `soft-weighting` run at the same λ.** Deletion is a stronger
+  claim than mean |r| 0.11–0.22 supports on its own.
+- **The geometric contamination bites harder here.** The 10 geometric ops' R is
+  dominated by image-label misalignment, which makes them look *least* redundant — so
+  mRMR preferentially keeps them and prunes photometric ops. Pair any reportable mRMR
+  run with `--photometric-only` until `warp_image_and_label` is wired into
+  `_DiffAugTransform.transform` and `CollectGradientHook._grad_for_op`.
+
+To support a pairwise method, `runner.corr_redundancy` now also carries `names`, `r`
+(the matrix), `mask_within_op` and `survives` alongside `red`/`raw`/`dropped`. `r` and
+`survives` are **excluded from `corr_redundancy_log.txt`** — both are already written
+in full to `corr_matrix_log.json` / `corr_bootstrap_log.txt` under the same `iter`,
+so join on that rather than writing an A×A block per line.
 
 ### Adding a down-weighting method
 
@@ -246,6 +293,7 @@ def _downweight_my_method(pdf_dict: dict, published: dict, lam: float):
 DOWNWEIGHT_METHODS = {
     "none": _downweight_none,
     "soft-weighting": _downweight_soft_weighting,
+    "mRMR": _downweight_mrmr,
     "my-method": _downweight_my_method,
 }
 ```
@@ -259,11 +307,11 @@ tests in `tests/test_downweight_methods.py` pick the new arm up automatically.
 | | |
 |---|---|
 | `pdf_dict` | `(op, level) -> prob`, summing to 1, straight from whichever of the three pdf generators ran |
-| `published` | the **whole** `runner.corr_redundancy` record, not just its `red` field — so a method built on the structure of R rather than on the row sums needs no signature change |
+| `published` | the **whole** `runner.corr_redundancy` record, not just its `red` field — `names`, `r`, `survives`, `mask_within_op`, `mode`, `raw`, `dropped`, `iter`, `checkpoint` are all there, so a method built on the structure of R (as `mRMR` is) needs no signature change |
 | `lam` | already ramped by `--corr-lambda-ramp`; never 0 (the caller short-circuits), so no method re-implements either |
 | return | `redundancy.ReweightResult` — the applied/reason/spread logging in `_apply_redundancy_reweighting` is written against it |
 
-**Two rules that are not optional:**
+**Three rules that are not optional:**
 
 - **Hold `("none", 0)` fixed.** Reweighting it would let the method change how *often*
   augmentation happens, which is a different intervention from changing *which*
@@ -271,8 +319,12 @@ tests in `tests/test_downweight_methods.py` pick the new arm up automatically.
 - **Decline, never raise.** The call happens mid-training on every rank. A method that
   cannot act returns `applied=False` with a `reason`; the loop logs it. Raising kills
   the job at round 4.
+- **Be soft, or say you aren't.** A method may not drive an entry to exactly 0 unless
+  its name is in `HARD_PRUNING_METHODS` (same file). Deletion is a stronger claim than
+  the observed correlation sizes support, so it costs a line someone has to write on
+  purpose rather than happening by accident.
 
-Both are enforced by the parametrized tests, so a method that breaks them fails
+All three are enforced by the parametrized tests, so a method that breaks them fails
 immediately rather than at analysis time.
 
 ### DDP correctness: R must be built on every rank, not just rank 0

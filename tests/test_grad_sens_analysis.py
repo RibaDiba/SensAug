@@ -583,6 +583,42 @@ def test_an_emission_publishes_a_redundancy_score(tmp_path):
     assert all(np.isfinite(v) for v in published["red"].values())
 
 
+def test_the_emission_publishes_r_itself_not_just_the_row_sums(tmp_path):
+    """A PAIRWISE down-weighting method -- mRMR ranks ops against each other --
+    cannot reconstruct R from the per-op row sums, so the matrix travels with the
+    score. `names` is the axis order of both `r` and `survives`, and `mode` /
+    `mask_within_op` say how compute_red read them, so a pairwise method can honour
+    --corr-red-mode and --corr-keep-within-op instead of quietly disagreeing with
+    red(a) about what R says."""
+    published = _emit_once(tmp_path, _redundancy_hook(tmp_path)).corr_redundancy
+
+    assert published["names"] == NAMES
+    assert published["mask_within_op"] is True
+    r = np.asarray(published["r"], dtype=float)
+    assert r.shape == (N_OPS, N_OPS)
+    assert np.isfinite(r).any()
+    # Symmetric with a unit diagonal wherever it is defined at all -- i.e. it is R,
+    # not the standardized score reshaped.
+    finite = np.isfinite(r)
+    assert np.allclose(r[finite], r.T[finite])
+
+
+def test_r_is_kept_out_of_the_redundancy_jsonl(tmp_path):
+    """corr_matrix_log.json already holds R in full under the same `iter`, so
+    writing it again here would turn one line per emission into an AxA block and
+    buy nothing. The runner record carries it; the log joins on `iter`."""
+    _emit_once(tmp_path, _redundancy_hook(tmp_path))
+
+    record = json.loads(
+        (tmp_path / "corr_redundancy_log.txt").read_text().strip().split("\n")[0]
+    )
+
+    assert "r" not in record and "survives" not in record
+    # ...but the small structural fields a reader needs to interpret it do stay.
+    assert record["names"] == NAMES
+    assert record["mask_within_op"] is True
+
+
 def test_the_published_score_is_standardized(tmp_path):
     """What makes one lambda portable across runs and checkpoints. If the raw row
     sums were published instead, a lambda tuned on one checkpoint would mean

@@ -1001,6 +1001,22 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             "red": score.as_dict(),
             "raw": {n: float(v) for n, v in zip(score.names, score.raw)},
             "dropped": score.dropped,
+            # R itself, plus the two masks that were applied to it. A down-weighting
+            # method built on a per-op SUMMARY of R needs only "red" above, but a
+            # PAIRWISE one -- mRMR, clustering, an eigenvector projection -- needs
+            # the matrix, and cannot reconstruct it from the row sums. The record is
+            # handed to those methods whole (see DOWNWEIGHT_METHODS in
+            # sensaug/loops/grad_corr_loop.py), so carrying the structure here is
+            # what lets a new arm be a function rather than a signature change.
+            #
+            # `names` is the axis order of BOTH `r` and `survives`; `mode` and
+            # `mask_within_op` say how compute_red read them, so a pairwise method
+            # can honour --corr-red-mode and --corr-keep-within-op identically
+            # instead of quietly disagreeing with red(a) about what R says.
+            "names": list(self.names),
+            "mask_within_op": bool(self.mask_within_op),
+            "r": np.asarray(r, dtype=np.float64),
+            "survives": survives,
         }
 
         print_log(f"[grad-corr] {summarise(score)}", logger="current")
@@ -1015,5 +1031,16 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         # JSONL append, matching corr_bootstrap_log.txt: one record per emission,
         # so the score is recomputable offline and a resume does not rewrite
         # history.
+        #
+        # `r` and `survives` are dropped on the way out. They exist on the runner
+        # record for the pairwise down-weighting methods, but both are already
+        # written in full to corr_matrix_log.json / corr_bootstrap_log.txt under the
+        # same `iter`, so writing them a third time would turn this file's one line
+        # per emission into an AxA block and buy nothing: join on `iter` instead.
         with open(self.redundancy_log_path, "a") as f:
-            f.write(json.dumps(_jsonable(runner.corr_redundancy)) + "\n")
+            logged = {
+                k: v
+                for k, v in runner.corr_redundancy.items()
+                if k not in ("r", "survives")
+            }
+            f.write(json.dumps(_jsonable(logged)) + "\n")
