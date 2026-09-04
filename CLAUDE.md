@@ -120,27 +120,112 @@ python train.py \
 | `--no-warmup` | flag | skip clean-training warmup rounds |
 | `--no-corr-sa` | flag | under `--aug-type=grad_corr`, disable the SA loop — trains exactly like `none` while still running the correlation measurement. This is the control arm |
 | `--resume` | flag | auto-resume from last checkpoint in work_dir |
-| `--round_interval` | int (iters) | the **SA pipeline's clock**. Default `max_iters // 20`. Overrides `schedule.round_interval` |
-| `--corr-interval` | int (iters) | the **correlation pipeline's clock**. Only meaningful under `--aug-type=grad_corr`. Default `max_iters // 4`. Overrides `schedule.corr_interval` |
+| `--rounds-config` | path | the **val-round grid**: how many rounds a run has, how many are warmup, and which of them the correlation pipeline fires on. Default `configs/rounds.yaml`. Cluster-independent on purpose — see [The round schedule](#the-round-schedule) |
+| `--round_interval` | int (iters) | the **SA pipeline's clock**. Default `max_iters // n_rounds` from `rounds.yaml` (20 → `max_iters // 20`). Overrides `schedule.round_interval` |
+| `--corr-interval` | int (iters) | put the correlation pipeline on a **fixed clock of its own** instead of the round-aligned default. Only meaningful under `--aug-type=grad_corr`. Overrides `schedule.corr_interval`. No default any more — unset means the round schedule |
+| `--corr-sync-sa` | flag | fire the correlation pipeline on **every** SA round rather than the round-aligned subset. ~5× the sweeps at the default geometry. Takes precedence over `--corr-interval` |
 | `--corr-lambda` | float | redundancy down-weighting strength (**Lever 3**). `0` (default) leaves the pdf bit-identical — the control arm. Under `soft-weighting` it is the tilt strength; under `mRMR` it is the prune budget (`ceil(A/(1+λ))` ops survive). See below |
 | `--corr-red-mode` | `squared`, `abs`, `signed` | how R reduces to a redundancy quantity. `squared` default. `soft-weighting` reduces a whole row to one score per op; `mRMR` applies the same reduction cell-by-cell and keeps it pairwise |
 | `--corr-downweight-method` | `none`, `soft-weighting`, `mRMR` | which function turns R into the reweighted pdf. `none` = pdf used as generated (R still measured and logged, just not fed back); `soft-weighting` = the max-entropy tilt; `mRMR` = **hard pruning** — rank the ops by minimum-Redundancy Maximum-Relevance and zero everything outside the budget. **Required** on every `--aug-type=grad_corr` run (no default — an arm is never left unnamed); a WARNING and otherwise inert on every other arm, `--no-corr-sa` included. See [Adding a down-weighting method](#adding-a-down-weighting-method) |
 | `--corr-lambda-ramp` | `linear`, `constant` | ramp λ from 0 over training (default) vs. full strength from the first R emission |
 | `--corr-keep-within-op` | flag | keep the `lighter_X`/`darker_X` and `_pos`/`_neg` cells in `red(a)`; excluded by default |
-| `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is hardcoded to every 6th round in `sensaug/loops/sensaug_loop.py` |
+| `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is every `SA_CURVE_CADENCE`-th round (6), defined in `sensaug/round_schedule.py` and applied in `sensaug/loops/sensaug_loop.py` |
 
-## The two pipelines (and their two clocks)
+## The two pipelines
 
-Training runs two independent measurements. They share no clock and no hook point — do not couple them.
+Training runs two independent measurements. They share no hook point and no code path — do not couple them. They *are* scheduled onto the same round grid by default, which is a different thing: see [The round schedule](#the-round-schedule).
 
-| Pipeline | Question it answers | Clock | Code |
+| Pipeline | Question it answers | Fires | Code |
 |---|---|---|---|
-| Sensitivity analysis (SA) | which perturbations is the model *worst at*? (weights the training aug PDF) | `round_interval` | `sensaug/loops/sensaug_loop.py` → `RobustValLoop` |
-| Gradient cross-correlation | which perturbations are *redundant with each other*? (the matrix R) | `corr_interval` | `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
+| Sensitivity analysis (SA) | which perturbations is the model *worst at*? (weights the training aug PDF) | every `round_interval` | `sensaug/loops/sensaug_loop.py` → `RobustValLoop` |
+| Gradient cross-correlation | which perturbations are *redundant with each other*? (the matrix R) | on the rounds `configs/rounds.yaml` names (shipped default 3, 4, 7, 10, 13, 16 of 20, via `corr_cadence: 3`); `--corr-interval` for a fixed clock instead | `sensaug/round_schedule.py` → `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
 
-- **SA** runs only under `--aug-type=ours`, from the val loop. The SA *curve* is recomputed every 6th round (hardcoded), so its effective cadence is `6 × round_interval`.
+- **SA** runs only under `--aug-type=ours`, from the val loop. The SA *curve* is recomputed every 6th round (`SA_CURVE_CADENCE`), so its effective cadence is `6 × round_interval`.
 - **Which val loop runs.** `--aug-type=ours` → `RobustValLoop`; `--aug-type=grad_corr` → `GradCorrValLoop`, which subclasses it and adds exactly one thing, Lever 3's redundancy reweighting. The base declares `_apply_redundancy_reweighting` as an identity function and the subclass overrides it, so the three pdf generators and `run()` carry no `if grad_corr` branch. `--aug-type=grad_corr --no-corr-sa` builds neither — mmengine's stock `ValLoop`.
-- **Correlation** is opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag layered on top of another one (`--aug-type=none --grad-corr` is not valid; that flag doesn't exist). It fires from `after_train_iter`, freezing the model and sweeping the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per aug per image. `CollectGradientHook` (priority NORMAL) sweeps; `PerturbationSensitivityAnalysisHookWithGradients` (priority LOW) correlates the sweep it just wrote — the priority ordering is load-bearing. Both are given the same `interval`; the shared gate is `fires_at()` in `grad_hook.py`. For the unaugmented control arm — R measured against a baseline with no training augmentation, which is what the SA-on number gets compared to — pass `--aug-type=grad_corr --no-corr-sa`: that disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.
+- **Correlation** is opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag layered on top of another one (`--aug-type=none --grad-corr` is not valid; that flag doesn't exist). It fires from `after_train_iter`, freezing the model and sweeping the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per aug per image. `CollectGradientHook` (priority NORMAL) sweeps; `PerturbationSensitivityAnalysisHookWithGradients` (priority LOW) correlates the sweep it just wrote — the priority ordering is load-bearing. Both are given the same gate — an explicit `fire_iters` set by default, an `interval` under `--corr-interval` — normalized by `resolve_gate()` and applied by `fires_at()`, both in `grad_hook.py`. For the unaugmented control arm — R measured against a baseline with no training augmentation, which is what the SA-on number gets compared to — pass `--aug-type=grad_corr --no-corr-sa`: that disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.
+
+## The round schedule
+
+A **round** is one run of the val loop: every `round_interval` training iterations,
+`RobustValLoop` re-evaluates perturbation robustness and rebuilds the training pdf. The
+first `warmup_rounds` do nothing but train; the SA *curve* the pdf derives from is
+recomputed every 6th round after that. The grid is configured in
+[`configs/rounds.yaml`](configs/rounds.yaml), selected with `--rounds-config`:
+
+```yaml
+n_rounds: 20          # sets the DEFAULT round_interval (max_iters // n_rounds)
+warmup_rounds: 4      # --no-warmup forces 0
+corr_rounds: null     # null -> derived (below); or a literal list of round numbers
+control_rounds: null  # null -> derived as the firing rounds inside warmup
+corr_cadence: 3       # rounds between correlation emissions; null/6 -> SA-curve-only
+```
+
+It is deliberately **not** in `configs/della.yaml` / `configs/nexus.yaml`: the round grid
+is an experiment parameter, and a copy per cluster is a copy that drifts. The cluster
+configs keep only the two `schedule:` intervals. A run copies its `rounds.yaml` into the
+work_dir next to `seg_config.yaml`.
+
+**Where the correlation pipeline fires.** At the shipped defaults (`corr_cadence: 3`),
+rounds **3, 4, 7, 10, 13, 16** of 20:
+
+| rounds | what |
+|---|---|
+| 0–2 | nothing |
+| 3 | one **control probe** — the baseline, does *not* feed the pdf |
+| 4 | compute, **SA-curve recompute** — governs rounds 4–9 |
+| 7 | compute — refreshes `red(a)` inside the still-current 4–9 window; the curve itself doesn't move here |
+| 10 | compute, **SA-curve recompute** — governs rounds 10–15 |
+| 13 | compute — refreshes `red(a)` inside the still-current 10–15 window |
+| 16 | compute, **SA-curve recompute** — governs rounds 16–18 |
+| 19 | nothing (training's over) |
+
+Setting `corr_cadence: null` (or `6`, `SA_CURVE_CADENCE`) drops back to the sparser
+`3, 4, 10, 16` table — one emission per SA-curve recompute only, and no in-between
+refreshes.
+
+Three things make the SA-curve rounds (4, 10, 16) the load-bearing ones, and all three
+are what the old `corr_interval = max_iters // 4` clock got wrong:
+
+- **4 / 10 / 16 are the SA-curve recompute rounds.** R exists to be read by the pdf, and
+  the pdf only changes shape when the curve behind it does. Each of those emissions then
+  stays current for exactly the 6 rounds that curve governs — `corr_cadence`'s extra
+  rounds (7, 13 above) don't change that; they just publish a fresher `red(a)` from a
+  new gradient sweep partway through an already-current window.
+- **The R measured at round `r` is read by round `r`'s own pdf.** `IterBasedTrainLoop`
+  calls `after_train_iter` and only *then* `val_loop.run()`, so the sweep at iteration
+  `(r+1) × round_interval` lands one hook point before the val loop that consumes it.
+  (It therefore probes at the *previous* round's magnitudes, which is the right
+  semantics — those were in effect over the window being measured.)
+- **Round 19 never fires.** Training ends with it, so nothing could read its R. Under the
+  interval clock the final iteration always fires, which is where the fourth, unusable
+  matrix of every old `grad_corr` run came from.
+
+**The control probe (round 3)** is the last warmup round, so R there is measured on a
+model no pdf has ever touched — the baseline every later matrix is read against.
+`PerturbationSensitivityAnalysisHookWithGradients` records it in `corr_matrix_log.json`
+with `"role": "control"` and publishes *nothing* to `runner.corr_redundancy` — not even
+clearing it. Round 4's emission would overwrite it before any pdf read it anyway; the
+withholding is explicit so that "the baseline never touched training" is a property of
+the code rather than a coincidence of two hook orderings. Every other emission carries
+`"role": "active"`.
+
+The count is derived from the round grid and `corr_cadence`, never pinned: at the
+shipped `corr_cadence: 3`, `--round_interval=2000` on an 80k run gives 40 rounds and 13
+emissions (1 control + 12 active) instead of 6. The schedule always follows the round
+grid the run *really* has (`max_iters // round_interval`), not `rounds.yaml`'s
+`n_rounds`, which is only the default divisor.
+
+**Escape hatches**, in precedence order: `--corr-sync-sa` fires on every round;
+`--corr-interval N` (or `schedule.corr_interval`) restores a fixed clock independent of
+the rounds. Short of those, `corr_cadence: N` in the YAML changes how densely
+emissions land *without* unaligning them from the round grid — lower than the shipped
+`3` for more (and proportionally more expensive) sweeps, `null`/`6` to fall back to
+SA-curve-recompute-only. Setting `corr_rounds:` / `control_rounds:` in the YAML pins an
+arbitrary schedule instead (and ignores `corr_cadence`, since there's nothing left to
+derive) — validated against the grid, so a round that could never fire is an error and a
+control round outside the firing set is an error. `sensaug/round_schedule.py` holds all of
+it as pure integer math (no torch, no mmseg), tested in `tests/test_round_schedule.py`.
+
 
 ## The three augmentation vocabularies
 
@@ -194,9 +279,13 @@ standardized row sum of R. Lives in `sensaug/redundancy.py` (pure numpy, no mmse
 - **Handoff.** `PerturbationSensitivityAnalysisHookWithGradients.prune_augmentations`
   (which no longer prunes) publishes `runner.corr_redundancy` and appends to
   `corr_redundancy_log.txt`; `RobustValLoop._apply_redundancy_reweighting` reads
-  whatever is current. The hook fires on `corr_interval`, the loop on
-  `round_interval` — they never have to agree, and before the first R emission the
-  pdf is untouched.
+  whatever is current. The loop never has to agree with the hook, and before the
+  first R emission the pdf is untouched. By default the hook's schedule is aligned
+  to the rounds (see [The round schedule](#the-round-schedule)), so on a firing
+  round "whatever is current" is the matrix measured one hook point earlier — but
+  nothing in the loop assumes it, and `--corr-interval` unaligns them again without
+  changing a line of it. The round-3 control probe publishes nothing, so the first
+  score the loop can ever see comes from round 4.
 - **λ is portable because `red(a)` is standardized.** Verified against all four
   logged `corr_matrix_log.json` files (10 checkpoints, both A=14 and A=32):
   λ=0.1 → 1.4–1.6×, **λ=0.25 → 2.3–3.1×**, λ=0.5 → 5.2–9.7×, λ=1.0 → 27–94×.
@@ -363,7 +452,7 @@ Diagnosed from `experiments/grad_corr_grad_corr_2_pspnet_cityscapes_4gpu_gradcor
 
 ## Cluster config: `configs/della.yaml`
 
-Parsed by `sensaug/cluster_config.py`. Controls all paths **and both pipeline schedules**.
+Parsed by `sensaug/cluster_config.py`. Controls all paths **and the two pipelines' iteration intervals**. The *round grid* is not here — it lives in `configs/rounds.yaml`, see [The round schedule](#the-round-schedule).
 
 ```yaml
 data_root: /projects/PUCHALLA/LLP2024/tumor/data
@@ -371,8 +460,11 @@ mmconfig_path: /projects/PUCHALLA/LLP2024/tumor/sensaug/custom_configs/mmseg
 primary_metric: mIoU
 
 schedule:                       # both in ITERATIONS; null → default
-  round_interval: null          # SA pipeline's clock.          null → max_iters // 20
-  corr_interval: null           # correlation pipeline's clock. null → max_iters // 4
+  round_interval: null          # SA pipeline's clock. null → max_iters // n_rounds
+                                #   (n_rounds from configs/rounds.yaml, i.e. // 20)
+  corr_interval: null           # null → the correlation pipeline uses the ROUND
+                                #   SCHEDULE, not a fixed interval. Set a number
+                                #   only to opt back out onto a clock of its own.
 
 datasets:
   cityscapes: cityscapes        # key → subfolder under data_root
@@ -417,6 +509,17 @@ datasets:
   DATASETNAME: path/relative/to/data_root
 ```
 
+On Nexus, seven of the datasets in `configs/nexus.yaml` are installed rather than
+hand-prepared: `scripts/prepare_datasets.py` resolves the target directory from the
+same `DATA_ROOT_LOOKUP` `train.py` uses, runs the vendored converters under
+`sensaug/custom_configs/dataset_converters/` (pinned to mmsegmentation v1.2.2), and is
+idempotent. `--check` reports install status without downloading; `--all` covers every
+key. `pascal_voc12` and `loveda` are public and fully scripted; `potsdam`, `synapse`,
+`acdc`, `idd`, and `a2i2haze` need a manual, logged-in download first — running with
+no `--src` prints the exact registration URL and steps.
+See the [README](README.md#setting-up-supported-datasets) for the full per-dataset table, or
+`sbatch job_scripts/prepare_datasets.sbatch` to run it as a job.
+
 ## Key files
 
 | File | Purpose |
@@ -432,6 +535,8 @@ datasets:
 | `sensaug/hooks/grad_hook.py` | `CollectGradientHook` — the frozen-frame per-image gradient sweep, and the shared `fires_at()` clock |
 | `sensaug/hooks/grad_sens_analysis.py` | `PerturbationSensitivityAnalysisHookWithGradients` — builds the cross-correlation matrix R from the sweep, and publishes `red(a)` |
 | `sensaug/redundancy.py` | `compute_red` / `reweight` — Lever 3's mechanism. Pure numpy, no mmseg |
+| `sensaug/round_schedule.py` | the val-round grid and the correlation pipeline's firing schedule — parses `configs/rounds.yaml`. Pure integers, no torch/mmseg |
+| `configs/rounds.yaml` | the round grid itself: `n_rounds`, `warmup_rounds`, and which rounds R is measured on |
 | `scripts/calibrate_lambda.py` | offline λ sweep against logged `corr_matrix_log.json` files |
 | `scripts/compute_grad_corr.py` | recompute R for an already-trained checkpoint without retraining — drives the grad_corr hooks off a loaded model + val dataloader; SLURM wrapper is `job_scripts/compute_grad_corr.sbatch` |
 | `scripts/calibrate_kid_magnitudes.py` | pick a per-op probe magnitude via KID (Kernel Inception Distance) so every op carries a comparable distortion budget, for checkpoints with no SA-published magnitude to draw from |
@@ -454,7 +559,7 @@ Per-pipeline logs:
 | `sa_curve_log.txt` | SA pipeline | JSONL, one SA curve per recompute |
 | `perturb_eval.txt` | SA pipeline | JSONL, per-round perturbed eval metrics |
 | `aug_gradient_log.txt` | correlation pipeline | JSONL, one record per sweep batch — every per-image gradient, so R is recomputable offline without retraining |
-| `corr_matrix_log.json` | correlation pipeline | one JSON array, one record per emission: raw + scale-normalized R, dropped ops, shared-image-factor loadings |
+| `corr_matrix_log.json` | correlation pipeline | one JSON array, one record per emission: raw + scale-normalized R, dropped ops, shared-image-factor loadings, and `role` (`control` for the pre-pdf baseline probe, `active` otherwise) |
 | `corr_bootstrap_log.txt` | correlation pipeline | JSONL, per-cell bootstrap CIs and BH-FDR q-values |
 | `corr_redundancy_log.txt` | correlation pipeline | JSONL, one record per emission: per-op `red(a)` (standardized) and the raw row sums |
 

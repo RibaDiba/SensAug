@@ -1,6 +1,8 @@
 # Project-related locations
 data/
 experiments/
+experiments_eval/
+archive/
 pretrained_checkpoints/
 sensaug/dataset/vip_fractals
 
