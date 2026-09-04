@@ -353,6 +353,21 @@ def test_geometric_affine_matrix_returns_none_for_photometric_ops(batch):
         assert geometric_affine_matrix(name, batch, 0.5) is None
 
 
+def test_geometric_affine_matrix_returns_none_for_the_sibling_module_ops(batch):
+    """The 14 RGB/HSV/blur/noise ops from the sibling module are photometric
+    too, but they never went through this module's own registry -- CollectGradientHook
+    calls this for every op in the merged 32-op DIFF32_OPS vocabulary
+    (sensaug.hooks.grad_hook), so a name from the sibling's 14 (e.g. lighter_R)
+    reaching here and NOT being recognised previously took the whole
+    grad-sweep down for every op, every batch, every checkpoint."""
+    from sensaug.dataset.differentiable_augmentations import (
+        DIFFERENTIABLE_PERTURBATIONS,
+    )
+
+    for name in sorted(DIFFERENTIABLE_PERTURBATIONS):
+        assert geometric_affine_matrix(name, batch, 0.5) is None
+
+
 def test_geometric_affine_matrix_rejects_unknown_names(batch):
     with pytest.raises(KeyError):
         geometric_affine_matrix("not_an_op", batch, 0.5)
