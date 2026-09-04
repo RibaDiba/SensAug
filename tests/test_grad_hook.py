@@ -77,7 +77,20 @@ def images():
 
 
 def _batch(images):
-    return {"inputs": images, "data_samples": None}
+    """A geometric op (rotate/shear/translate) warps the label alongside the
+    image, so it needs a real gt_sem_seg per sample -- data_samples=None only
+    ever worked because every op used to fail before reaching one (see
+    differentiable_augmentations_aa.geometric_affine_matrix)."""
+    from mmengine.structures import PixelData
+    from mmseg.structures import SegDataSample
+
+    b, _, h, w = images.shape
+    samples = []
+    for _ in range(b):
+        sample = SegDataSample()
+        sample.gt_sem_seg = PixelData(data=torch.randint(0, 19, (1, h, w)))
+        samples.append(sample)
+    return {"inputs": images, "data_samples": samples}
 
 
 def _sweep_hook(tmp_path, batches, names=None, **kwargs):
@@ -312,7 +325,7 @@ def test_non_finite_gradient_raises_probe_error(images):
 
     with pytest.raises(ProbeError):
         hook._grad_for_op(
-            "exploding",
+            "brightness_pos",  # a real photometric name; the point is the non-finite grad
             model,
             _exploding_op,
             images,
@@ -330,10 +343,13 @@ def test_probe_error_is_not_swallowed(images, tmp_path, monkeypatch):
     -- if it were, every guard in the probe would be decorative.
     """
     model = _TinySegModel()
+    # a real photometric name -- geometric_affine_matrix must recognize it and
+    # return None, or _grad_for_op raises KeyError before ever reaching the
+    # exploding op and the non-finite check this test is actually after.
     monkeypatch.setattr(
-        grad_hook, "DIFFERENTIABLE_PERTURBATIONS", {"exploding": _exploding_op}
+        grad_hook, "DIFF32_OPS", {"brightness_pos": _exploding_op}
     )
-    hook = _sweep_hook(tmp_path, [_batch(images)], names=["exploding"])
+    hook = _sweep_hook(tmp_path, [_batch(images)], names=["brightness_pos"])
 
     with pytest.raises(ProbeError):
         hook._sweep(_FakeRunner(model), checkpoint=1.0)
@@ -351,12 +367,14 @@ def test_transient_failure_skips_only_that_batch(images, tmp_path, monkeypatch):
         return images * magnitude.reshape(-1, 1, 1, 1)
 
     model = _TinySegModel()
-    monkeypatch.setattr(grad_hook, "DIFFERENTIABLE_PERTURBATIONS", {"flaky": _flaky})
-    hook = _sweep_hook(tmp_path, [_batch(images), _batch(images)], names=["flaky"])
+    monkeypatch.setattr(grad_hook, "DIFF32_OPS", {"brightness_pos": _flaky})
+    hook = _sweep_hook(
+        tmp_path, [_batch(images), _batch(images)], names=["brightness_pos"]
+    )
 
     hook._sweep(_FakeRunner(model), checkpoint=1.0)
 
-    assert len(hook.grad_buffer["flaky"]) == 1, (
+    assert len(hook.grad_buffer["brightness_pos"]) == 1, (
         "the failed batch should be skipped and the surviving one kept"
     )
 
@@ -663,3 +681,36 @@ def test_a_malformed_seed_file_raises_rather_than_degrading(tmp_path):
     hook = CollectGradientHook(interval=1, magnitudes_path=str(path))
     with pytest.raises(ValueError, match="no snapshots"):
         hook._load_seed_snapshot()
+
+
+# --- the two clocks -----------------------------------------------------------
+
+
+def test_a_hook_needs_exactly_one_clock():
+    """interval and fire_iters are two different ways of saying when. Accepting
+    both would leave the collector and the analyser free to resolve the ambiguity
+    differently, which is the one thing this pipeline cannot survive."""
+    with pytest.raises(ValueError, match="both"):
+        CollectGradientHook(interval=10, fire_iters=(10, 20))
+    with pytest.raises(ValueError, match="positive iteration count"):
+        CollectGradientHook()
+
+
+def test_an_empty_schedule_is_a_config_error_not_a_disabled_pipeline():
+    """A registered pipeline that can never emit surfaces weeks later as an
+    experiment with an empty corr_matrix_log.json."""
+    with pytest.raises(ValueError, match="never emit"):
+        CollectGradientHook(fire_iters=())
+
+
+def test_a_schedule_may_not_contain_iteration_zero():
+    """iteration_count() is 1-based -- 0 is before the first training step, so
+    there is no hook point there."""
+    with pytest.raises(ValueError, match="positive iteration counts"):
+        CollectGradientHook(fire_iters=(0, 20))
+
+
+def test_a_schedule_is_normalized_to_sorted_unique_iterations():
+    hook = CollectGradientHook(fire_iters=[68, 16, 20, 16])
+    assert hook.fire_iters == (16, 20, 68)
+    assert hook.interval is None

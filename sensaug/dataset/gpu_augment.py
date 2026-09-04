@@ -217,7 +217,7 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
         for sample, label in zip(data_samples, labels):
             sample.gt_sem_seg.data = label
 
-    def _apply(self, rgb01, labels, specs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _apply_ops(self, rgb01, labels, specs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply each sampled op to the sub-batch that drew it.
 
         Grouped rather than looped per image so the ops still run batched, which
@@ -287,7 +287,7 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
         with torch.no_grad():
             rgb01 = ((inputs * std + mean) / 255.0).clamp(0.0, 1.0)
             labels = self._gather_labels(data_samples)
-            rgb01, labels = self._apply(rgb01, labels, specs)
+            rgb01, labels = self._apply_ops(rgb01, labels, specs)
             data["inputs"] = (rgb01 * 255.0 - mean) / std
 
         if labels is not None:

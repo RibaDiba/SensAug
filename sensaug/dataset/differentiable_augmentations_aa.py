@@ -454,11 +454,10 @@ def geometric_affine_matrix(
     would notice.
     """
     if name not in GEOMETRIC_OP_KEYS:
-        if name in PHOTOMETRIC_OP_KEYS:
+        if name in PHOTOMETRIC_OP_KEYS or name in DIFFERENTIABLE_PERTURBATIONS:
             return None
         raise KeyError(
-            f"Unknown op {name!r}; expected one of "
-            f"{sorted(AUTOAUGMENT_DIFFERENTIABLE_PERTURBATIONS)}"
+            f"Unknown op {name!r}; expected one of {sorted(DIFF32_OPS)}"
         )
     sign = -1.0 if name.endswith("_neg") else 1.0
     delta = _batch_delta(magnitude, images) * sign

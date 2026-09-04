@@ -7,10 +7,12 @@ augmentations the correlation matrix R found redundant with the rest of the bank
 
 Note what is NOT here. R itself is built in `sensaug/hooks/` --
 `CollectGradientHook` sweeps for `d loss / d magnitude` and
-`PerturbationSensitivityAnalysisHookWithGradients` correlates the sweep, both off
-`corr_interval` in `after_train_iter`. This loop runs on `round_interval` and
-never has to agree with them; it just reads whatever score is current. The two
-pipelines share no clock and no hook point.
+`PerturbationSensitivityAnalysisHookWithGradients` correlates the sweep, both in
+`after_train_iter`. This loop just reads whatever score is current, and works
+whether or not one was published this round. By default the hooks' schedule is
+aligned to the SA rounds (`sensaug/round_schedule.py`), so on a firing round the
+score this loop reads was measured one hook point earlier, on this round's model -- but nothing here assumes that, and `--corr-interval` puts
+the hooks back on an unaligned clock without changing a line of it.
 
 So the only thing this class adds is the consumer side of that handoff:
 `_apply_redundancy_reweighting`, the one extension point the base declares.
@@ -147,6 +149,30 @@ def _op_of(key):
     """The op name out of a pdf key. Keys are (op, level); a bare string is
     tolerated so this works against an op-keyed dict too."""
     return key[0] if isinstance(key, tuple) else key
+
+
+def _pruned_ops(pdf: dict, held=frozenset({NONE_KEY})) -> frozenset:
+    """Which ops this pdf has driven to exactly zero across every one of their
+    magnitude levels.
+
+    Generic over whichever method produced `pdf`, not special-cased to mRMR by
+    name: `soft-weighting`/`none` structurally never produce exact zeros (see
+    `tests/test_downweight_methods.py::test_every_soft_method_is_soft_never_zero`),
+    so this comes back empty for them for free, and any future
+    `HARD_PRUNING_METHODS` arm is picked up with no change here. This is how
+    `CollectGradientHook` and `RobustValLoop.test_perturbed_new` learn what to
+    skip -- see `runner.corr_pruned_ops` below -- without `redundancy.py`'s
+    shared `ReweightResult` needing a field that only a hard-pruning method
+    would ever populate.
+    """
+    by_op: dict = {}
+    for key, prob in pdf.items():
+        if key in held:
+            continue
+        by_op.setdefault(_op_of(key), []).append(prob)
+    return frozenset(
+        op for op, probs in by_op.items() if all(p == 0.0 for p in probs)
+    )
 
 
 def _finite_mean(values):
@@ -494,6 +520,7 @@ class GradCorrValLoop(RobustValLoop):
         corr_lambda: float = 0.0,
         corr_lambda_ramp: str = "linear",
         corr_downweight_method: str = None,
+        corr_skip_pruned_eval: bool = False,
         fp16: bool = False,
     ) -> None:
         super().__init__(
@@ -511,6 +538,7 @@ class GradCorrValLoop(RobustValLoop):
             photometric_only=photometric_only,
             weighted_augs=weighted_augs,
             perturbation_set=perturbation_set,
+            corr_skip_pruned_eval=corr_skip_pruned_eval,
             fp16=fp16,
         )
 
@@ -527,15 +555,22 @@ class GradCorrValLoop(RobustValLoop):
         self.corr_downweight_method = corr_downweight_method
         self._downweight = resolve_downweight_method(corr_downweight_method)
 
+        # Published on the runner (not kept only on `self`) so `CollectGradientHook`
+        # -- a different object, reachable only via the runner -- can read it too.
+        # Explicit empty default rather than relying on `getattr` fallbacks
+        # everywhere: nothing is pruned before the first reweighting round runs.
+        self.runner.corr_pruned_ops = frozenset()
+
     def _apply_redundancy_reweighting(self, pdf_dict: dict) -> dict:
         """Down-weight ops the correlation pipeline found redundant with the rest
         of the bank.
 
         Reads `runner.corr_redundancy`, published by
-        PerturbationSensitivityAnalysisHookWithGradients.prune_augmentations. That
-        hook fires on `corr_interval` and this loop on `round_interval`, so what is
-        read here is simply the latest score -- there is none at all until the first
-        emission, and the pdf is returned untouched until then.
+        PerturbationSensitivityAnalysisHookWithGradients.prune_augmentations. What
+        is read here is simply the latest score -- there is none at all until the
+        first PUBLISHED emission, and the pdf is returned untouched until then.
+        (The default schedule's first emission is a control probe that publishes
+        nothing, taken during warmup when this branch is not reached anyway.)
 
         Called by all three pdf generators, so `--corr-lambda` composes with
         `--uniform` and `--weighted-augs` rather than silently applying to only one
@@ -546,11 +581,21 @@ class GradCorrValLoop(RobustValLoop):
         the logging -- is shared, so the arms differ in exactly one thing.
         """
         if not self.corr_lambda:
-            return pdf_dict
+            return self._publish_pruned_ops(pdf_dict)
 
         published = getattr(self.runner, "corr_redundancy", None)
         if not published:
-            return pdf_dict
+            # Not just "before the first emission" -- also whenever a LATER
+            # emission is withheld (the shared-factor alarm, an unusable score)
+            # after an earlier one succeeded. `runner.corr_redundancy` is left
+            # at its last value in that case (see grad_sens_analysis.py), so
+            # this branch is reached with a stale published score still on the
+            # runner -- but nothing here reweights off it, so the pdf handed
+            # back is the unpruned one, and corr_pruned_ops must say so too:
+            # publishing unconditionally is what keeps a withheld emission from
+            # leaving CollectGradientHook/test_perturbed_new skipping ops that
+            # are, this round, actually back at full pdf mass.
+            return self._publish_pruned_ops(pdf_dict)
 
         # Ramped before dispatch: every method inherits --corr-lambda-ramp and
         # none of them re-implements it.
@@ -594,4 +639,21 @@ class GradCorrValLoop(RobustValLoop):
                     level=30,  # WARNING
                 )
 
-        return result.pdf
+        return self._publish_pruned_ops(result.pdf)
+
+    def _publish_pruned_ops(self, pdf: dict) -> dict:
+        """Derive this round's hard-pruned op set from `pdf` and publish it,
+        then hand `pdf` back unchanged.
+
+        Called from EVERY return path of `_apply_redundancy_reweighting`,
+        including both early "nothing to reweight" branches -- not just after a
+        successful prune. That is what keeps this "not latched": a round that
+        declines to prune (or reverts to no pruning because the published score
+        was withheld) republishes an EMPTY set rather than leaving behind
+        whatever a previous round's successful prune left on the runner. Every
+        rank publishes, same reasoning as the DDP fix to `runner.corr_redundancy`
+        itself -- `CollectGradientHook` and `test_perturbed_new` need to see the
+        same skip-list on every rank they run on.
+        """
+        self.runner.corr_pruned_ops = _pruned_ops(pdf)
+        return pdf

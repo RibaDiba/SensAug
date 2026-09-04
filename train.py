@@ -29,11 +29,18 @@ from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
 from sensaug.hooks import *  # noqa:F403
 from sensaug.loops import *  # noqa:F403
+# Explicit for the same reason DOWNWEIGHT_METHODS below is: these are READ here,
+# to turn configs/rounds.yaml into the correlation pipeline's firing schedule.
+from sensaug.round_schedule import (
+    DEFAULT_ROUNDS_CONFIG,
+    load_round_config,
+    resolve_schedule,
+)
 # Explicit rather than left to the star import above: this one is READ here, to
 # build the flag's `choices` from the registry so the two cannot drift. A name
 # that exists only by virtue of a star import is invisible to every linter that
 # would otherwise catch it going stale.
-from sensaug.loops.grad_corr_loop import DOWNWEIGHT_METHODS
+from sensaug.loops.grad_corr_loop import DOWNWEIGHT_METHODS, HARD_PRUNING_METHODS
 from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
 
 #: The arms that draw from the 32-op bank. All of them run on the GPU set, so
@@ -155,6 +162,51 @@ def warn_ignored_downweight_method(args):
     print_log(
         f"[downweight] --corr-downweight-method="
         f"{args.corr_downweight_method} is set but will NOT be applied: {why}",
+        logger="current",
+        level=logging.WARNING,
+    )
+
+
+def warn_ignored_skip_pruned_eval(args):
+    """Warn when `--corr-skip-pruned-eval` was supplied but nothing will prune.
+
+    `runner.corr_pruned_ops` is only ever non-empty under a
+    HARD_PRUNING_METHODS arm (today, just mRMR) -- every soft method
+    structurally never drives a pdf entry to exactly zero. So on any other
+    arm this flag is a no-op skip-list that's always empty: correct, but
+    silently so, which reads exactly like the optimization firing when it
+    never has anything to skip.
+
+    Same posture as warn_ignored_downweight_method: never raises, called from
+    train() after Runner.from_cfg so the warning lands in the run's own log
+    file rather than only the SLURM .out.
+    """
+    if not args.corr_skip_pruned_eval:
+        return
+
+    if args.aug_type != "grad_corr":
+        why = (
+            f"--aug-type={args.aug_type} builds no GradCorrValLoop, so nothing "
+            f"ever publishes runner.corr_pruned_ops for either sweep to read."
+        )
+    elif args.no_corr_sa:
+        why = (
+            "--no-corr-sa builds the stock ValLoop instead of GradCorrValLoop, "
+            "so nothing publishes a pruned-op set here either."
+        )
+    elif args.corr_downweight_method not in HARD_PRUNING_METHODS:
+        why = (
+            f"--corr-downweight-method={args.corr_downweight_method!r} is soft "
+            f"by construction (never drives a pdf entry to exactly zero), so "
+            f"corr_pruned_ops is always empty and there is nothing to skip. "
+            f"Hard-pruning methods: {sorted(HARD_PRUNING_METHODS)}."
+        )
+    else:
+        return
+
+    print_log(
+        f"[skip-pruned-eval] --corr-skip-pruned-eval is set but will NOT skip "
+        f"anything: {why}",
         logger="current",
         level=logging.WARNING,
     )
@@ -433,20 +485,35 @@ def build_config(args):
         type="Visualizer", vis_backends=[dict(type="TensorboardVisBackend")]
     )
 
-    N_ROUNDS = 20
-    N_CORR_EMISSIONS = 4
+    # The val-round grid, from configs/rounds.yaml. Cluster-independent, unlike
+    # everything in --cluster-config: how many rounds a run has and where the
+    # correlation pipeline fires on them is an experiment parameter, not a path.
+    round_cfg = load_round_config(args.rounds_config)
 
-    # The two pipelines' clocks, resolved independently of each other. round_interval
-    # drives the SA pipeline (RobustValLoop; its SA-curve recompute is every 6th of
-    # these rounds, in sensaug/loops/sensaug_loop.py). corr_interval drives the gradient
-    # cross-correlation pipeline. Neither is derived from the other.
+    # round_interval drives the SA pipeline (RobustValLoop; its SA-curve recompute
+    # is every SA_CURVE_CADENCE of these rounds, in sensaug/loops/sensaug_loop.py).
+    # rounds.yaml's n_rounds is only the DEFAULT divisor -- the CLI flag and the
+    # cluster config's schedule: block still win.
     round_interval = resolve_interval(
-        args.round_interval, "round_interval", cfg.train_cfg.max_iters // N_ROUNDS
-    )
-    corr_interval = resolve_interval(
-        args.corr_interval, "corr_interval", cfg.train_cfg.max_iters // N_CORR_EMISSIONS
+        args.round_interval,
+        "round_interval",
+        cfg.train_cfg.max_iters // round_cfg.n_rounds,
     )
     cfg.train_cfg.val_interval = round_interval
+
+    # The correlation pipeline's clock. `None` -- neither --corr-interval nor
+    # schedule.corr_interval given -- is the DEFAULT and means "use the SA round
+    # grid" (the schedule built below), not "use max_iters // 4": an emission is
+    # only worth taking where a pdf can read it. Naming an interval opts back out
+    # into a clock that is independent of the rounds.
+    corr_interval = resolve_interval(args.corr_interval, "corr_interval", None)
+
+    # The rounds this run will REALLY have, which is round_cfg.n_rounds only when
+    # nothing overrode the interval above. The schedule is built from this, not
+    # from the configured number: derived from the wrong one, every round would
+    # still look right in the log while pointing at the wrong iteration.
+    n_rounds = cfg.train_cfg.max_iters // round_interval
+    warmup_rounds = 0 if args.no_warmup else round_cfg.warmup_rounds
 
     # if "acdc" not in args.dataset.lower():
     #     cfg.train_cfg.max_iters = (
@@ -498,7 +565,7 @@ def build_config(args):
         cfg.val_cfg.descending_MA = args.descending_MA  # defaults to False
         # cfg.val_cfg.descending_MA = False # NOTE: False --> severe augmentations prioritized in pdf
         cfg.val_cfg.remove_H = args.no_inv_aug
-        cfg.val_cfg.warmup_rounds = 0 if args.no_warmup else 4
+        cfg.val_cfg.warmup_rounds = warmup_rounds
         cfg.val_cfg.random_aug = args.random_aug
         cfg.val_cfg.geometric_only = args.geometric_only
         cfg.val_cfg.photometric_only = args.photometric_only
@@ -515,6 +582,7 @@ def build_config(args):
             # implicit default here would be a silent arm -- unrecoverable from the
             # checkpoint, the logs or the work_dir name after the fact.
             cfg.val_cfg.corr_downweight_method = args.corr_downweight_method
+            cfg.val_cfg.corr_skip_pruned_eval = args.corr_skip_pruned_eval
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio
@@ -526,25 +594,80 @@ def build_config(args):
             cfg.optimizer.lr *= 0.1
 
     if args.aug_type == "grad_corr":
-        # Gradient-based augmentation cross-correlation. Every `emit_interval`
-        # iters CollectGradientHook freezes the model and sweeps the whole clean
-        # val set for d loss / d magnitude, then
+        # Gradient-based augmentation cross-correlation. At each firing iteration
+        # CollectGradientHook freezes the model and sweeps the whole clean val set
+        # for d loss / d magnitude, then
         # PerturbationSensitivityAnalysisHookWithGradients correlates that sweep
-        # into R. Both gate on the SAME interval, so they are built from one
-        # variable rather than two that could drift apart.
+        # into R. Both are handed the SAME gate, built once here rather than twice.
         #
-        # --corr-sync-sa just hands them the SA loop's clock instead of their own.
-        # No special gate is needed: fires_at() counts runner.iter + 1, which is the
-        # value IterBasedTrainLoop tests against val_interval right after this hook
-        # point, so passing round_interval lands the sweep on exactly the iterations
-        # that are SA rounds.
+        # ORDERING, and every mode below depends on it: IterBasedTrainLoop calls
+        # val_loop.run() AFTER run_iter, so a sweep landing on a val iteration fires
+        # BEFORE that round's val loop rebuilds the pdf. It therefore probes at the
+        # PREVIOUS round's magnitudes (the ones in effect over the window being
+        # measured, which is the right semantics) and its R is on the runner in time
+        # for THIS round's pdf to be reweighted by it.
         #
-        # ORDERING, and it matters: RobustIterBasedTrainLoop calls val_loop.run()
-        # AFTER run_iter, so a synced sweep fires BEFORE the SA round it is synced
-        # to updates the pdf. It therefore probes at the previous round's
-        # magnitudes -- which is the right semantics (those are the magnitudes that
-        # were in effect over the window being measured) but is not obvious.
-        emit_interval = round_interval if args.corr_sync_sa else corr_interval
+        # Three ways to say when, in precedence order:
+        emit_interval = None
+        fire_iters = control_iters = full_recheck_iters = ()
+        if args.corr_sync_sa:
+            # Every SA round. The densest schedule available -- one R per pdf
+            # rebuild, at ~n_rounds/4 times the cost of the default.
+            emit_interval = round_interval
+        elif corr_interval is not None:
+            # An explicitly named interval: a clock independent of the rounds, which
+            # is what this pipeline had by default before the round-aligned
+            # schedule. Emissions land wherever the arithmetic puts them, so an R
+            # can be measured mid-curve and sit unread until the next round.
+            emit_interval = corr_interval
+        else:
+            # THE DEFAULT: the round grid from configs/rounds.yaml. One baseline
+            # probe in the last warmup round, then one emission per SA-curve
+            # recompute, each governing the rounds that curve governs. See
+            # sensaug/round_schedule.py for why those rounds and not others.
+            #
+            # `pre_train_round` mirrors RobustIterBasedTrainLoop's `init_sa`: those
+            # runs spend round 0 on a val pass before training starts, which shifts
+            # every subsequent round one interval earlier.
+            pre_train_round = sa_loop and bool(cfg.resume or args.no_warmup)
+            schedule = resolve_schedule(
+                round_cfg,
+                n_rounds=n_rounds,
+                warmup_rounds=warmup_rounds,
+                round_interval=round_interval,
+                pre_train_round=pre_train_round,
+            )
+            fire_iters = schedule.fire_iters
+            control_iters = schedule.control_iters
+            full_recheck_iters = schedule.full_recheck_iters
+            for warning in schedule.warnings:
+                dist_print(f"WARNING: {warning}")
+            # In the launch log so an experiment records the schedule it actually
+            # ran, not the one rounds.yaml happened to say at analysis time.
+            dist_print(
+                f"Correlation schedule ({'derived' if schedule.derived else 'explicit'}"
+                f", {round_cfg.path}): rounds {list(schedule.rounds)} of {n_rounds} "
+                f"-> iters {list(fire_iters)} (control: {list(control_iters)})"
+            )
+
+        if args.corr_skip_pruned_eval and (args.corr_sync_sa or corr_interval is not None):
+            dist_print(
+                "WARNING: --corr-skip-pruned-eval cannot determine full-recheck "
+                "rounds on a plain interval clock (--corr-sync-sa/--corr-interval "
+                "put the gradient sweep on a clock with no notion of an SA "
+                "round); CollectGradientHook will measure every op every sweep "
+                "regardless. The round-eval side (test_perturbed_new) is "
+                "unaffected -- its cadence comes from SA_CURVE_CADENCE directly."
+            )
+        elif args.corr_skip_pruned_eval and fire_iters and not full_recheck_iters:
+            dist_print(
+                f"WARNING: this schedule's corr_rounds never land on an "
+                f"SA-curve recompute round, so a pruned op would never be "
+                f"freshly re-measured on the gradient-sweep side for the rest "
+                f"of the run. CollectGradientHook will measure every op every "
+                f"sweep regardless (the optimization is inactive there); the "
+                f"round-eval side is unaffected."
+            )
 
         # The priorities are load-bearing, not cosmetic: both hooks act in
         # after_train_iter, and the correlation hook must see the sweep the
@@ -553,14 +676,19 @@ def build_config(args):
             dict(
                 type="CollectGradientHook",
                 interval=emit_interval,
+                fire_iters=fire_iters or None,
                 sweep_batch_size=1,
                 magnitude_mode=args.corr_magnitude_mode,
                 magnitudes_path=args.corr_magnitudes,
+                skip_pruned=args.corr_skip_pruned_eval,
+                full_recheck_iters=full_recheck_iters,
                 priority="NORMAL",
             ),
             dict(
                 type="PerturbationSensitivityAnalysisHookWithGradients",
                 interval=emit_interval,
+                fire_iters=fire_iters or None,
+                control_iters=control_iters,
                 red_mode=args.corr_red_mode,
                 mask_within_op=not args.corr_keep_within_op,
                 priority="LOW",
@@ -603,6 +731,10 @@ def train(args):
     cfg = build_config(args)
     os.makedirs(cfg.work_dir, exist_ok=True)
     shutil.copy(args.cluster_config, os.path.join(cfg.work_dir, "seg_config.yaml"))
+    # Same reason as the line above: the run should carry the schedule it was
+    # launched with, so a later analysis does not have to trust that
+    # configs/rounds.yaml still says what it said months ago.
+    shutil.copy(args.rounds_config, os.path.join(cfg.work_dir, "rounds.yaml"))
     runner = Runner.from_cfg(cfg)
     set_manual_seed(0)  # set seed
     runner.val_loop  # initialize val loop
@@ -612,6 +744,7 @@ def train(args):
     # val_loop so a bad method name has already failed hard rather than being
     # reported as merely ignored.
     warn_ignored_downweight_method(args)
+    warn_ignored_skip_pruned_eval(args)
 
     # Install the initial uniform training policy for the GPU arms.
     #
@@ -653,6 +786,16 @@ if __name__ == "__main__":
         "--cluster-config",
         required=True,
         help="path to YAML cluster config (e.g. configs/della.yaml)",
+    )
+    parser.add_argument(
+        "--rounds-config",
+        type=str,
+        default=DEFAULT_ROUNDS_CONFIG,
+        help="path to the YAML val-round grid (default: configs/rounds.yaml). "
+        "Sets how many val/SA rounds a run has, how many of them are warmup, and "
+        "which of them the gradient cross-correlation pipeline fires on. Kept out "
+        "of the cluster config on purpose -- it is an experiment parameter, and "
+        "della.yaml and nexus.yaml should not each carry a copy that can drift.",
     )
     parser.add_argument(
         "--work_dir",
@@ -800,19 +943,25 @@ if __name__ == "__main__":
         "--corr-sync-sa",
         action="store_true",
         default=False,
-        help="fire the gradient sweep on the SA loop's clock (--round_interval) "
-        "instead of its own --corr-interval. The sweep still runs from "
-        "after_train_iter, which is BEFORE that round's val loop updates the pdf, "
-        "so it probes at the previous round's magnitudes.",
+        help="fire the gradient sweep on EVERY SA round (--round_interval) rather "
+        "than on the round-aligned subset the default schedule uses. ~20x the "
+        "sweeps, one per pdf rebuild. The sweep still runs from after_train_iter, "
+        "which is BEFORE that round's val loop updates the pdf, so it probes at the "
+        "previous round's magnitudes. Takes precedence over --corr-interval.",
     )
     parser.add_argument(
         "--corr-interval",
         type=int,
         default=None,
-        help="interval of iterations between gradient sweeps and cross-correlation "
-        "matrix emissions. Overrides schedule.corr_interval in the cluster config. "
-        "Independent of --round_interval. Defaults to max_iters // 4. Ignored when "
-        "--corr-sync-sa is set.",
+        help="put the correlation pipeline on a fixed iteration clock of its own "
+        "instead of the default SA-round-aligned schedule. Overrides "
+        "schedule.corr_interval in the cluster config. By DEFAULT (neither given) "
+        "sweeps fire on the SA rounds that can act on them: the last warmup round "
+        "as an unpublished baseline probe, then every SA-curve recompute round -- "
+        "rounds 3, 4, 10 and 16 of 20 at the default round_interval and warmup. "
+        "Naming an interval here decouples the two again, so an R may be measured "
+        "mid-curve and sit unread until the next round. Ignored when --corr-sync-sa "
+        "is set.",
     )
     parser.add_argument(
         "--corr-lambda",
@@ -882,6 +1031,28 @@ if __name__ == "__main__":
         "excluded by default: the two directions of one op measure a "
         "parameterization convention, not redundancy between augmentations anyone "
         "would have chosen independently.",
+    )
+    parser.add_argument(
+        "--corr-skip-pruned-eval",
+        action="store_true",
+        default=False,
+        help="skip the expensive gradient sweep (CollectGradientHook) and the "
+        "expensive round-eval (RobustValLoop.test_perturbed_new) for whatever ops "
+        "--corr-downweight-method=mRMR currently has pruned, reusing each op's "
+        "last real measurement instead of re-measuring an op nobody is training "
+        "on. Every SA_CURVE_CADENCE-th round (the round the SA curve itself "
+        "recomputes on) ignores the skip-list and measures everything fresh, so a "
+        "pruned op's numbers cannot go stale forever -- but on the rounds in "
+        "between, its row of R and its mIoU in perturb_eval.txt are a cached, not "
+        "fresh, number. Both logs mark which ops that round's line came from "
+        "cache (corr_matrix_log.json's 'stale' field, perturb_eval.txt's "
+        "'_stale_ops' key) -- filter on those before reusing either log for a "
+        "'did pruning hurt robustness' comparison. Requires "
+        "--corr-downweight-method=mRMR (the only method that can produce a "
+        "pruned set to skip); ignored with a warning otherwise. Buys no savings "
+        "on the gradient-sweep side under --corr-sync-sa/--corr-interval, which "
+        "put that sweep on a clock with no notion of an SA round to full-recheck "
+        "on -- the round-eval side is unaffected by that.",
     )
     parser.add_argument(
         "--adamw",

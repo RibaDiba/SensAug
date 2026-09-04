@@ -4,8 +4,9 @@ This is the loop `--aug-type=ours` runs. Every `round_interval` iterations it
 re-evaluates how badly the model does under each perturbation, turns that into a
 sampling pdf over (perturbation, magnitude) pairs, and rebuilds the train
 dataloader to sample augmentations from it. The SA *curve* itself is recomputed
-every 6th round (hardcoded in `run()`), so its effective cadence is
-`6 x round_interval`.
+every `SA_CURVE_CADENCE`-th round (6, from `sensaug/round_schedule.py`), so its
+effective cadence is `6 x round_interval` -- and that is the grid the gradient
+cross-correlation pipeline's sweeps are scheduled onto.
 
 `--aug-type=grad_corr` runs `GradCorrValLoop` (`grad_corr_loop.py`), which is a
 strict superset of this: same SA machinery, plus Lever 3's redundancy
@@ -37,6 +38,11 @@ import torch
 from sensaug.sensitivity_analysis import *  # noqa: F401,F403
 from sensaug.runner_utils import *  # noqa: F401,F403
 from sensaug.corr_magnitudes import conditional_levels, modal_magnitude
+# The SA-curve cadence is defined once, in the module that also builds the
+# correlation pipeline's firing schedule out of it. The two must agree: those
+# sweeps exist to land on the rounds this `%` selects.
+from sensaug.round_schedule import SA_CURVE_CADENCE
+from sensaug.dataset.differentiable_augmentations_aa import DIFF32_OPS
 
 __all__ = [
     "dict_mean",
@@ -72,6 +78,7 @@ class RobustValLoop(ValLoop):
         photometric_only: bool = False,
         weighted_augs: bool = False,
         perturbation_set: str = "legacy20",
+        corr_skip_pruned_eval: bool = False,
         fp16: bool = False,
     ) -> None:
         super().__init__(runner, dataloader, evaluator, fp16)
@@ -98,6 +105,27 @@ class RobustValLoop(ValLoop):
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
         self.weighted_augs = weighted_augs
+
+        # Only meaningful under GradCorrValLoop + a HARD_PRUNING_METHODS arm
+        # (mRMR): skip re-evaluating an op nobody is currently training on,
+        # except on the rounds the SA curve itself refreshes. Inert here --
+        # `runner.corr_pruned_ops` is never populated unless the down-weighting
+        # loop is the one running -- so this flag is safe to carry on the base
+        # class rather than duplicating test_perturbed_new for the subclass.
+        self.corr_skip_pruned_eval = corr_skip_pruned_eval
+        # (op -> (miou_by_level, mean_metrics)) as of the last round it was
+        # actually measured. What a skip round reads back instead of a fresh
+        # eval; see test_perturbed_new.
+        self._last_measured = {}
+        # Set for real in run(), right where the SA-curve recompute gate is
+        # already evaluated -- test_perturbed_new reads this directly (same
+        # object, no lag). CollectGradientHook needs the equivalent signal too,
+        # but reads it as a STATIC full_recheck_iters schedule fixed at
+        # config-build time instead (sensaug/round_schedule.py), not a live
+        # attribute here: a runtime flag would lag by one round on that hook,
+        # since after_train_iter hooks run before this round's own run() call
+        # on a shared firing iteration.
+        self._sa_curve_just_recomputed = False
 
         # Which augmentation vocabulary SA measures. "legacy20" is the historical
         # LEGACY20_OPS set; "non-diff32" and "diff32" are both keyed by the 32 op
@@ -192,8 +220,34 @@ class RobustValLoop(ValLoop):
         metrics_record = {}
         final_metrics = {}
 
+        # Currently-pruned ops (mRMR, via GradCorrValLoop) are skipped on every
+        # round EXCEPT the ones where the SA curve itself just refreshed -- that's
+        # the natural point to re-measure everything, since the curve's own
+        # relevance numbers just changed too. `corr_pruned_ops` is only ever
+        # populated by GradCorrValLoop, so this is empty (a full sweep every
+        # round, today's behaviour) unless both the flag and a hard-pruning
+        # method are active.
+        skip_ops = (
+            frozenset()
+            if not self.corr_skip_pruned_eval or self._sa_curve_just_recomputed
+            else getattr(self.runner, "corr_pruned_ops", frozenset())
+        )
+        stale_ops = []
+
         # iterate through perturbation levels and test their MIOU performance
         for p_type, levels in self.sa_curve.items():
+            if p_type in skip_ops and p_type in self._last_measured:
+                # Not training on this op right now -- reuse its last real
+                # reading instead of spending a full eval pass re-measuring an
+                # op nobody is sampling. Flagged in final_metrics["_stale_ops"]
+                # below, not silently blended in: this is exactly the data a
+                # "did pruning hurt robustness" comparison reads.
+                miou_record[p_type], metrics_record[p_type] = self._last_measured[
+                    p_type
+                ]
+                stale_ops.append(p_type)
+                continue
+
             miou_record[p_type] = {}
             metrics_record[p_type] = []
 
@@ -219,10 +273,22 @@ class RobustValLoop(ValLoop):
                 metrics_record[p_type]
             )  # average metric for p type across all levels
 
+            # Cache the fresh reading so a later skip round has something real
+            # to carry forward -- see the skip branch above.
+            self._last_measured[p_type] = (
+                miou_record[p_type],
+                metrics_record[p_type],
+            )
+
         for p_type, mean_dict in metrics_record.items():
             for metric, value in mean_dict.items():
                 new_key = p_type.replace("_", "") + f"_{metric}"
                 final_metrics[new_key] = value
+
+        if stale_ops:
+            # Self-documenting: a reader of perturb_eval.txt must be able to
+            # tell a carried-forward number from a fresh one.
+            final_metrics["_stale_ops"] = sorted(stale_ops)
 
         return miou_record, final_metrics
 
@@ -265,7 +331,7 @@ class RobustValLoop(ValLoop):
         cross-correlation probe.
 
         Only meaningful for an R-keyed vocabulary ("non-diff32" or "diff32"): the probe
-        differentiates DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by
+        differentiates DIFF32_OPS, so a snapshot keyed by
         LEGACY20_OPS names would match nothing and every op would silently
         fall back to the fixed reference magnitude. Skipped outright rather than
         published-and-ignored, so `runner.corr_magnitudes` is never a misleading
@@ -303,7 +369,7 @@ class RobustValLoop(ValLoop):
             return
 
         snapshot = conditional_levels(
-            self.pdf_dict, op_names=set(DIFFERENTIABLE_PERTURBATIONS)  # noqa: F405
+            self.pdf_dict, op_names=set(DIFF32_OPS)
         )
         self.runner.corr_magnitudes = snapshot
 
@@ -537,7 +603,10 @@ class RobustValLoop(ValLoop):
                 )
 
             else:
-                if (self.n_rounds - self.warmup_rounds) % 6 == 0:
+                self._sa_curve_just_recomputed = (
+                    self.n_rounds - self.warmup_rounds
+                ) % SA_CURVE_CADENCE == 0
+                if self._sa_curve_just_recomputed:
                     self.update_sa_curve()
 
                 if self.sa_curve is not None:

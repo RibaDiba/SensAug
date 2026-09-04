@@ -718,3 +718,118 @@ def test_an_unknown_red_mode_is_rejected_at_construction(tmp_path):
     way into a multi-hour run."""
     with pytest.raises(ValueError, match="unknown red_mode"):
         PerturbationSensitivityAnalysisHookWithGradients(interval=10, red_mode="cubed")
+
+
+# --- the round-aligned schedule and its control probe --------------------------
+
+
+def _scheduled_hook(tmp_path, fire_iters, control_iters=()):
+    """A hook on the explicit round schedule rather than the modulo clock."""
+    return _hook(
+        interval=None,
+        fire_iters=fire_iters,
+        control_iters=control_iters,
+        bootstrap=False,
+        n_min=8,
+    )
+
+
+def test_the_schedule_fires_on_exactly_the_listed_iterations(tmp_path):
+    """No modulo, and no implicit final-iteration emission: the round schedule
+    deliberately leaves the last round out, because training ends with it and no
+    pdf would ever read the R it produced."""
+    from sensaug.hooks.grad_hook import fires_at
+
+    hook = _scheduled_hook(tmp_path, fire_iters=(16, 20, 44, 68))
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=80)
+
+    fired = []
+    for iteration in range(80):
+        runner.iter = iteration
+        if fires_at(runner, hook.interval, hook.fire_iters):
+            fired.append(iteration + 1)  # the 1-based count fires_at tests
+
+    assert fired == [16, 20, 44, 68]
+    assert 80 not in fired, "the final iteration must not fire on this clock"
+
+
+def test_both_halves_share_the_schedule_too(tmp_path):
+    """Same claim as test_both_halves_of_the_pipeline_share_one_clock, for the
+    other mode: the analyser correlates the sweep the collector just took, so a
+    gate that disagreed by one iteration would drain an empty or stale buffer."""
+    from sensaug.hooks.grad_hook import CollectGradientHook, fires_at
+
+    iters = (16, 20, 44, 68)
+    collector = CollectGradientHook(fire_iters=iters)
+    analyser = _scheduled_hook(tmp_path, fire_iters=iters, control_iters=(16,))
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=80)
+
+    for iteration in range(80):
+        runner.iter = iteration
+        assert fires_at(runner, collector.interval, collector.fire_iters) == fires_at(
+            runner, analyser.interval, analyser.fire_iters
+        )
+
+
+def test_a_control_emission_is_logged_but_never_published(tmp_path):
+    """Round 3's probe is the pre-pdf baseline every later matrix is read against.
+    It is measured and written like any other emission, and it must not reach
+    training -- withheld explicitly, not left to the fact that the next emission
+    would overwrite it first."""
+    hook = _scheduled_hook(tmp_path, fire_iters=(16, 20), control_iters=(16,))
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=80)
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 15  # iteration_count 16 -- the control probe
+    hook.after_train_iter(runner, batch_idx=15)
+
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert len(records) == 1, "the control probe is still a full emission"
+    assert records[0]["role"] == "control"
+    assert getattr(runner, "corr_redundancy", None) is None
+    assert not (tmp_path / "corr_redundancy_log.txt").exists()
+
+
+def test_the_next_emission_after_the_control_publishes_normally(tmp_path):
+    hook = _scheduled_hook(tmp_path, fire_iters=(16, 20), control_iters=(16,))
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=80)
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 15
+    hook.after_train_iter(runner, batch_idx=15)
+
+    _fill(buffer, n_probes=6, seed=1)
+    runner.iter = 19  # iteration_count 20 -- an active round
+    hook.after_train_iter(runner, batch_idx=19)
+
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert [r["role"] for r in records] == ["control", "active"]
+    assert runner.corr_redundancy is not None
+    assert set(runner.corr_redundancy["red"]) == set(NAMES)
+
+
+def test_a_control_emission_does_not_clear_an_existing_score(tmp_path):
+    """Inert with respect to training, not merely neutral: a control that wiped
+    the current score would change the pdf by deletion instead of by publication."""
+    hook = _scheduled_hook(tmp_path, fire_iters=(16,), control_iters=(16,))
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=80)
+    runner.corr_redundancy = {"from": "an earlier round"}
+
+    hook.prune_augmentations(runner, np.eye(N_OPS), checkpoint=0.2, role="control")
+
+    assert runner.corr_redundancy == {"from": "an earlier round"}
+
+
+def test_an_interval_run_labels_every_emission_active(tmp_path):
+    """--corr-interval and the offline recompute have no baseline round, so
+    nothing should be tagged as one."""
+    _emit_once(tmp_path, _redundancy_hook(tmp_path))
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert records[0]["role"] == "active"
+
+
+def test_a_control_round_outside_the_schedule_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="not in fire_iters"):
+        _scheduled_hook(tmp_path, fire_iters=(20, 44), control_iters=(16,))

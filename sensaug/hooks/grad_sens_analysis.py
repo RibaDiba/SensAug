@@ -20,20 +20,23 @@ per-column one, so that factor would re-inflate R just as convergence drift did.
 It is divided out (``normalize_per_image``), and its per-op loadings are logged at
 every emission so you can see how much of R it was accounting for.
 
-R is emitted every ``interval`` train iters from the observations collected since
-the previous emission, never pooled across them: a warmup window and a converged
-window describe different models, and pooling groups with different underlying
-structure manufactures trends neither group has (Simpson's paradox).
+R is emitted from the observations collected since the previous emission, never
+pooled across them: a warmup window and a converged window describe different
+models, and pooling groups with different underlying structure manufactures trends
+neither group has (Simpson's paradox).
 
-That ``interval`` is the correlation pipeline's OWN clock, shared with
-CollectGradientHook and with nothing else. Both hooks used to fire from
-``after_val_epoch``, which under ``--aug-type=ours`` is called by RobustValLoop
-itself, so R was computed inside the sensitivity-analysis pipeline's val epoch and
-could only be emitted on an SA round. The two measure different things -- SA asks
-which perturbations the model is worst at, R asks which perturbations are
-redundant with each other -- so they now keep separate clocks and neither is
-reachable from the other. See sensaug/loops/sensaug_loop.py for the SA pipeline, which this
-module deliberately does not touch.
+WHEN it is emitted is decided in sensaug/round_schedule.py: a set of iterations
+aligned to the SA rounds, one baseline probe in the last warmup round
+plus one emission per SA-curve recompute. Both hooks are handed that same set.
+Alignment is NOT the old coupling: the two hooks still fire from
+``after_train_iter`` and neither is reachable from the val loop. They used to fire
+from ``after_val_epoch``, which under ``--aug-type=ours`` is RobustValLoop's own
+call, so R was computed *inside* the SA pipeline's val epoch and could not exist
+without it. What is shared now is only the grid the emissions land on -- chosen
+because every emission exists to be read by the pdf, and the pdf changes shape on
+that grid. ``--corr-interval`` still buys the plain independent modulo clock. See
+sensaug/loops/sensaug_loop.py for the SA pipeline, which this module deliberately
+does not call into.
 
 Scope: R covers the differentiable ops only. Pruning based on R is future work --
 ``prune_augmentations`` is a stub, pending sign-off on what "redundant" is allowed
@@ -61,7 +64,12 @@ from mmengine.hooks import Hook
 from sensaug.dataset.differentiable_augmentations_aa import (
     DIFF32_OPS,
 )
-from sensaug.hooks.grad_hook import fires_at, training_progress
+from sensaug.hooks.grad_hook import (
+    fires_at,
+    iteration_count,
+    resolve_gate,
+    training_progress,
+)
 from sensaug.redundancy import MODES, compute_red, summarise
 # Imported straight off the submodule, NOT as `from sensaug.hooks import corr_viz`.
 # hooks/__init__.py imports this module, so the package form is a cycle through a
@@ -376,11 +384,25 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
     effect unless that hook is also registered.
 
     Args:
-        interval (int): Train iters between emissions of R. Must match
-            CollectGradientHook's ``interval`` -- the two are one pipeline on one
-            clock. Each R uses only the probes collected since the previous
-            emission; windows are never pooled, because a warmup model and a
-            converged model are different measurement instruments.
+        interval (int): Train iters between emissions of R, on the plain modulo
+            clock. Must match CollectGradientHook's ``interval`` -- the two are one
+            pipeline on one clock. Each R uses only the probes collected since the
+            previous emission; windows are never pooled, because a warmup model and
+            a converged model are different measurement instruments. Mutually
+            exclusive with ``fire_iters``.
+        fire_iters (Sequence[int]): The explicit iteration counts to emit on --
+            the SA-round-aligned schedule a training run uses by default. Must
+            match CollectGradientHook's ``fire_iters``.
+        control_iters (Sequence[int]): The subset of ``fire_iters`` whose R is a
+            BASELINE: measured, logged and plotted as usual, but not published to
+            ``runner.corr_redundancy``, so it can never reach the training pdf.
+            This is the ``warmup_rounds - 1`` probe (see
+            sensaug/round_schedule.derive_corr_rounds), taken
+            while the SA loop is still in warmup and there is no pdf to weight.
+            Withheld explicitly rather than left to the fact that the next
+            emission overwrites it first, because "the control arm's matrix never
+            touched training" is a claim about the experiment, not a coincidence
+            of two hook orderings.
         n_min (int): Minimum images in a window before R is computed at all. At
             n=100 the correlation standard error is ~1/sqrt(n-3) ~ 0.10. The old
             gate ("at least 2 probes") was meaningless: with 2 points corrcoef
@@ -395,7 +417,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
 
     def __init__(
         self,
-        interval: int,
+        interval: int = None,
         n_min: int = 100,
         normalize_per_image: bool = True,
         bootstrap: bool = True,
@@ -405,12 +427,26 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         gather_ranks: bool = True,
         red_mode: str = "squared",
         mask_within_op: bool = True,
+        fire_iters=None,
+        control_iters=(),
     ) -> None:
-        if interval < 1:
-            raise ValueError(f"interval must be a positive iteration count, got {interval}")
         if red_mode not in MODES:
             raise ValueError(f"unknown red_mode {red_mode!r}, expected one of {MODES}")
-        self.interval = interval
+        self.interval, self.fire_iters = resolve_gate(interval, fire_iters)
+        control = frozenset(int(i) for i in control_iters or ())
+        if control and self.fire_iters is None:
+            raise ValueError(
+                f"control_iters {sorted(control)} were given on the plain interval "
+                f"clock. A baseline is defined by which ROUND it falls in, so it "
+                f"only means anything against an explicit fire_iters schedule."
+            )
+        if self.fire_iters is not None and not control <= set(self.fire_iters):
+            raise ValueError(
+                f"control_iters {sorted(control - set(self.fire_iters))} are not in "
+                f"fire_iters: a control emission that never fires is a silently "
+                f"missing baseline, not a disabled one"
+            )
+        self.control_iters = control
         self.n_min = n_min
         self.normalize_per_image = normalize_per_image
         self.bootstrap = bootstrap
@@ -441,10 +477,16 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         # this hook's LOW), so by the time we get here the buffer holds exactly the
         # sweep it just took: one frozen model state, which is the whole claim R
         # rests on.
-        if not fires_at(runner, self.interval):
+        if not fires_at(runner, self.interval, self.fire_iters):
             return  # window still open -- keep accumulating
 
         checkpoint = training_progress(runner)
+        # "control" only for the pre-pdf baseline probe; see control_iters.
+        role = (
+            "control"
+            if iteration_count(runner) in self.control_iters
+            else "active"
+        )
 
         # Gather before R is built: each rank probed a different shard.
         window = buffer
@@ -463,7 +505,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         #
         # The rank-0 guards now sit on the side effects inside _emit (log files,
         # TensorBoard) instead of on the computation that feeds training.
-        self._emit(runner, checkpoint, window)
+        self._emit(runner, checkpoint, window, role=role)
 
         # Clear on EVERY rank (not just rank 0, or the other ranks' buffers grow
         # without bound), and only at an emission (so a window is one model state,
@@ -471,7 +513,9 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         for name in buffer:
             buffer[name].clear()
 
-    def _emit(self, runner: Runner, checkpoint: float, buffer: dict) -> None:
+    def _emit(
+        self, runner: Runner, checkpoint: float, buffer: dict, role: str = "active"
+    ) -> None:
         if self.corr_log_path is None:
             work_dir = runner.cfg.work_dir
             self.corr_log_path = os.path.join(work_dir, "corr_matrix_log.json")
@@ -510,15 +554,30 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         # the SA distribution answer different questions, and without this field
         # they are indistinguishable in the log.
         magnitude_info = getattr(runner, "aug_grad_magnitude_info", None) or {}
+        # Ops CollectGradientHook backfilled from a cached prior measurement
+        # this sweep (under --corr-skip-pruned-eval) rather than freshly
+        # measuring, because they're currently pruned from the training pdf.
+        # A pure provenance label, not an exclusion: a stale row still
+        # participates fully in R and in the redundancy ranking below (see
+        # sensaug/loops/grad_corr_loop.py's skip_pruned discussion for why
+        # treating it like a "dropped" row would make pruning flip-flop every
+        # round instead of holding for SA_CURVE_CADENCE rounds).
+        stale_names = sorted(getattr(runner, "aug_grad_stale_ops", None) or ())
         record = {
             "checkpoint": checkpoint,
             "iter": int(runner.iter),
+            # "control" for the pre-pdf baseline probe, "active" for every matrix
+            # that was published to the training pdf. Recorded because the two are
+            # otherwise indistinguishable in this file, and the baseline is the one
+            # every later matrix gets read against.
+            "role": role,
             "n_images": n_images,
             "n_probes": n_probes,
             "names": self.names,
             "R_raw": r_raw,
             "R_scalenorm": r_norm,
             "dropped": dropped_names,
+            "stale": stale_names,
             "shared_factor_loadings": loadings,
             "magnitude_source": magnitude_info.get("source"),
             "magnitude_mode": magnitude_info.get("mode"),
@@ -554,9 +613,10 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
 
         max_loading = np.nanmax(np.abs(loadings)) if np.isfinite(loadings).any() else np.nan
         summary = (
-            f"[grad-corr] checkpoint {checkpoint:.0%} (iter {runner.iter}): "
+            f"[grad-corr] checkpoint {checkpoint:.0%} (iter {runner.iter}, {role}): "
             f"n_images={n_images} n_probes={n_probes} "
             f"dropped={dropped_names or 'none'} "
+            f"stale={stale_names or 'none'} "
             f"max_shared_loading={max_loading:.2f} "
             f"magnitudes={magnitude_info.get('source', 'unknown')}/"
             f"{magnitude_info.get('mode', 'unknown')}"
@@ -603,6 +663,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             checkpoint=checkpoint,
             survives=(cell_stats or {}).get("survives"),
             max_loading=max_loading,
+            role=role,
         )
 
     def _emit_bootstrap(self, checkpoint, d_grad, probe_ids, dropped):
@@ -932,6 +993,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         checkpoint: float = None,
         survives: np.ndarray = None,
         max_loading: float = np.nan,
+        role: str = "active",
     ) -> None:
         """Publish a per-op redundancy score for the SA loop to reweight the pdf by.
 
@@ -945,17 +1007,36 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         Named for what it used to be a stub for. It does not prune.
 
         Published onto the runner rather than pushed, the same handoff channel
-        `runner.corr_magnitudes` uses in the other direction: this hook fires on
-        `corr_interval` (4 emissions by default) and the SA loop regenerates the pdf
-        on `round_interval` (20 rounds), so the loop reads whatever is current and
-        the two clocks never have to agree. Before the first emission there is no
-        score and the pdf is untouched.
+        `runner.corr_magnitudes` uses in the other direction: the loop reads
+        whatever is current, so the two halves never have to agree on a clock.
+        Before the first emission there is no score and the pdf is untouched. By
+        default the emission schedule is aligned to the SA rounds (see
+        `derive_corr_rounds` in sensaug/round_schedule.py), so that "whatever is
+        current" is the matrix measured one hook point earlier, at this very round.
+
+        A `role="control"` emission publishes NOTHING. That is the
+        `warmup_rounds - 1` baseline probe: R measured before the pdf has ever been
+        weighted, which is the reference the later matrices are compared against
+        and must not itself be an input to training.
 
         The score is a per-op summary of R, and R defines "redundant" as loss-
         gradient alignment at the probe magnitude -- not as overlap in held-out
         per-image performance drop, which is what a pruning claim would need to rest
         on. Down-weighting is defensible on the weaker definition; deletion is not.
         """
+        # The baseline probe. Return BEFORE touching runner.corr_redundancy at all
+        # -- not even to clear it -- so a control emission is inert with respect to
+        # training rather than merely neutral.
+        if role == "control":
+            print_log(
+                f"[grad-corr] control probe at checkpoint "
+                f"{(checkpoint if checkpoint is not None else float('nan')):.0%}: R "
+                f"measured and logged as the pre-pdf baseline, not published to "
+                f"the training pdf.",
+                logger="current",
+            )
+            return
+
         if not np.isfinite(r).any():
             return
 
