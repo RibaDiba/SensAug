@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=sensaug_gamma
+#SBATCH --job-name=ours-hard-ade20k-1
 #SBATCH --nodes=1
 
 ## GAMMA training config (per the lab's train_generic.sh guidelines)
-#SBATCH --time=48:00:00
+#SBATCH --time=36:00:00
 #SBATCH --qos=huge-long
 #SBATCH --account=gamma
 #SBATCH --partition=gamma
@@ -27,21 +27,29 @@
 ##SBATCH --mem=64gb
 ##SBATCH --ntasks=15
 
-# NOTE: SLURM opens these files *before* the script body runs, so the directory
-# must already exist at submit time -- the `mkdir -p logs` further down is too
-# late for these two. Create it once:  mkdir -p /fs/gammascratch/amodak/sensaug/logs
-#SBATCH --output=/fs/gammascratch/amodak/sensaug/logs/%x.%j.out
-#SBATCH --error=/fs/gammascratch/amodak/sensaug/logs/%x.%j.err
+# NOTE: SLURM opens these files *before* the script body runs, so a %x-named
+# subdirectory can't be relied on here -- it wouldn't exist yet for a job name
+# picked at submit time via `--job-name=`. These paths are absolute (not
+# relative to $SLURM_SUBMIT_DIR) specifically so `sbatch` works the same
+# whether you run it from the repo root or from inside job_scripts/ --
+# a relative path here previously doubled into job_scripts/job_scripts/logs/
+# when submitted from job_scripts/. Bootstrap flat into job_scripts/logs/;
+# once running, the script `mv`s these two files into a per-job-name
+# subdirectory it creates on the fly -- a same-filesystem rename keeps the
+# already-open fd writing to the same inode, so no output is lost and no
+# `exec` redirect is needed. Every submission ends up grouped under
+# job_scripts/logs/<job-name>/ regardless of job name or submit dir.
+#SBATCH --output=/gammascratch/amodak/SensAug/job_scripts/logs/%x.%j.out
+#SBATCH --error=/gammascratch/amodak/SensAug/job_scripts/logs/%x.%j.err
 
-## failure notifications -- uncomment and fill in
-##SBATCH --mail-user=amodak@terpmail.umd.edu
-##SBATCH --mail-type=FAIL,END
+#SBATCH --mail-user=amodak@terpmail.umd.edu
+#SBATCH --mail-type=FAIL,END
 
 set -o pipefail
 
 # ---------------------------------------------------------------- config ----
 # All overridable via env vars.
-NAME="${NAME:-sensaug_gamma}"
+NAME="${NAME:-ours-hard-ade20k-1}"
 
 # Valid --aug-type values (train.py argparse choices):
 #   none ours default grad_corr random autoaugment augmix randaugment
@@ -50,9 +58,9 @@ NAME="${NAME:-sensaug_gamma}"
 # setup runs. The sensitivity-informed arm is `ours`; `grad_corr` additionally
 # runs the gradient cross-correlation pipeline (add --no-corr-sa for its control
 # arm: no SA, probes at the fixed 0.5 reference magnitude).
-AUG_TYPE="${1:-none}"
+AUG_TYPE="${1:-grad_corr}"
 BACKBONE="${2:-segformer}"
-DATASET="${3:-cityscapes}"
+DATASET="${3:-ade20k}"
 
 # Validate here rather than letting train.py's argparse catch it: under
 # --launcher=pytorch that error prints once per rank (4x on this script) and
@@ -87,16 +95,38 @@ CONFIG="${CONFIG:-configs/nexus.yaml}"
 # train.py REQUIRES it on every --aug-type=grad_corr run (there is no default, so
 # an arm is never left unnamed) and warns that it is ignored on every other arm --
 # hence conditional rather than always appended.
-DOWNWEIGHT="${DOWNWEIGHT:-soft-weighting}"
+DOWNWEIGHT="${DOWNWEIGHT:-mRMR}"
+# Budget/tilt strength for Lever 3. train.py defaults this to 0.0, which is the
+# short-circuit control arm (bit-identical to no downweighting, for either
+# method) -- so it must be set explicitly here or every grad_corr run silently
+# no-ops regardless of --corr-downweight-method. 0.25 is the calibrated value
+# from CLAUDE.md / scripts/calibrate_lambda.py: ~2.3-3.1x tilt under
+# soft-weighting, ~80% of ops survive the prune under mRMR.
+CORR_LAMBDA="${CORR_LAMBDA:-0.25}"
 EXTRA_ARGS=()
 if [ "${AUG_TYPE}" = "grad_corr" ]; then
-    EXTRA_ARGS+=(--corr-downweight-method="${DOWNWEIGHT}")
+    EXTRA_ARGS+=(--corr-downweight-method="${DOWNWEIGHT}" --corr-lambda="${CORR_LAMBDA}")
 fi
 
-# Your own checkout. The SBATCH log paths above point at /fs/gammascratch/amodak
-# -- if that is also where the repo lives, set REPO_DIR to match rather than
-# using the shared lab checkout below.
-REPO_DIR="${REPO_DIR:-/fs/nexus-scratch/lyzheng/sensaug}"
+# Your own checkout -- set REPO_DIR to override if it differs from this.
+REPO_DIR="${REPO_DIR:-/gammascratch/amodak/SensAug}"
+
+# Group this job's bootstrap logs (see the #SBATCH --output/--error comment
+# above) into job_scripts/logs/<job-name>/ before doing anything else, so a
+# crash further down still leaves clean, grouped logs rather than flat ones.
+# Rename, not copy: the fd SLURM already opened for stdout/stderr keeps
+# writing to the same inode after the mv, so nothing written so far is lost
+# and nothing later needs an explicit redirect. Anchored to the same absolute
+# base as the #SBATCH paths above, so this works regardless of where `sbatch`
+# was actually invoked from.
+LOG_BASE="/gammascratch/amodak/SensAug/job_scripts/logs"
+LOG_GROUP_DIR="${LOG_BASE}/${SLURM_JOB_NAME:-${NAME}}"
+mkdir -p "${LOG_GROUP_DIR}"
+for ext in out err; do
+    BOOT="${LOG_BASE}/${SLURM_JOB_NAME:-${NAME}}.${SLURM_JOB_ID}.${ext}"
+    [ -f "${BOOT}" ] && mv "${BOOT}" "${LOG_GROUP_DIR}/${SLURM_JOB_NAME:-${NAME}}.${SLURM_JOB_ID}.${ext}"
+done
+
 cd "${REPO_DIR}" || { echo "ERROR: REPO_DIR=${REPO_DIR} does not exist" >&2; exit 1; }
 if [ ! -f train.py ]; then
     echo "ERROR: no train.py under REPO_DIR=${REPO_DIR}; wrong checkout?" >&2
