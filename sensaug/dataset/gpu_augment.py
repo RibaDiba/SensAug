@@ -22,6 +22,7 @@ easiest way for that to stop being true is for the two to reconstruct RGB [0, 1]
 differently.
 """
 
+import contextlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -42,6 +43,7 @@ __all__ = [
     "set_train_spec",
     "set_eval_spec",
     "clear_spec",
+    "suspended_augmentation",
     "NO_OP",
 ]
 
@@ -107,6 +109,33 @@ def clear_spec(runner, training: bool) -> None:
         dp.set_train_none()
     else:
         dp.set_eval_none()
+
+
+@contextlib.contextmanager
+def suspended_augmentation(model):
+    """Both augmentation slots off for the duration, restored on the way out.
+
+    For measurement code that has to call the preprocessor to get a device-side,
+    normalized, padded batch but must NOT get the training policy applied on the
+    way through -- CollectGradientHook's sweep, whose whole contract is that
+    every op is probed against the same CLEAN image. `training=True` is not
+    optional there (mmseg pads gt_sem_seg only on that branch), so the policy has
+    to come off the preprocessor rather than out of the flag.
+
+    Takes the model rather than the runner, and is a no-op when the preprocessor
+    is the stock SegDataPreProcessor: the non-GPU arms have no policy to suspend
+    and must not be made to raise for lacking one.
+    """
+    dp = _unwrap(model).data_preprocessor
+    if not isinstance(dp, GpuAugSegDataPreProcessor):
+        yield
+        return
+    train_spec, eval_spec = dp._train_spec, dp._eval_spec
+    dp._train_spec = dp._eval_spec = None
+    try:
+        yield
+    finally:
+        dp._train_spec, dp._eval_spec = train_spec, eval_spec
 
 
 @MODELS.register_module()

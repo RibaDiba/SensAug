@@ -82,6 +82,7 @@ from sensaug.dataset.differentiable_augmentations_aa import (
     geometric_affine_matrix,
     warp_image_and_label,
 )
+from sensaug.dataset.gpu_augment import suspended_augmentation
 from sensaug.corr_magnitudes import (
     MAGNITUDE_MODES,
     MODE_FIXED,
@@ -568,60 +569,72 @@ class CollectGradientHook(Hook):
         batch_sizes = []
         swept_magnitudes = {name: [] for name in DIFF32_OPS}
         try:
-            for data in self._probe_loader:
-                try:
-                    grads, magnitudes = self._probe_batch(
-                        model, data, snapshot, active_ops
-                    )
-                except ProbeError:
-                    # A wrong-shaped or non-finite gradient is a bug in the probe,
-                    # not a transient failure. Fail loudly rather than degrading
-                    # into a silently skipped batch (which is what the blanket
-                    # except below would otherwise do).
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    print_log(
-                        f"CollectGradientHook batch failed during the "
-                        f"{checkpoint:.0%} sweep: {e}",
-                        logger="current",
-                    )
-                    continue
+            # The sweep's contract is a CLEAN batch: every op probed against the
+            # same unaugmented image, so a column of R is attributable to the op.
+            # Under --aug-type=grad_corr the preprocessor IS GpuAugSegDataPreProcessor
+            # and train.py has installed a training policy on it, so calling it with
+            # training=True (which is not optional -- mmseg pads gt_sem_seg only on
+            # that branch) would apply a randomly drawn augmentation to every probe
+            # image first. That is a per-image factor shared by all 32 ops, i.e. it
+            # inflates every correlation at once, and it is not even reproducible:
+            # the draw comes from numpy's global RNG, which nothing here seeds or
+            # restores. A no-op on the arms whose preprocessor is the stock one.
+            with suspended_augmentation(model):
+                for data in self._probe_loader:
+                    try:
+                        grads, magnitudes = self._probe_batch(
+                            model, data, snapshot, active_ops
+                        )
+                    except ProbeError:
+                        # A wrong-shaped or non-finite gradient is a bug in the probe,
+                        # not a transient failure. Fail loudly rather than degrading
+                        # into a silently skipped batch (which is what the blanket
+                        # except below would otherwise do).
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        print_log(
+                            f"CollectGradientHook batch failed during the "
+                            f"{checkpoint:.0%} sweep: {e}",
+                            logger="current",
+                        )
+                        continue
 
-                for name, value in grads.items():
-                    self.grad_buffer[name].append(value)
-                for name, value in magnitudes.items():
-                    swept_magnitudes[name].append(value)
+                    for name, value in grads.items():
+                        self.grad_buffer[name].append(value)
+                    for name, value in magnitudes.items():
+                        swept_magnitudes[name].append(value)
 
-                batch_size = int(next(iter(grads.values())).shape[0])
-                n_batches += 1
-                n_images += batch_size
-                batch_sizes.append(batch_size)
+                    batch_size = int(next(iter(grads.values())).shape[0])
+                    n_batches += 1
+                    n_images += batch_size
+                    batch_sizes.append(batch_size)
 
-                if is_main_process():
-                    # Log EVERY batch, in full: this makes R recomputable offline
-                    # from the log without retraining. .tolist() is required --
-                    # np.ndarray and np.float32 both raise TypeError in json.dumps.
-                    #
-                    # The magnitudes go in alongside the gradients because a
-                    # gradient is only interpretable together with the magnitude it
-                    # was taken at -- without them an offline recompute cannot tell
-                    # a fixed-0.5 sweep from an SA-driven one.
-                    self._pending_records.append(
-                        {
-                            "checkpoint": checkpoint,
-                            "iter": int(runner.iter),
-                            "batch_size": batch_size,
-                            "magnitude_source": source,
-                            "magnitude_mode": self.magnitude_mode,
-                            "grads": {
-                                name: value.tolist() for name, value in grads.items()
-                            },
-                            "magnitudes": {
-                                name: value.tolist()
-                                for name, value in magnitudes.items()
-                            },
-                        }
-                    )
+                    if is_main_process():
+                        # Log EVERY batch, in full: this makes R recomputable offline
+                        # from the log without retraining. .tolist() is required --
+                        # np.ndarray and np.float32 both raise TypeError in json.dumps.
+                        #
+                        # The magnitudes go in alongside the gradients because a
+                        # gradient is only interpretable together with the magnitude it
+                        # was taken at -- without them an offline recompute cannot tell
+                        # a fixed-0.5 sweep from an SA-driven one.
+                        self._pending_records.append(
+                            {
+                                "checkpoint": checkpoint,
+                                "iter": int(runner.iter),
+                                "batch_size": batch_size,
+                                "magnitude_source": source,
+                                "magnitude_mode": self.magnitude_mode,
+                                "grads": {
+                                    name: value.tolist()
+                                    for name, value in grads.items()
+                                },
+                                "magnitudes": {
+                                    name: value.tolist()
+                                    for name, value in magnitudes.items()
+                                },
+                            }
+                        )
         finally:
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
