@@ -785,7 +785,11 @@ class BrightnessTransform(BaseTransform):
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
         results["img"] = np.ascontiguousarray(results["img"])
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # results["ori_shape"] = results["img"].shape[:2]  # this op never changes
+        # spatial dims; overwriting ori_shape with the post-Resize shape clobbers
+        # the true native size EncoderDecoder.postprocess_result needs to resize
+        # the prediction back to before IoUMetric compares it against the
+        # never-resized label -- see tests/test_perturbed_pipeline_order.py.
         return results
 
 
@@ -809,7 +813,7 @@ class ColorTransform(BaseTransform):
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
         results["img"] = np.ascontiguousarray(results["img"])
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -831,7 +835,7 @@ class ContrastTransform(BaseTransform):
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
         results["img"] = np.ascontiguousarray(results["img"])
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -852,7 +856,7 @@ class SharpnessTransform(BaseTransform):
         img_pil = F.adjust_sharpness(img_pil, 1.0 + self.magnitude)
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -876,7 +880,7 @@ class PosterizeTransform(BaseTransform):
         img_pil = F.posterize(img_pil, bits)
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -896,7 +900,7 @@ class SolarizeTransform(BaseTransform):
             img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
             results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
 
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
 
         return results
 
@@ -1040,7 +1044,10 @@ class ImageNetCTransform(BaseTransform):
         img = np.array(img).astype(np.uint8)
         img = img[..., ::-1]  # RGB -> BGR
         results["img"] = img
-        results["ori_shape"] = img.shape[:2]
+        # ori_shape left untouched -- none of the IMAGENETC_NAME_FN_DICT corruptions
+        # (motion_blur, zoom_blur, pixelate, jpeg_compression, snow, frost, fog)
+        # change spatial dims, so this used to just clobber the true native shape
+        # with the post-Resize one -- see BrightnessTransform.transform above.
 
         return results
 
@@ -1296,7 +1303,8 @@ class CombinationPerturbation(BaseTransform):
         img = img + np.random.normal(0, self.noise_sigma, size=img.shape)
 
         results["img"] = np.clip(img, a_min=0, a_max=255).astype(np.uint8)
-        results["ori_shape"] = img.shape[:2]
+        # ori_shape left untouched -- color/blur/noise perturbations never change
+        # spatial dims; see BrightnessTransform.transform above.
         return results
 
     def __repr__(self) -> str:
