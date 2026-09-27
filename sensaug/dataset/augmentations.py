@@ -8,12 +8,6 @@ from mmcv.transforms.base import BaseTransform
 from mmseg.registry import TRANSFORMS
 
 import torch
-from torchvision.transforms.v2 import (
-    AugMix,
-    RandAugment,
-    TrivialAugmentWide,
-    AutoAugment,
-)
 from torchvision.transforms.v2 import AutoAugmentPolicy, functional as F
 from torchvision.transforms import InterpolationMode
 
@@ -22,6 +16,11 @@ from sensaug.dataset.utils.non_geometric_transforms import (
     ColorAutoAugment,
     ColorRandAugment,
     ColorTrivialAugmentWide,
+)
+from sensaug.dataset.utils.label_safe_transforms import (
+    LabelSafeAutoAugment,
+    LabelSafeRandAugment,
+    LabelSafeTrivialAugmentWide,
 )
 
 from sensaug.dataset.utils.cropping import *
@@ -242,8 +241,16 @@ class FastNoiseTransform(BaseTransform):
 
 @TRANSFORMS.register_module()
 class AugMixTransform(BaseTransform):
+    """AugMix for segmentation: photometric ops only.
+
+    AugMix blends several independently augmented copies of the image, so a
+    geometric op in any chain leaves no single label that matches the output.
+    The geometric ops are therefore dropped (``ColorAugMix``); the photometric
+    ops, magnitudes and mixing are torchvision's AugMix unchanged.
+    """
+
     def __init__(self):
-        self.augmix = AugMix(
+        self.augmix = ColorAugMix(
             severity=3,
             mixture_width=3,
             chain_depth=-1,
@@ -254,10 +261,28 @@ class AugMixTransform(BaseTransform):
         )
 
     def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.augmix(img_pil)
-        # img_np, cropped_rect = crop_and_resize_data(np.array(img_pil).astype(np.uint8))
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
+        # BGR -> RGB for the call: torchvision's Color op uses RGB luma weights.
+        rgb = torch.from_numpy(np.ascontiguousarray(results["img"][..., ::-1]))
+        rgb = self.augmix(rgb.permute(2, 0, 1))
+        results["img"] = np.ascontiguousarray(rgb.permute(1, 2, 0).numpy()[..., ::-1])
+        return results
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}()"
+
+
+class _LabelSafeAutoAugmentTransform(BaseTransform):
+    """Runs a label-safe torchvision auto-augment method on img + gt_seg_map.
+
+    See sensaug.dataset.utils.label_safe_transforms: the method itself is the
+    torchvision reference, and every geometric op is replayed on the label.
+    """
+
+    def transform(self, results: dict) -> dict:
+        img, seg = self.policy.apply(results["img"], results.get("gt_seg_map"))
+        results["img"] = img
+        if seg is not None:
+            results["gt_seg_map"] = seg
         return results
 
     def __repr__(self) -> str:
@@ -265,29 +290,19 @@ class AugMixTransform(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class AutoAugmentTransform(BaseTransform):
+class AutoAugmentTransform(_LabelSafeAutoAugmentTransform):
     def __init__(self):
-        self.autoAugment = AutoAugment(
+        self.policy = LabelSafeAutoAugment(
             policy=AutoAugmentPolicy.IMAGENET,
             interpolation=InterpolationMode.NEAREST,
             fill=None,
         )
 
-    def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.autoAugment(img_pil)
-        # img_np, cropped_rect = crop_and_resize_data(np.array(img_pil).astype(np.uint8))
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}()"
-
 
 @TRANSFORMS.register_module()
-class RandAugmentTransform(BaseTransform):
+class RandAugmentTransform(_LabelSafeAutoAugmentTransform):
     def __init__(self):
-        self.randAugment = RandAugment(
+        self.policy = LabelSafeRandAugment(
             num_ops=2,
             magnitude=9,
             num_magnitude_bins=31,
@@ -295,31 +310,13 @@ class RandAugmentTransform(BaseTransform):
             fill=None,
         )
 
-    def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.randAugment(img_pil)
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}()"
-
 
 @TRANSFORMS.register_module()
-class TrivialAugmentWideTransform(BaseTransform):
+class TrivialAugmentWideTransform(_LabelSafeAutoAugmentTransform):
     def __init__(self):
-        self.trivialAugment = TrivialAugmentWide(
+        self.policy = LabelSafeTrivialAugmentWide(
             num_magnitude_bins=31, interpolation=InterpolationMode.NEAREST, fill=None
         )
-
-    def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.trivialAugment(img_pil)
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}()"
 
 
 ####### Photometric AutoAugment Based Augmentations #######

@@ -13,119 +13,35 @@ from torchvision.transforms.v2 import (
     Transform,
 )
 
-# Common augmentation space for color transformations excluding spatial operations.
-_COLOR_AUGMENTATION_SPACE = {
-    "Identity": (lambda num_bins, height, width: None, False),
-    "Posterize": (
-        lambda num_bins, height, width: (
-            4 - (torch.arange(num_bins) / ((num_bins - 1) / 4))
-        )
-        .round()
-        .int(),
-        False,
-    ),
-    "Solarize": (
-        lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins),
-        False,
-    ),
-    "AutoContrast": (lambda num_bins, height, width: None, False),
-    "Equalize": (lambda num_bins, height, width: None, False),
-    "Brightness": (
-        lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-        True,
-    ),
-    "Color": (lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins), True),
-    "Contrast": (
-        lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-        True,
-    ),
-    "Sharpness": (
-        lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-        True,
-    ),
-}
+# The geometric op ids in torchvision's auto-augment spaces. Every photometric
+# space below is torchvision's own table with exactly these removed, so the
+# magnitudes (Posterize's bit range especially, which differs per method) stay
+# the reference method's rather than a hand-copied table.
+_GEOMETRIC_OPS = frozenset({"ShearX", "ShearY", "TranslateX", "TranslateY", "Rotate"})
+
+
+def _photometric(space):
+    return {k: v for k, v in space.items() if k not in _GEOMETRIC_OPS}
 
 
 class ColorAugMix(AugMixBase):
     """AugMix excluding geometric operations"""
 
-    _PARTIAL_AUGMENTATION_SPACE = {
-        "Posterize": (
-            lambda num_bins, height, width: (
-                4 - (torch.arange(num_bins) / ((num_bins - 1) / 4))
-            )
-            .round()
-            .int(),
-            False,
-        ),
-        "Solarize": (
-            lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins),
-            False,
-        ),
-        "AutoContrast": (lambda num_bins, height, width: None, False),
-        "Equalize": (lambda num_bins, height, width: None, False),
-    }
-
-    _AUGMENTATION_SPACE = {
-        **_PARTIAL_AUGMENTATION_SPACE,
-        "Brightness": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Color": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Contrast": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Sharpness": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-    }
+    _PARTIAL_AUGMENTATION_SPACE = _photometric(AugMixBase._PARTIAL_AUGMENTATION_SPACE)
+    _AUGMENTATION_SPACE = _photometric(AugMixBase._AUGMENTATION_SPACE)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
 
 class ColorAutoAugment(AutoAugmentBase):
-    """AutooAugment excluding geometric operations"""
+    """AutoAugment excluding geometric operations.
 
-    _AUGMENTATION_SPACE = {
-        "Posterize": (
-            lambda num_bins, height, width: (
-                4 - (torch.arange(num_bins) / ((num_bins - 1) / 4))
-            )
-            .round()
-            .int(),
-            False,
-        ),
-        "Solarize": (
-            lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins),
-            False,
-        ),
-        "AutoContrast": (lambda num_bins, height, width: None, False),
-        "Equalize": (lambda num_bins, height, width: None, False),
-        "Brightness": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Color": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Contrast": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Sharpness": (
-            lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins),
-            True,
-        ),
-        "Invert": (lambda num_bins, height, width: None, False),
-    }
+    Not the reference ImageNet policy: the 7 of its 25 sub-policies that contain
+    a Rotate or ShearX are dropped whole, photometric half included.
+    """
+
+    _AUGMENTATION_SPACE = _photometric(AutoAugmentBase._AUGMENTATION_SPACE)
 
     def _get_policies(
         self, policy: AutoAugmentPolicy
@@ -168,7 +84,7 @@ class ColorAutoAugment(AutoAugmentBase):
 class ColorRandAugment(RandAugmentBase):
     """RandAugment excluding geometric operations"""
 
-    _AUGMENTATION_SPACE = _COLOR_AUGMENTATION_SPACE
+    _AUGMENTATION_SPACE = _photometric(RandAugmentBase._AUGMENTATION_SPACE)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -177,7 +93,7 @@ class ColorRandAugment(RandAugmentBase):
 class ColorTrivialAugmentWide(TrivialAugmentWideBase):
     """TrivialAugmentWide excluding geometric operations"""
 
-    _AUGMENTATION_SPACE = _COLOR_AUGMENTATION_SPACE
+    _AUGMENTATION_SPACE = _photometric(TrivialAugmentWideBase._AUGMENTATION_SPACE)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
