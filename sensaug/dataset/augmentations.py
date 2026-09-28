@@ -916,6 +916,7 @@ class RandomAlphaTrainTransform(BaseTransform):
         geometric_only: bool = False,
         photometric_only: bool = False,
         perturbation_set: str = "legacy20",
+        pruned: tuple = (),
     ):
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
@@ -929,7 +930,13 @@ class RandomAlphaTrainTransform(BaseTransform):
         # the pipeline for that set. The guard below is what says so out loud.
         _reject_gpu_set(perturbation_set, type(self).__name__)
         self.perturbation_set = perturbation_set
-        resolve_perturbation_set(perturbation_set, geometric_only, photometric_only)
+        # Static, whole-run exclusion list (--pruned-augmentations), distinct
+        # from the geometric/photometric filters above. See
+        # resolve_perturbation_set's `exclude` param.
+        self.pruned = tuple(pruned)
+        resolve_perturbation_set(
+            perturbation_set, geometric_only, photometric_only, exclude=self.pruned
+        )
 
     def transform(self, results: dict) -> dict:
         results["img"] = np.ascontiguousarray(results["img"].copy())
@@ -940,7 +947,10 @@ class RandomAlphaTrainTransform(BaseTransform):
         num_transforms = 1
 
         perturbations = resolve_perturbation_set(
-            self.perturbation_set, self.geometric_only, self.photometric_only
+            self.perturbation_set,
+            self.geometric_only,
+            self.photometric_only,
+            exclude=self.pruned,
         )
         perturbation_list = list(perturbations.keys()) + ["none"]
 
@@ -1666,7 +1676,10 @@ NON_DIFF32_OPS_PHOTOMETRIC = {
 }
 
 def resolve_perturbation_set(
-    name: str, geometric_only: bool = False, photometric_only: bool = False
+    name: str,
+    geometric_only: bool = False,
+    photometric_only: bool = False,
+    exclude=(),
 ) -> dict:
     """Select a perturbation registry by name, honouring the geometric/photometric
     filters.
@@ -1685,31 +1698,50 @@ def resolve_perturbation_set(
     all three. Callers that need a transform class are CPU-only by construction
     and must never be handed ``diff32`` -- `_perturbation_transform_cfg` raises
     rather than unpacking a callable into a class.
+
+    ``exclude`` is this module's one dispatch point for the static
+    `--pruned-augmentations` list: names in it are dropped from whichever set
+    was selected, AFTER the geometric/photometric filter, so every consumer of
+    this function (the CPU samplers, and -- via
+    ``sensaug.runner_utils._perturbation_transform_cfg`` -- the SA round-eval
+    enumeration) skips them uniformly. A name not present in the selected set
+    (wrong vocabulary, or already excluded by geometric/photometric-only) is
+    silently a no-op here; `train.py` is what warns a pruned name is inert for
+    a given run.
     """
     if name == "legacy20":
         if geometric_only:
-            return LEGACY20_OPS_GEOMETRIC
-        if photometric_only:
-            return LEGACY20_OPS_PHOTOMETRIC
-        return LEGACY20_OPS
+            base = LEGACY20_OPS_GEOMETRIC
+        elif photometric_only:
+            base = LEGACY20_OPS_PHOTOMETRIC
+        else:
+            base = LEGACY20_OPS
 
-    if name == "non-diff32":
+    elif name == "non-diff32":
         if geometric_only:
-            return NON_DIFF32_OPS_GEOMETRIC
-        if photometric_only:
-            return NON_DIFF32_OPS_PHOTOMETRIC
-        return NON_DIFF32_OPS
+            base = NON_DIFF32_OPS_GEOMETRIC
+        elif photometric_only:
+            base = NON_DIFF32_OPS_PHOTOMETRIC
+        else:
+            base = NON_DIFF32_OPS
 
-    if name == GPU_PERTURBATION_SET:
+    elif name == GPU_PERTURBATION_SET:
         if geometric_only:
-            return DIFF32_OPS_GEOMETRIC
-        if photometric_only:
-            return DIFF32_OPS_PHOTOMETRIC
-        return DIFF32_OPS
+            base = DIFF32_OPS_GEOMETRIC
+        elif photometric_only:
+            base = DIFF32_OPS_PHOTOMETRIC
+        else:
+            base = DIFF32_OPS
 
-    raise ValueError(
-        f"unknown perturbation_set {name!r}, expected one of {PERTURBATION_SETS}"
-    )
+    else:
+        raise ValueError(
+            f"unknown perturbation_set {name!r}, expected one of {PERTURBATION_SETS}"
+        )
+
+    if not exclude:
+        return base
+    excluded = set(exclude)
+    return {k: v for k, v in base.items() if k not in excluded}
 
 # @TRANSFORMS.register_module()
 # class PackSegInputs(BaseTransform):

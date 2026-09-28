@@ -131,11 +131,12 @@ def _downweight_soft_weighting(pdf_dict: dict, published: dict, lam: float):
 # to reach for by default, and a result from it should be read next to a
 # soft-weighting run at the same lambda rather than on its own.
 #
-# The geometric caveat in CLAUDE.md bites harder here for the same reason: the 10
-# geometric ops' R is contaminated by image-label misalignment, which makes them
-# look LEAST redundant, so mRMR will preferentially keep them and prune
-# photometric ops. Pair any reportable mRMR run with --photometric-only until
-# warp_image_and_label is wired into the probe.
+# The geometric caveat in CLAUDE.md lands here first: while the probe's geometric
+# rows were contaminated by image-label misalignment they read as LEAST redundant,
+# so mRMR preferentially kept them and pruned photometric ops instead. The warp is
+# in the probe now (warp_image_and_label, in the label's own pixel frame), but no
+# mRMR arm has been re-measured against the corrected R -- so read which ops a
+# stage-1 run prunes before letting stage 2 retrain on that list.
 # --------------------------------------------------------------------------- #
 
 #: Guards the two standardizations below when the spread is degenerate. A uniform
@@ -521,6 +522,8 @@ class GradCorrValLoop(RobustValLoop):
         corr_lambda_ramp: str = "linear",
         corr_downweight_method: str = None,
         corr_skip_pruned_eval: bool = False,
+        pruned_augmentations: list = None,
+        hold_none_prob: bool = False,
         fp16: bool = False,
     ) -> None:
         super().__init__(
@@ -539,6 +542,8 @@ class GradCorrValLoop(RobustValLoop):
             weighted_augs=weighted_augs,
             perturbation_set=perturbation_set,
             corr_skip_pruned_eval=corr_skip_pruned_eval,
+            pruned_augmentations=pruned_augmentations,
+            hold_none_prob=hold_none_prob,
             fp16=fp16,
         )
 

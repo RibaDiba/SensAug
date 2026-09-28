@@ -309,6 +309,19 @@ class CollectGradientHook(Hook):
             R still has a same-length, correctly-clustered row for it and it can
             still compete to un-prune next round. Defaults to False: today's
             behaviour, every op measured every sweep.
+        static_pruned_ops (Sequence[str]): Ops removed for the WHOLE run by
+            ``--pruned-augmentations``. Never measured, never backfilled: their
+            row in R is all-NaN and they are reported as ``static_pruned``, not
+            as ``dropped`` (measured but variance-free) and not as stale
+            (measured earlier, reused now). A deliberately separate mechanism
+            from ``skip_pruned`` above, because the two answer different
+            questions -- an mRMR-pruned op may return next round and so needs a
+            real, if stale, row to be ranked back in, while a statically pruned
+            op is gone for the run and has no prior measurement to carry
+            forward. Routing it through ``skip_pruned`` would hit that path's
+            ``op in self._last_full_row`` guard and silently measure it anyway.
+            STATIC, like ``full_recheck_iters``: fixed at config-build time from
+            the CLI, with no runner state to read.
         full_recheck_iters (Sequence[int]): The subset of ``fire_iters`` on
             which ``skip_pruned`` is ignored and every op is measured regardless
             -- normally the iterations that coincide with an SA-curve recompute
@@ -338,6 +351,7 @@ class CollectGradientHook(Hook):
         fire_iters=None,
         skip_pruned: bool = False,
         full_recheck_iters=(),
+        static_pruned_ops=(),
     ) -> None:
         if magnitude_mode not in MAGNITUDE_MODES:
             raise ValueError(
@@ -352,6 +366,23 @@ class CollectGradientHook(Hook):
         self.magnitude_mode = magnitude_mode
         self.magnitudes_path = magnitudes_path
         self.skip_pruned = skip_pruned
+
+        # Validated here rather than tolerated: a typo'd op name would otherwise
+        # read as "nothing to prune" and the run would quietly measure the full
+        # 32. train.py already rejects unknown names at the CLI, so reaching this
+        # means a hand-built config.
+        self.static_pruned_ops = frozenset(static_pruned_ops or ())
+        unknown = self.static_pruned_ops - set(DIFF32_OPS)
+        if unknown:
+            raise ValueError(
+                f"static_pruned_ops {sorted(unknown)} are not differentiable op "
+                f"names; the gradient probe only knows {sorted(DIFF32_OPS)}."
+            )
+        if self.static_pruned_ops == set(DIFF32_OPS):
+            raise ValueError(
+                "static_pruned_ops names every op the probe measures, so R "
+                "would be entirely NaN. Drop --aug-type=grad_corr instead."
+            )
 
         # Same validation posture as PerturbationSensitivityAnalysisHookWithGradients's
         # control_iters: a full-recheck iteration only means anything against an
@@ -557,8 +588,16 @@ class CollectGradientHook(Hook):
             else getattr(runner, "corr_pruned_ops", frozenset())
         )
         skip_ops = frozenset(op for op in raw_skip_ops if op in self._last_full_row)
+        # Statically pruned ops come out UNCONDITIONALLY -- not gated on
+        # skip_pruned, and not restored by a full recheck. There is nothing to
+        # recheck: --pruned-augmentations removed them from training for the
+        # whole run, so the quantity R would report for them does not exist.
+        # Kept out of `skip_ops` (and so out of the backfill/stale accounting
+        # below) because those two sets mean different things downstream.
         active_ops = {
-            name: op for name, op in DIFF32_OPS.items() if name not in skip_ops
+            name: op
+            for name, op in DIFF32_OPS.items()
+            if name not in skip_ops and name not in self.static_pruned_ops
         }
 
         n_batches = n_images = 0
@@ -659,8 +698,21 @@ class CollectGradientHook(Hook):
         # stale), which is what keeps it eligible to be ranked back in next
         # round rather than reading as "dropped, exempt" (see the class
         # docstring's skip_pruned entry).
+        #
+        # Statically pruned ops take a third branch: neither measured nor
+        # backfilled (there is no prior measurement to backfill FROM), so they
+        # get an all-NaN row of the right length. That keeps every op's column
+        # alignment and chunk structure intact -- stack_probe_buffer and the
+        # bootstrap both assume a rectangular buffer -- while making the absence
+        # explicit rather than encoding it as a zero, which would read as a real
+        # gradient of zero and correlate with everything.
         stale_ops = []
         for name in DIFF32_OPS:
+            if name in self.static_pruned_ops:
+                self.grad_buffer[name] = [
+                    np.full(size, np.nan, dtype=np.float64) for size in batch_sizes
+                ]
+                continue
             if name in active_ops:
                 if self.grad_buffer[name]:
                     self._last_full_row[name] = np.concatenate(self.grad_buffer[name])
@@ -691,6 +743,11 @@ class CollectGradientHook(Hook):
         # aug_grad_magnitude_info below: silently blending stale rows in with
         # fresh ones would make a matrix look more current than it is.
         runner.aug_grad_stale_ops = frozenset(stale_ops)
+        # Read by the same hook, and kept SEPARATE from stale_ops/dropped: those
+        # two mean "measured, reused" and "measured, no variance", while this
+        # means "never measured, by construction". Only the third is a statement
+        # about the experiment's design rather than about the data.
+        runner.aug_grad_static_pruned = frozenset(self.static_pruned_ops)
 
         # Handed to PerturbationSensitivityAnalysisHookWithGradients, which records
         # it with R. Without it a fixed-0.5 matrix and an SA-driven matrix are
@@ -716,6 +773,12 @@ class CollectGradientHook(Hook):
                 f"last real measurement: {', '.join(sorted(stale_ops))}"
                 if stale_ops
                 else ""
+            )
+            + (
+                f" -- {len(self.static_pruned_ops)} statically pruned op(s) not "
+                f"measured, NaN row: {', '.join(sorted(self.static_pruned_ops))}"
+                if self.static_pruned_ops
+                else ""
             ),
             logger="current",
         )
@@ -731,10 +794,11 @@ class CollectGradientHook(Hook):
 
         `snapshot` is the SA-published per-op magnitude distribution, or ``{}``
         for the fixed-magnitude fallback. `active_ops` is normally all of
-        `DIFF32_OPS` -- it excludes whatever `_sweep` decided to skip this sweep
-        under `skip_pruned`, which is where the actual forward+backward savings
-        come from (skipped ops never reach `_grad_for_op`, backfilled by the
-        caller from a cached prior measurement instead).
+        `DIFF32_OPS`, minus two exclusions `_sweep` applies -- ops skipped this
+        sweep under `skip_pruned`, and ops removed for the whole run by
+        `static_pruned_ops`. Both are where the actual forward+backward savings
+        come from: neither reaches `_grad_for_op`. The caller fills the first
+        from a cached prior measurement and the second with NaN.
 
         Assumes the caller has already put the model in eval mode and taken
         responsibility for restoring the RNG (see _sweep).

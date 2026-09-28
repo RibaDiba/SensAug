@@ -232,11 +232,12 @@ def test_full_magnitude_actually_changes_pixels(name, bgr_image):
 
 @pytest.mark.parametrize("name", sorted(NON_DIFF32_OPS_GEOMETRIC))
 def test_geometric_ops_warp_the_label_with_the_image(name, bgr_image, seg_map):
-    """The property that makes these safe to TRAIN on, and the one their
-    differentiable counterparts lack: aa.py documents that neither _DiffAugTransform
-    nor CollectGradientHook._grad_for_op moves gt_seg_map, so the diff geometrics'
-    measured dL/dmagnitude is dominated by image-label misalignment. The CPU classes
-    warp both, so training on them is not learning from a misregistered target."""
+    """The property that makes these safe to TRAIN on: a geometric op that moved the
+    image and left gt_seg_map behind would have every pixel paired with the wrong
+    class. The CPU classes get it structurally -- each `_x` method rebuilds its cv2
+    matrix from whichever array it is warping, so image and label are each warped in
+    their own frame. The diff32 path reaches the same place through
+    geometric_affine_matrix + warp_image_and_label instead."""
     transform_cls, _ = NON_DIFF32_OPS[name]
 
     results = transform_cls(magnitude=0.8)(
@@ -273,6 +274,42 @@ def test_geometric_and_photometric_filters_partition_the_non_diff32_set():
 def test_unknown_perturbation_set_still_raises():
     with pytest.raises(ValueError, match="unknown perturbation_set"):
         resolve_perturbation_set("legacy")
+
+
+# --- static pruning (--pruned-augmentations) -----------------------------------
+
+
+def test_exclude_drops_the_named_ops():
+    pruned = resolve_perturbation_set("legacy20", exclude=("ShearX", "Rotate"))
+    assert "ShearX" not in pruned
+    assert "Rotate" not in pruned
+    assert len(pruned) == len(LEGACY20_OPS) - 2
+
+
+def test_exclude_empty_is_a_no_op():
+    assert resolve_perturbation_set("legacy20", exclude=()) == LEGACY20_OPS
+    assert resolve_perturbation_set("legacy20") == LEGACY20_OPS
+
+
+def test_exclude_everything_returns_empty_dict_without_raising():
+    assert resolve_perturbation_set("legacy20", exclude=list(LEGACY20_OPS)) == {}
+
+
+def test_exclude_composes_with_geometric_only():
+    """exclude is applied AFTER the geometric/photometric filter, so pruning a
+    photometric op has no effect on a geometric_only-filtered set."""
+    geometric = resolve_perturbation_set(
+        "legacy20", geometric_only=True, exclude=("BrightnessTransform",)
+    )
+    assert geometric == resolve_perturbation_set("legacy20", geometric_only=True)
+
+
+def test_exclude_a_name_not_in_the_selected_set_is_inert():
+    """A 32-op snake_case name pruned on legacy20 (PascalCase keys) shares no
+    name with the set -- silently a no-op here. train.py is what warns about
+    this case for a real run; the vocabulary-selection function itself never
+    raises on it."""
+    assert resolve_perturbation_set("legacy20", exclude=("lighter_R",)) == LEGACY20_OPS
 
 
 # --- cfg resolution is vocabulary-aware ---------------------------------------

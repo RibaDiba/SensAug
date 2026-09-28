@@ -119,6 +119,85 @@ def resolve_interval(cli_value, key, default):
     return default if configured is None else configured
 
 
+def resolve_pruned_augmentations(cli_value):
+    """Resolve the pruned-op list: CLI flag > cluster config's `pruned_augmentations:`.
+
+    `cli_value` is `None` when `--pruned-augmentations` was never passed, which
+    means "use the cluster config's list as-is". An explicit CLI value --
+    including an explicit empty one, e.g. `--pruned-augmentations` alone --
+    overrides the config list rather than merging with it, matching
+    `resolve_interval`'s CLI > config precedence for the schedule.
+    """
+    if cli_value is not None:
+        return list(cli_value)
+    return list(PRUNED_AUGMENTATIONS)
+
+
+def validate_pruned_augmentations(names, known):
+    """Raise ValueError if any of `names` isn't a real augmentation op.
+
+    `known` is the full vocabulary of op names that exist ANYWHERE in the
+    codebase (union across all three perturbation sets), not just the ones
+    active for the current --aug-type -- this is a typo check, not an
+    applicability check. Pulled out of the argparse block so it's testable on
+    its own; the CLI call site turns this into `parser.error(...)` so a bad
+    name is caught before any config is built or work_dir created.
+    """
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise ValueError(
+            f"--pruned-augmentations names not found in any perturbation set: "
+            f"{unknown}. Valid names: {sorted(known)}"
+        )
+
+
+def warn_ignored_pruned_augmentations(args, active_vocab):
+    """Warn (never raise) about a pruned name that exists but is inert here.
+
+    A name can be valid (it's in `validate_pruned_augmentations`'s union of
+    every known op) yet belong to a perturbation set this run never touches --
+    e.g. a snake_case diff32/non-diff32 name pruned on --aug-type=random,
+    which only ever samples from legacy20's PascalCase names. That is not an
+    error, but a silent no-op here would be a confusing one to debug later,
+    so it gets one line in the run's own log (same posture and call site as
+    warn_ignored_downweight_method -- after Runner.from_cfg, so it lands in
+    {work_dir}/<timestamp>/<timestamp>.log rather than only the SLURM .out).
+    """
+    inert = [n for n in args.pruned_augmentations if n not in active_vocab]
+    if not inert:
+        return
+
+    print_log(
+        f"[pruned-augmentations] {inert} are valid op names but not part of "
+        f"the perturbation set this run (--aug-type={args.aug_type}) actually "
+        f"samples from, so pruning them has no effect here.",
+        logger="current",
+        level=logging.WARNING,
+    )
+
+
+def _active_pruning_vocab(args):
+    """The op-name vocabulary this run actually samples from, for the pruned-
+    augmentations inertness warning.
+
+    Mirrors the perturbation_set choices build_config makes when it assembles
+    the training pipeline (the `augmentation_type in (...)` branch around the
+    "random"/"ours"/"grad_corr"/"default" pipeline entries, and
+    cfg.val_cfg.perturbation_set for the SA-loop arms): "random" samples from
+    the 20 PascalCase LEGACY20_OPS names; "ours"/"grad_corr"/"default" all
+    train on the 32 shared diff32/non-diff32 snake_case names (DIFF32_OPS).
+    Every other --aug-type (none, autoaugment, augmix, randaugment,
+    trivialaugment, idbh, vip) does not sample from either perturbation-set
+    registry at all, so pruning is unconditionally inert there -- returning an
+    empty set flags every pruned name as such.
+    """
+    if args.aug_type == "random":
+        return set(LEGACY20_OPS)
+    if args.aug_type in ("ours", "grad_corr", "default"):
+        return set(DIFF32_OPS)
+    return set()
+
+
 def warn_ignored_downweight_method(args):
     """Warn when `--corr-downweight-method` was supplied but nothing will read it.
 
@@ -167,15 +246,47 @@ def warn_ignored_downweight_method(args):
     )
 
 
+SKIP_PRUNED_EVAL_REJECTION = (
+    "--corr-skip-pruned-eval is not supported on --aug-type=grad_corr.\n\n"
+    "It would skip the gradient sweep for whatever ops the down-weighting "
+    "method currently has pruned and backfill each of them from "
+    "CollectGradientHook._last_full_row -- gradients measured at an EARLIER "
+    "checkpoint. Those rows are then correlated against freshly measured ones, "
+    "so a single R mixes vintages and successive emissions are no longer "
+    "comparable to each other. Watching R change as the model improves is what "
+    "a grad_corr session is for, so this is not a saving the pipeline can take.\n\n"
+    "If the goal is to stop training on an op: prune it statically with "
+    "--pruned-augmentations. That excludes it from the SA round-eval, the "
+    "training pdf and the gradient sweep alike, and its row of R is recorded as "
+    "'static_pruned' (never measured) rather than backfilled."
+)
+
+
+def reject_skip_pruned_eval(args):
+    """Return a rejection message for `--corr-skip-pruned-eval`, or None.
+
+    Errors on `grad_corr` -- the ONE arm where the flag could act -- for the
+    reason spelled out in SKIP_PRUNED_EVAL_REJECTION: skipping trades a
+    comparable R for compute the measurement cannot spare.
+
+    Returns a string rather than raising so the CLI can route it through
+    `parser.error` (exit 2, before any config is built or work_dir created)
+    while the tests can assert on it directly.
+    """
+    if not args.corr_skip_pruned_eval or args.aug_type != "grad_corr":
+        return None
+    return SKIP_PRUNED_EVAL_REJECTION
+
+
 def warn_ignored_skip_pruned_eval(args):
-    """Warn when `--corr-skip-pruned-eval` was supplied but nothing will prune.
+    """Warn when `--corr-skip-pruned-eval` was supplied on an arm that ignores it.
 
     `runner.corr_pruned_ops` is only ever non-empty under a
-    HARD_PRUNING_METHODS arm (today, just mRMR) -- every soft method
-    structurally never drives a pdf entry to exactly zero. So on any other
-    arm this flag is a no-op skip-list that's always empty: correct, but
-    silently so, which reads exactly like the optimization firing when it
-    never has anything to skip.
+    HARD_PRUNING_METHODS arm (today, just mRMR) running `GradCorrValLoop`, so on
+    every other arm this flag is a no-op skip-list that's always empty: correct,
+    but silently so, which reads exactly like the optimization firing when it
+    never has anything to skip. `grad_corr` itself never reaches here --
+    `reject_skip_pruned_eval` has already stopped the run at the CLI.
 
     Same posture as warn_ignored_downweight_method: never raises, called from
     train() after Runner.from_cfg so the warning lands in the run's own log
@@ -184,29 +295,35 @@ def warn_ignored_skip_pruned_eval(args):
     if not args.corr_skip_pruned_eval:
         return
 
-    if args.aug_type != "grad_corr":
-        why = (
-            f"--aug-type={args.aug_type} builds no GradCorrValLoop, so nothing "
-            f"ever publishes runner.corr_pruned_ops for either sweep to read."
-        )
-    elif args.no_corr_sa:
-        why = (
-            "--no-corr-sa builds the stock ValLoop instead of GradCorrValLoop, "
-            "so nothing publishes a pruned-op set here either."
-        )
-    elif args.corr_downweight_method not in HARD_PRUNING_METHODS:
-        why = (
-            f"--corr-downweight-method={args.corr_downweight_method!r} is soft "
-            f"by construction (never drives a pdf entry to exactly zero), so "
-            f"corr_pruned_ops is always empty and there is nothing to skip. "
-            f"Hard-pruning methods: {sorted(HARD_PRUNING_METHODS)}."
-        )
-    else:
+    print_log(
+        f"[skip-pruned-eval] --corr-skip-pruned-eval is set but will NOT skip "
+        f"anything: --aug-type={args.aug_type} builds no GradCorrValLoop, so "
+        f"nothing ever publishes runner.corr_pruned_ops for either sweep to "
+        f"read. To exclude an op from this run, use --pruned-augmentations.",
+        logger="current",
+        level=logging.WARNING,
+    )
+
+
+def warn_ignored_hold_none_prob(args):
+    """Warn when `--hold-none-prob` was supplied but there is no drift to hold.
+
+    The flag only does anything when --pruned-augmentations removed at least one
+    op from the vocabulary this run samples from: with nothing pruned the
+    denominator it pins is already the surviving count. Silent inertness here
+    would be the bad kind -- the launch command reads as if the augmentation
+    rate had been controlled for.
+    """
+    if not args.hold_none_prob:
+        return
+    effective = set(args.pruned_augmentations) & _active_pruning_vocab(args)
+    if effective:
         return
 
     print_log(
-        f"[skip-pruned-eval] --corr-skip-pruned-eval is set but will NOT skip "
-        f"anything: {why}",
+        f"[hold-none-prob] --hold-none-prob is set but no op is pruned from the "
+        f"vocabulary --aug-type={args.aug_type} samples from, so P(none) is "
+        f"already at its unpruned value and nothing is held.",
         logger="current",
         level=logging.WARNING,
     )
@@ -365,6 +482,7 @@ def build_config(args):
 
     cfg.test_dataloader = cfg.val_dataloader
 
+
     # Set up working dir to save files and logs.
     cfg.work_dir = os.path.join(args.work_dir, args.exp_name)
 
@@ -448,6 +566,7 @@ def build_config(args):
                         geometric_only=args.geometric_only,
                         photometric_only=args.photometric_only,
                         perturbation_set="legacy20",
+                        pruned=tuple(args.pruned_augmentations),
                     )
                 )
         elif augmentation_type == "idbh":
@@ -570,6 +689,8 @@ def build_config(args):
         cfg.val_cfg.geometric_only = args.geometric_only
         cfg.val_cfg.photometric_only = args.photometric_only
         cfg.val_cfg.weighted_augs = args.weighted_augs
+        cfg.val_cfg.pruned_augmentations = args.pruned_augmentations
+        cfg.val_cfg.hold_none_prob = args.hold_none_prob
         # Lever 3's two knobs only exist on GradCorrValLoop. Setting them
         # unconditionally would attach kwargs RobustValLoop does not accept, and
         # under --no-corr-sa (sa_loop False) there is no custom val loop at all --
@@ -582,7 +703,10 @@ def build_config(args):
             # implicit default here would be a silent arm -- unrecoverable from the
             # checkpoint, the logs or the work_dir name after the fact.
             cfg.val_cfg.corr_downweight_method = args.corr_downweight_method
-            cfg.val_cfg.corr_skip_pruned_eval = args.corr_skip_pruned_eval
+            # Always False: reject_skip_pruned_eval has already stopped the run
+            # at the CLI if it was asked for. Passed explicitly rather than
+            # dropped so the loop's signature stays the shape the tests exercise.
+            cfg.val_cfg.corr_skip_pruned_eval = False
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio
@@ -650,24 +774,9 @@ def build_config(args):
                 f"-> iters {list(fire_iters)} (control: {list(control_iters)})"
             )
 
-        if args.corr_skip_pruned_eval and (args.corr_sync_sa or corr_interval is not None):
-            dist_print(
-                "WARNING: --corr-skip-pruned-eval cannot determine full-recheck "
-                "rounds on a plain interval clock (--corr-sync-sa/--corr-interval "
-                "put the gradient sweep on a clock with no notion of an SA "
-                "round); CollectGradientHook will measure every op every sweep "
-                "regardless. The round-eval side (test_perturbed_new) is "
-                "unaffected -- its cadence comes from SA_CURVE_CADENCE directly."
-            )
-        elif args.corr_skip_pruned_eval and fire_iters and not full_recheck_iters:
-            dist_print(
-                f"WARNING: this schedule's corr_rounds never land on an "
-                f"SA-curve recompute round, so a pruned op would never be "
-                f"freshly re-measured on the gradient-sweep side for the rest "
-                f"of the run. CollectGradientHook will measure every op every "
-                f"sweep regardless (the optimization is inactive there); the "
-                f"round-eval side is unaffected."
-            )
+        # (The two --corr-skip-pruned-eval schedule warnings that used to sit here
+        # are gone with the flag: reject_skip_pruned_eval stops that combination
+        # at the CLI, so neither could ever fire.)
 
         # The priorities are load-bearing, not cosmetic: both hooks act in
         # after_train_iter, and the correlation hook must see the sweep the
@@ -680,8 +789,12 @@ def build_config(args):
                 sweep_batch_size=1,
                 magnitude_mode=args.corr_magnitude_mode,
                 magnitudes_path=args.corr_magnitudes,
-                skip_pruned=args.corr_skip_pruned_eval,
+                skip_pruned=False,  # see reject_skip_pruned_eval
                 full_recheck_iters=full_recheck_iters,
+                # Statically pruned ops are excluded from the sweep entirely and
+                # get an all-NaN row -- a separate mechanism from skip_pruned,
+                # which backfills from cache. See the hook's class docstring.
+                static_pruned_ops=args.pruned_augmentations,
                 priority="NORMAL",
             ),
             dict(
@@ -713,6 +826,7 @@ def build_config(args):
     # mean/std, which is carried through untouched.
     if uses_gpu_augmentation(args.aug_type):
         cfg.model.data_preprocessor.type = "GpuAugSegDataPreProcessor"
+        cfg.model.data_preprocessor.pruned_ops = args.pruned_augmentations
 
     cfg.randomness = dict(seed=0, diff_rank_seed=False)
 
@@ -745,6 +859,8 @@ def train(args):
     # reported as merely ignored.
     warn_ignored_downweight_method(args)
     warn_ignored_skip_pruned_eval(args)
+    warn_ignored_pruned_augmentations(args, _active_pruning_vocab(args))
+    warn_ignored_hold_none_prob(args)
 
     # Install the initial uniform training policy for the GPU arms.
     #
@@ -780,6 +896,7 @@ if __name__ == "__main__":
     SUPPORTED_BACKBONES = _seg["SUPPORTED_BACKBONES"]
     SCHEDULE            = _seg["SCHEDULE"]
     PRETRAINED_CACHE_DIR = _seg["PRETRAINED_CACHE_DIR"]
+    PRUNED_AUGMENTATIONS = _seg["PRUNED_AUGMENTATIONS"]
 
     parser = argparse.ArgumentParser(description="main")
     parser.add_argument(
@@ -1036,23 +1153,55 @@ if __name__ == "__main__":
         "--corr-skip-pruned-eval",
         action="store_true",
         default=False,
-        help="skip the expensive gradient sweep (CollectGradientHook) and the "
-        "expensive round-eval (RobustValLoop.test_perturbed_new) for whatever ops "
-        "--corr-downweight-method=mRMR currently has pruned, reusing each op's "
-        "last real measurement instead of re-measuring an op nobody is training "
-        "on. Every SA_CURVE_CADENCE-th round (the round the SA curve itself "
-        "recomputes on) ignores the skip-list and measures everything fresh, so a "
-        "pruned op's numbers cannot go stale forever -- but on the rounds in "
-        "between, its row of R and its mIoU in perturb_eval.txt are a cached, not "
-        "fresh, number. Both logs mark which ops that round's line came from "
-        "cache (corr_matrix_log.json's 'stale' field, perturb_eval.txt's "
-        "'_stale_ops' key) -- filter on those before reusing either log for a "
-        "'did pruning hurt robustness' comparison. Requires "
-        "--corr-downweight-method=mRMR (the only method that can produce a "
-        "pruned set to skip); ignored with a warning otherwise. Buys no savings "
-        "on the gradient-sweep side under --corr-sync-sa/--corr-interval, which "
-        "put that sweep on a clock with no notion of an SA round to full-recheck "
-        "on -- the round-eval side is unaffected by that.",
+        help="REJECTED on --aug-type=grad_corr, which is the only arm where it "
+        "could ever act. It would skip the gradient sweep and the round-eval for "
+        "whatever ops mRMR currently has pruned, backfilling each from its last "
+        "real measurement -- but that makes a skipped op's row of R come from an "
+        "OLDER checkpoint's gradients while every other row is fresh, so R mixes "
+        "vintages and stops being comparable round over round. Watching R evolve "
+        "as the model improves is the entire purpose of a grad_corr session, so "
+        "the saving is not one this pipeline can take. Inert (warned, not "
+        "rejected) on every other --aug-type: nothing but GradCorrValLoop ever "
+        "publishes runner.corr_pruned_ops, so there is no skip-list to read. To "
+        "actually train without an op, prune it statically with "
+        "--pruned-augmentations, which excludes it everywhere and costs R "
+        "nothing.",
+    )
+    parser.add_argument(
+        "--hold-none-prob",
+        action="store_true",
+        default=False,
+        help="hold P(no augmentation) fixed as --pruned-augmentations shrinks "
+        "the bank. The training pdf carries a synthetic ('none', 0) entry whose "
+        "mass is derived from the count of SURVIVING ops, so pruning 6 of 30 "
+        "silently raises it by ~0.7pp -- the pruned arm then trains on clean "
+        "images that much more often than its control, a second difference "
+        "sitting inside the comparison. With this flag the denominator counts "
+        "the pruned ops as if still present, so their mass goes to the surviving "
+        "ops and the augmentation RATE is unchanged: the prune alters which "
+        "augmentation is sampled, never how often one is. Same invariant "
+        "--corr-downweight-method=mRMR already holds internally. Off by default, "
+        "so a run launched before this flag existed is reproduced exactly. "
+        "Inert (warned) without --pruned-augmentations. Applies to "
+        "generate_pdf_new (the default) and --uniform; NOT to --weighted-augs, "
+        "whose rate moves with the op count for a different reason (a truncated "
+        "beta-binomial over all (op, level) pairs) that this flag does not "
+        "address.",
+    )
+    parser.add_argument(
+        "--pruned-augmentations",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="OP_NAME",
+        help="op names to permanently exclude from sampling for this entire "
+        "run, regardless of --aug-type. Overrides (does not merge with) the "
+        "cluster config's `pruned_augmentations:` list. Valid names are "
+        "LEGACY20_OPS' 20 PascalCase names or the 32 shared diff32/non-diff32 "
+        "snake_case names in sensaug/dataset/augmentations.py -- an unknown "
+        "name aborts before any config is built or work_dir created. A "
+        "known name that isn't part of the vocabulary this run's --aug-type "
+        "actually samples from is accepted but logged as inert.",
     )
     parser.add_argument(
         "--adamw",
@@ -1109,6 +1258,26 @@ if __name__ == "__main__":
             "down-weighting arm is not recoverable from the checkpoint or the "
             "logs afterwards, so it has to be stated up front."
         )
+
+    # Resolve CLI > cluster config, then validate against every known op name
+    # BEFORE any config is built, checkpoint loaded, or work_dir created --
+    # same fail-fast posture as the grad_corr check above. Re-assigned onto
+    # args so build_config can just read args.pruned_augmentations like every
+    # other resolved flag.
+    args.pruned_augmentations = resolve_pruned_augmentations(args.pruned_augmentations)
+    try:
+        validate_pruned_augmentations(
+            args.pruned_augmentations, set(LEGACY20_OPS) | set(DIFF32_OPS)
+        )
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Same fail-fast posture, and the same reason: rejecting a flag combination
+    # after Runner.from_cfg would mean discovering it a compute node and a
+    # scheduler queue later.
+    rejection = reject_skip_pruned_eval(args)
+    if rejection is not None:
+        parser.error(rejection)
 
     if args.exp_name is None:
         args.exp_name = f"ours_{args.backbone}_{args.dataset}"

@@ -833,3 +833,74 @@ def test_an_interval_run_labels_every_emission_active(tmp_path):
 def test_a_control_round_outside_the_schedule_is_refused(tmp_path):
     with pytest.raises(ValueError, match="not in fire_iters"):
         _scheduled_hook(tmp_path, fire_iters=(20, 44), control_iters=(16,))
+
+
+# --- statically pruned ops ----------------------------------------------------
+#
+# CollectGradientHook writes an all-NaN row for anything --pruned-augmentations
+# removed, which correlate() then reports as dropped. `dropped` has to keep
+# meaning "the measurement failed", because that is the number worth chasing when
+# it rises; a configured absence belongs in its own field.
+
+
+def _pruned_runner(tmp_path, pruned, n_probes=6, batch=4):
+    """A buffer where `pruned`'s rows are NaN, exactly as the sweep writes them."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    _fill(buffer, n_probes=n_probes, batch=batch)
+    for name in pruned:
+        buffer[name] = [np.full(batch, np.nan) for _ in range(n_probes)]
+    runner.aug_grad_static_pruned = frozenset(pruned)
+    return runner
+
+
+def test_static_pruned_is_recorded_and_kept_out_of_dropped(tmp_path):
+    pruned = [NAMES[1], NAMES[4]]
+    runner = _pruned_runner(tmp_path, pruned)
+    hook = _hook()
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["static_pruned"] == sorted(pruned)
+    assert record["dropped"] == []
+    assert not set(record["dropped"]) & set(record["static_pruned"])
+    # R keeps its full shape -- the pruned ops are present as NaN rows, not
+    # removed from the index, so a log is comparable across arms.
+    assert record["names"] == NAMES
+    assert np.array(record["R_raw"], dtype=float).shape == (N_OPS, N_OPS)
+
+
+def test_a_genuinely_dropped_op_is_still_reported_as_dropped(tmp_path):
+    """The other half of the same claim: subtracting static_pruned must not
+    subtract a real failure."""
+    runner = _pruned_runner(tmp_path, [NAMES[1]])
+    # A constant row: measured, but no variance -- the real "dropped" case.
+    # normalize_per_image=False because the per-image scale divide turns a
+    # constant row back into a varying one, and `dropped` is read off the
+    # normalized matrix when normalization is on.
+    runner.aug_grad_buffer[NAMES[3]] = [np.full(4, 7.0) for _ in range(6)]
+    hook = _hook(normalize_per_image=False)
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["dropped"] == [NAMES[3]]
+    assert record["static_pruned"] == [NAMES[1]]
+
+
+def test_no_static_prune_records_an_empty_list(tmp_path):
+    """The regression guard: an ordinary grad_corr run gains a key, nothing else."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    _fill(buffer, n_probes=6)
+    hook = _hook()
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["static_pruned"] == []
+    assert record["dropped"] == []

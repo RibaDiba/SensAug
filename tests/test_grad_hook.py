@@ -714,3 +714,135 @@ def test_a_schedule_is_normalized_to_sorted_unique_iterations():
     hook = CollectGradientHook(fire_iters=[68, 16, 20, 16])
     assert hook.fire_iters == (16, 20, 68)
     assert hook.interval is None
+
+
+# --- statically pruned ops (--pruned-augmentations) ---------------------------
+#
+# A separate mechanism from `skip_pruned`, and the tests below are what keep them
+# separate. `skip_pruned` means "not training on this right now, reuse the last
+# real row"; `static_pruned_ops` means "removed for the whole run, there is no
+# row and there never will be". Routing the second through the first would hit
+# its `op in self._last_full_row` guard and silently measure the op anyway.
+
+STATIC_PRUNED = ["lighter_R", "blur"]
+
+
+def test_static_pruned_ops_are_never_probed(images, tmp_path, monkeypatch):
+    """No forward+backward for a statically pruned op -- that is where the
+    saving is. Asserted at _grad_for_op rather than by timing it."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(
+        tmp_path, [_batch(images)], static_pruned_ops=STATIC_PRUNED
+    )
+
+    probed = []
+    real = CollectGradientHook._grad_for_op
+
+    def spy(self, name, *args, **kwargs):
+        probed.append(name)
+        return real(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(CollectGradientHook, "_grad_for_op", spy)
+    hook._sweep(_FakeRunner(model, iteration=10), checkpoint=0.5)
+
+    assert probed, "the sweep probed nothing at all -- fixture is wrong"
+    for name in STATIC_PRUNED:
+        assert name not in probed, f"{name} reached _grad_for_op"
+        assert name not in hook._last_full_row, f"{name} was measured and cached"
+    for name in DIFFERENTIABLE_PERTURBATIONS:
+        if name not in STATIC_PRUNED:
+            assert name in probed
+
+
+def test_static_pruned_rows_are_nan_not_zero(images, tmp_path):
+    """NaN, never 0.0. A zero row reads as a real gradient of exactly zero and
+    would correlate with everything; NaN is the only value that says 'absent'."""
+    model = _TinySegModel()
+    model.eval()
+    batches = [_batch(images), _batch(images)]
+    hook = _sweep_hook(tmp_path, batches, static_pruned_ops=STATIC_PRUNED)
+
+    hook._sweep(_FakeRunner(model, iteration=10), checkpoint=0.5)
+
+    for name in STATIC_PRUNED:
+        chunks = hook.grad_buffer[name]
+        # Same chunk COUNT and sizes as a measured op: stack_probe_buffer and the
+        # bootstrap's cluster ids both assume a rectangular buffer.
+        assert len(chunks) == len(batches)
+        assert [c.shape for c in chunks] == [
+            c.shape for c in hook.grad_buffer["darker_R"]
+        ]
+        assert all(np.isnan(c).all() for c in chunks)
+
+    # Everything else still measured for real.
+    for name in DIFFERENTIABLE_PERTURBATIONS:
+        if name not in STATIC_PRUNED:
+            assert np.isfinite(np.concatenate(hook.grad_buffer[name])).any()
+
+
+def test_static_pruned_ops_are_not_reported_as_stale(images, tmp_path):
+    """`stale` means measured-earlier-reused-now, which keeps an op eligible to
+    be ranked back in. A statically pruned op is neither, and conflating them
+    would make the R log claim a row exists that never did."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(tmp_path, [_batch(images)], static_pruned_ops=STATIC_PRUNED)
+    runner = _FakeRunner(model, iteration=10)
+
+    hook._sweep(runner, checkpoint=0.5)
+
+    assert runner.aug_grad_stale_ops == frozenset()
+    assert runner.aug_grad_static_pruned == frozenset(STATIC_PRUNED)
+
+
+def test_static_prune_survives_a_full_recheck_iteration(images, tmp_path):
+    """full_recheck_iters un-skips a `skip_pruned` op, on purpose. It must NOT
+    un-skip a statically pruned one: there is nothing to recheck, the op is gone
+    from training for the whole run."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(
+        tmp_path,
+        [_batch(images)],
+        interval=None,
+        fire_iters=(10,),
+        full_recheck_iters=(10,),
+        skip_pruned=True,
+        static_pruned_ops=STATIC_PRUNED,
+    )
+    runner = _FakeRunner(model, iteration=10)
+
+    hook._sweep(runner, checkpoint=0.5)
+
+    for name in STATIC_PRUNED:
+        assert np.isnan(np.concatenate(hook.grad_buffer[name])).all()
+        assert name not in hook._last_full_row
+
+
+def test_unknown_static_pruned_name_is_rejected():
+    """A typo would otherwise read as 'nothing pruned' and the run would quietly
+    sweep the full 32."""
+    with pytest.raises(ValueError, match="not differentiable op names"):
+        CollectGradientHook(interval=1, static_pruned_ops=["NotAnOp"])
+
+
+def test_pruning_every_op_is_rejected():
+    """R would be entirely NaN; that is a config mistake, not a measurement."""
+    with pytest.raises(ValueError, match="entirely NaN"):
+        CollectGradientHook(
+            interval=1, static_pruned_ops=list(DIFFERENTIABLE_PERTURBATIONS)
+        )
+
+
+def test_no_static_prune_is_the_default_and_measures_everything(images, tmp_path):
+    """The regression guard: an existing grad_corr run is unchanged."""
+    model = _TinySegModel()
+    model.eval()
+    hook = _sweep_hook(tmp_path, [_batch(images)])
+
+    hook._sweep(_FakeRunner(model, iteration=10), checkpoint=0.5)
+
+    assert hook.static_pruned_ops == frozenset()
+    for name in DIFFERENTIABLE_PERTURBATIONS:
+        assert np.isfinite(np.concatenate(hook.grad_buffer[name])).any()

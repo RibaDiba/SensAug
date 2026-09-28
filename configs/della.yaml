@@ -27,6 +27,14 @@ schedule:
   # actually read the resulting R on.
   corr_interval: null
 
+# Op names to always exclude from sampling, for the whole run, regardless of
+# --aug-type. Empty by default. See sensaug/dataset/augmentations.py for valid
+# names (LEGACY20_OPS' 20 PascalCase names, or the 32 shared snake_case names
+# in DIFF32_OPS/NON_DIFF32_OPS). train.py validates every name at startup and
+# refuses to run on an unrecognized one. CLI flag --pruned-augmentations
+# overrides this list rather than merging with it.
+pruned_augmentations: []
+
 datasets:
   cityscapes: cityscapes
 supported_backbones:

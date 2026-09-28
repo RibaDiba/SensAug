@@ -563,6 +563,19 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         # treating it like a "dropped" row would make pruning flip-flop every
         # round instead of holding for SA_CURVE_CADENCE rounds).
         stale_names = sorted(getattr(runner, "aug_grad_stale_ops", None) or ())
+        # Ops --pruned-augmentations removed for the whole run. Distinct from
+        # both of the above: `dropped` is measured-but-variance-free and `stale`
+        # is measured-earlier-reused-now, while these were never measured at
+        # all. Their rows are all-NaN by construction (grad_hook writes them
+        # that way), so they land in `dropped_names` too -- but only this key
+        # says WHY, and only this key is a fact about the run's configuration
+        # rather than about the data. Subtracted out of the reported
+        # `dropped` below so that number keeps meaning "R failed to measure
+        # this", which is what makes a rise in it worth investigating.
+        static_pruned = sorted(
+            getattr(runner, "aug_grad_static_pruned", None) or ()
+        )
+        dropped_names = [n for n in dropped_names if n not in set(static_pruned)]
         record = {
             "checkpoint": checkpoint,
             "iter": int(runner.iter),
@@ -578,6 +591,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             "R_scalenorm": r_norm,
             "dropped": dropped_names,
             "stale": stale_names,
+            "static_pruned": static_pruned,
             "shared_factor_loadings": loadings,
             "magnitude_source": magnitude_info.get("source"),
             "magnitude_mode": magnitude_info.get("mode"),
@@ -617,6 +631,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
             f"n_images={n_images} n_probes={n_probes} "
             f"dropped={dropped_names or 'none'} "
             f"stale={stale_names or 'none'} "
+            f"static_pruned={static_pruned or 'none'} "
             f"max_shared_loading={max_loading:.2f} "
             f"magnitudes={magnitude_info.get('source', 'unknown')}/"
             f"{magnitude_info.get('mode', 'unknown')}"
@@ -640,6 +655,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
                 first_r=first_r,
                 loadings=loadings,
                 dropped_names=dropped_names,
+                static_pruned=static_pruned,
                 n_images=n_images,
                 n_probes=n_probes,
                 n_survivors=n_survivors,
@@ -777,6 +793,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         n_cells,
         cell_stats=None,
         magnitude_info=None,
+        static_pruned=(),
     ) -> None:
         """Write R and its diagnostics to TensorBoard.
 
@@ -841,7 +858,14 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         vis.add_scalar("grad_corr/max_shared_loading", max_loading, step)
         vis.add_scalar("grad_corr/n_images", n_images, step)
         vis.add_scalar("grad_corr/summary/n_probes", n_probes, step)
+        # Two separate scalars on purpose: n_dropped is a health signal (a rise
+        # in it means the measurement is degrading and is worth chasing), while
+        # n_static_pruned is flat by construction for a whole run. Summing them
+        # would make a configuration choice look like a measurement failure.
         vis.add_scalar("grad_corr/summary/n_dropped", len(dropped_names), step)
+        vis.add_scalar(
+            "grad_corr/summary/n_static_pruned", len(static_pruned), step
+        )
         if finite.size:
             vis.add_scalar(
                 "grad_corr/summary/mean_abs_offdiag", float(np.abs(finite).mean()), step
@@ -888,7 +912,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
                 "Augmentation gradient cross-correlation"
                 + (" (scale-normalized)" if self.normalize_per_image else " (raw)"),
                 subtitle=subtitle, mark=mark, warn=warn,
-                cbar_label="Pearson r",
+                cbar_label="Pearson r", static_pruned=static_pruned,
             ),
             step,
         )
@@ -903,7 +927,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
                     r_raw, self.names,
                     "Augmentation gradient cross-correlation (raw, confounded)",
                     subtitle=subtitle + " · NOT de-confounded",
-                    cbar_label="Pearson r",
+                    cbar_label="Pearson r", static_pruned=static_pruned,
                 ),
                 step,
             )
@@ -918,6 +942,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
                     r_primary - first_r, self.names,
                     "Drift in R since this run's first emission",
                     subtitle=subtitle, cbar_label="Δ Pearson r",
+                    static_pruned=static_pruned,
                 ),
                 step,
             )
@@ -925,11 +950,13 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
         self._log_tb_extras(
             vis, step, checkpoint, finite, r_primary, dropped_names,
             n_images, n_probes, max_loading, cell_stats, magnitude_info,
+            static_pruned,
         )
 
     def _log_tb_extras(
         self, vis, step, checkpoint, offdiag_finite, r_primary, dropped_names,
         n_images, n_probes, max_loading, cell_stats, magnitude_info,
+        static_pruned=(),
     ) -> None:
         """The histogram and text tabs, which need the raw SummaryWriter.
 
@@ -956,6 +983,7 @@ class PerturbationSensitivityAnalysisHookWithGradients(Hook):
                     checkpoint=checkpoint, iteration=step,
                     n_images=n_images, n_probes=n_probes,
                     dropped_names=dropped_names,
+                    static_pruned=static_pruned,
                     magnitude_source=magnitude_info.get("source"),
                     magnitude_mode=magnitude_info.get("mode"),
                     max_shared_loading=max_loading,

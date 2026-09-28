@@ -415,3 +415,32 @@ def test_every_method_declines_with_a_reason_when_no_score_is_published(name):
 
     assert not result.applied
     assert result.reason
+
+
+def test_mrmr_ranking_is_invariant_to_a_global_rescale_of_the_perturbation_mass():
+    """--hold-none-prob scales every non-`none` entry by one constant.
+
+    mRMR's relevance is per-op pdf mass, then z-scored, so a global scale cancels
+    and the ranking is unchanged. This pins that: the flag changes how often
+    augmentation fires, and must not quietly change WHICH ops mRMR keeps.
+    """
+    published = _published(seed=3)
+    pdf = _pdf()
+
+    scaled = {}
+    free = 0.87  # any perturbation mass != the original
+    old_free = sum(p for k, p in pdf.items() if k != NONE_KEY)
+    for key, prob in pdf.items():
+        scaled[key] = prob if key == NONE_KEY else prob * (free / old_free)
+    scaled[NONE_KEY] = 1.0 - free
+
+    base = DOWNWEIGHT_METHODS["mRMR"](pdf, published, 0.5)
+    other = DOWNWEIGHT_METHODS["mRMR"](scaled, published, 0.5)
+
+    assert base.applied and other.applied
+    kept = lambda res: {k[0] for k, p in res.pdf.items() if k != NONE_KEY and p > 0}
+    assert kept(base) == kept(other)
+    # And the same ops are driven to exactly zero, not merely a similar number.
+    zeroed = lambda res: {k[0] for k, p in res.pdf.items() if k != NONE_KEY and p == 0}
+    assert zeroed(base) == zeroed(other)
+    assert zeroed(base), "lambda=0.5 pruned nothing -- the test proves nothing"

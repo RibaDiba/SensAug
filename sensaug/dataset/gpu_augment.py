@@ -148,12 +148,17 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
     the other's state. `forward`'s `training` flag selects between them.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, pruned_ops: Sequence[str] = (), **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # (kind, payload): ("uniform", (geo, photo)) | ("pdf", pdf_dict) | None
         self._train_spec: Optional[Tuple[str, object]] = None
         # (op_name, magnitude) | None
         self._eval_spec: Optional[Tuple[str, float]] = None
+        # Static, whole-run exclusion list (--pruned-augmentations). Only
+        # consulted by _op_bank, i.e. the "uniform" train-spec branch
+        # (--random-aug under diff32): the "pdf" branch's keys already exclude
+        # pruned ops upstream, at the SA curve's source (RobustValLoop.pruned_augmentations).
+        self._pruned_ops = frozenset(pruned_ops)
         # Sampling RNG is numpy's global, matching the transforms this replaces
         # (RandomAlphaTrainTransform / RandomTrainTransformNew both call
         # np.random.*), so seeding behaviour is unchanged.
@@ -188,7 +193,7 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
     # --- sampling ------------------------------------------------------------
 
     def _op_bank(self, geometric_only: bool, photometric_only: bool) -> List[str]:
-        names = list(DIFF32_OPS)
+        names = [n for n in DIFF32_OPS if n not in self._pruned_ops]
         if geometric_only:
             return [n for n in names if n in GEOMETRIC_OP_KEYS]
         if photometric_only:
