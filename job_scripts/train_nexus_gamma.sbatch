@@ -1,14 +1,14 @@
 #!/bin/bash
 
-#SBATCH --job-name=ours-hard-ade20k-1
+#SBATCH --job-name=ours-pruned-loveda-1
 #SBATCH --nodes=1
 
 ## GAMMA training config (per the lab's train_generic.sh guidelines)
-#SBATCH --time=36:00:00
+#SBATCH --time=24:00:00
 #SBATCH --qos=huge-long
 #SBATCH --account=gamma
 #SBATCH --partition=gamma
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:rtxa6000:4
 #SBATCH --mem=120gb
 #SBATCH --ntasks=16
 
@@ -49,7 +49,7 @@ set -o pipefail
 
 # ---------------------------------------------------------------- config ----
 # All overridable via env vars.
-NAME="${NAME:-ours-hard-ade20k-1}"
+NAME="${NAME:-ours-pruned-loveda-1}"
 
 # Valid --aug-type values (train.py argparse choices):
 #   none ours default grad_corr random autoaugment augmix randaugment
@@ -58,9 +58,9 @@ NAME="${NAME:-ours-hard-ade20k-1}"
 # setup runs. The sensitivity-informed arm is `ours`; `grad_corr` additionally
 # runs the gradient cross-correlation pipeline (add --no-corr-sa for its control
 # arm: no SA, probes at the fixed 0.5 reference magnitude).
-AUG_TYPE="${1:-grad_corr}"
+AUG_TYPE="${1:-ours}"
 BACKBONE="${2:-segformer}"
-DATASET="${3:-ade20k}"
+DATASET="${3:-loveda}"
 
 # Validate here rather than letting train.py's argparse catch it: under
 # --launcher=pytorch that error prints once per rank (4x on this script) and
@@ -86,7 +86,42 @@ fi
 # Keep "ours" in the name: train.py appends "_ours" to any exp_name lacking it when
 # --aug-type=ours, which would desync EXP_NAME from the real work_dir (and the guard below).
 # RUN_TAG suffixes the name for repeat runs of the same config, e.g. RUN_TAG=seed2.
+# The `null` random-pruning control arm: drop RANDOM_PRUNE_COUNT ops chosen at
+# random, once, and keep them dropped for the whole run. Unset by default, which
+# is no random prune at all. To match a finished mRMR stage-1 run, pass its prune
+# count:
+#
+#   RANDOM_PRUNE_COUNT=$(wc -w < experiments/<stage1>/mrmr_pruned_ops.txt) \
+#     sbatch job_scripts/train_nexus_gamma.sbatch ours segformer ade20k
+#
+# The seed defaults to the SLURM job id -- unique per run, and identical across
+# all four ranks, which is what matters: every rank runs train.py independently
+# and a per-rank seed would train a different bank on each GPU. It is passed
+# EXPLICITLY rather than left for train.py to derive, so EXP_NAME below can carry
+# it (train.py appends the same suffix, and a mismatch would desync EXP_NAME from
+# the real work_dir and defeat the resume guard). Set it by hand to repeat a draw
+# or to sweep several draws of the same size: RANDOM_PRUNE_SEED=1, 2, ...
+RANDOM_PRUNE_COUNT="${RANDOM_PRUNE_COUNT:-}"
+RANDOM_PRUNE_SEED="${RANDOM_PRUNE_SEED:-${SLURM_JOB_ID}}"
+
 EXP_NAME="${4:-${AUG_TYPE}_${NAME}_${BACKBONE}_${DATASET}_4gpu${RUN_TAG:+_${RUN_TAG}}}"
+# Two random draws of the same size at different seeds are different
+# experiments, so both the count and the seed go in the name -- otherwise they
+# share a work_dir, interleave their logs, and the ALLOW_RESUME guard below
+# (which keys off ${WORK_DIR}/${EXP_NAME}/last_checkpoint) has them silently
+# resume each other. Matches the suffix train.py appends, so the two agree.
+if [ -n "${RANDOM_PRUNE_COUNT}" ]; then
+    if [ -z "${RANDOM_PRUNE_SEED}" ]; then
+        # Only reachable outside SLURM, where SLURM_JOB_ID is unset. Refuse
+        # rather than build an EXP_NAME ending in "_s" and let train.py pick its
+        # own seed, which would put a different seed in the run than in its name.
+        echo "ERROR: RANDOM_PRUNE_COUNT is set but RANDOM_PRUNE_SEED is empty" >&2
+        echo "       (no SLURM_JOB_ID to derive it from). Set RANDOM_PRUNE_SEED." >&2
+        exit 1
+    fi
+    EXP_NAME="${EXP_NAME}_nullprune${RANDOM_PRUNE_COUNT}_s${RANDOM_PRUNE_SEED}"
+fi
+
 WORK_DIR="${WORK_DIR:-./experiments}"
 # gamma is a UMD Nexus partition/account -- use the Nexus cluster config, not della's.
 CONFIG="${CONFIG:-configs/nexus.yaml}"
@@ -106,6 +141,50 @@ CORR_LAMBDA="${CORR_LAMBDA:-0.25}"
 EXTRA_ARGS=()
 if [ "${AUG_TYPE}" = "grad_corr" ]; then
     EXTRA_ARGS+=(--corr-downweight-method="${DOWNWEIGHT}" --corr-lambda="${CORR_LAMBDA}")
+fi
+
+# Space-separated op names to permanently exclude from sampling for this
+# entire run, on top of (actually: instead of -- it overrides, not merges)
+# whatever configs/nexus.yaml's pruned_augmentations: already lists. Empty by
+# default, meaning "use the config file's list as-is". train.py validates
+# every name against the full augmentation vocabulary
+# (sensaug/dataset/augmentations.py's LEGACY20_OPS/DIFF32_OPS) and refuses to
+# start on an unrecognized one, so a typo here fails before any GPU is
+# touched rather than mid-run.
+#
+# Available augmentation names (source of truth: sensaug/dataset/augmentations.py) --
+#   LEGACY20_OPS (20, PascalCase -- used by --aug-type=random):
+#     BrightnessTransform, NegativeBrightnessTransform, ColorTransform,
+#     NegativeColorTransform, ContrastTransform, NegativeContrastTransform,
+#     SharpnessTransform, NegativeSharpnessTransform, PosterizeTransform,
+#     SolarizeTransform, ShearX, NegativeShearX, ShearY, NegativeShearY,
+#     TranslateX, NegativeTranslateX, TranslateY, NegativeTranslateY,
+#     Rotate, NegativeRotate
+#   DIFF32_OPS / NON_DIFF32_OPS (32 shared snake_case names -- used by
+#   --aug-type in ours/grad_corr/default; DIFF32_OPS is the GPU-batched
+#   version, NON_DIFF32_OPS the CPU one, same keys):
+#     lighter_R, darker_R, lighter_G, darker_G, lighter_B, darker_B,
+#     lighter_H, darker_H, lighter_S, darker_S, lighter_V, darker_V,
+#     blur, noise, rotate_pos, rotate_neg, shear_x_pos, shear_x_neg,
+#     shear_y_pos, shear_y_neg, translate_x_pos, translate_x_neg,
+#     translate_y_pos, translate_y_neg, brightness_pos, brightness_neg,
+#     contrast_pos, contrast_neg, sharpness_pos, sharpness_neg,
+#     color_pos, color_neg
+# A name only exists in one of the two vocabularies above -- pruning a
+# snake_case name while --aug-type=random (or vice versa) is accepted but
+# logged as inert for that run (see train.py's warn_ignored_pruned_augmentations).
+PRUNED_AUGS="${PRUNED_AUGS-darker_R darker_S lighter_G sharpness_neg sharpness_pos}"
+if [ -n "${PRUNED_AUGS}" ]; then
+    # Deliberately unquoted: it must word-split into separate argv entries
+    # for train.py's `--pruned-augmentations` (nargs="+"), same shape as
+    # TORCHRUN_ARGS above.
+    EXTRA_ARGS+=(--pruned-augmentations ${PRUNED_AUGS})
+fi
+
+if [ -n "${RANDOM_PRUNE_COUNT}" ]; then
+    EXTRA_ARGS+=(--random-prune-method=null
+                 --random-prune-count="${RANDOM_PRUNE_COUNT}"
+                 --random-prune-seed="${RANDOM_PRUNE_SEED}")
 fi
 
 # Your own checkout -- set REPO_DIR to override if it differs from this.
@@ -143,6 +222,22 @@ if [ -z "${ALLOW_RESUME}" ] && [ -f "${WORK_DIR}/${EXP_NAME}/last_checkpoint" ];
     exit 1
 fi
 
+# `conda` itself is not on PATH on a fresh gamma compute-node shell -- this job
+# previously only worked by inheriting miniforge's bin dir from the submitting
+# shell's PATH via SLURM's `--export=ALL` default, which fails differently
+# (and confusingly) the first time it's submitted from a shell that never
+# activated conda itself. Load the module explicitly instead of relying on that.
+# `module` is a shell function only an interactive login shell exports; a job
+# submitted from a script inherits none, so re-source it and fall back to conda's
+# own init rather than dying with a bare 127.
+if ! declare -F module >/dev/null 2>&1 && ! command -v module >/dev/null 2>&1; then
+    for f in /etc/profile.d/modules.sh /etc/profile.d/ummodules.sh; do
+        [ -f "$f" ] && source "$f"
+    done
+fi
+module load miniforge3 2>/dev/null || true
+command -v conda >/dev/null 2>&1 || \
+    source /opt/common/miniforge3/latest/etc/profile.d/conda.sh
 eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV:-sensaug}"
 
@@ -201,6 +296,21 @@ if [ -n "${SKIP_EVAL}" ]; then
 fi
 
 EXP_DIR="${WORK_DIR}/${EXP_NAME}"
+
+# EVAL=all_augs: a full SA val round over every diff32 op, the run's own prune
+# ignored, at the fixed shared levels so every arm is scored at the same
+# magnitudes. Use it for arms test_robust.py can't compare (--aug-type=none has
+# no perturbation_set, so test_robust would sweep legacy20 instead of diff32).
+if [ "${EVAL:-test_robust}" = "all_augs" ]; then
+    torchrun "${TORCHRUN_ARGS[@]}" \
+        scripts/eval_all_augmentations.py \
+        --work-dir "${EXP_DIR}" \
+        --sa-curve sensaug/testing/shared_levels_diff32.json \
+        --launcher pytorch
+    EVAL_STATUS=$?
+    echo "All done: ${EXP_DIR} (eval exit ${EVAL_STATUS})"
+    exit $EVAL_STATUS
+fi
 
 # ------------------------------------------------- robustness evaluation ----
 # test_robust.py rebuilds the config from ${EXP_DIR}/*.py, so it takes NO
