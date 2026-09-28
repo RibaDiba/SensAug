@@ -20,6 +20,7 @@ from sensaug.dataset.augmentations import (
     LEGACY20_OPS,
     IMAGENETC_NAME_FN_DICT,
 )
+from sensaug.dataset.differentiable_augmentations_aa import DIFF32_OPS
 from sensaug.analysis import eval_results_to_csv
 from sensaug.sensitivity_analysis import adaptive_sensitivity_analysis
 from sensaug.runner_utils import (
@@ -191,11 +192,20 @@ def cfg_switch_work_dir(cfg, args, path):
     return cfg
 
 
-def test_robust(cfg, args, sa_results_file="sensaug/testing/test_levels.json"):
+def test_robust(
+    cfg, args, sa_results_file="sensaug/testing/test_levels.json", perturbation_set=None
+):
     perturb_levels = {}
 
     with open(sa_results_file, "r") as fp:
         perturb_levels = json.load(fp)
+
+    if perturbation_set == "diff32":
+        # PosterizeTransform/SolarizeTransform have no diff32 implementation --
+        # keep them on the CPU legacy path so switching the other 32 ops over to
+        # diff32 doesn't silently drop this coverage.
+        perturb_levels["PosterizeTransform"] = [0.25, 0.5, 0.75, 1.0]
+        perturb_levels["SolarizeTransform"] = [0.25, 0.5, 0.75, 1.0]
 
     # add imagenetc transforms
     perturb_levels["motion_blur"] = list(range(1, 6))
@@ -248,9 +258,19 @@ def test_robust(cfg, args, sa_results_file="sensaug/testing/test_levels.json"):
             )
             runner = Runner.from_cfg(cfg)
 
+            # Ops in DIFF32_OPS get the checkpoint's own perturbation_set (GPU,
+            # differentiable, batched -- see sensaug.dataset.gpu_augment); every
+            # other p_type here (legacy CPU ops, ImageNetC corruptions,
+            # combination) has no diff32 form and always goes through the CPU
+            # pipeline path regardless of perturbation_set.
+            op_perturbation_set = perturbation_set if p_type in DIFF32_OPS else None
+
             # construct the dataloader here
             apply_perturbations_dataloader(
-                runner, train=False, perturb_levels={p_type: level}
+                runner,
+                train=False,
+                perturb_levels={p_type: level},
+                perturbation_set=op_perturbation_set,
             )
 
             # run evaluation
@@ -294,6 +314,11 @@ def test_once(args):
     cfg.test_cfg = dict(type="TestLoop")  # Could be SubsetTestLoop before
     cfg.test_evaluator = cfg.val_evaluator
     cfg.test_evaluator["collect_device"] = "gpu"
+    # Read before val_cfg is replaced below -- this is how the checkpoint's own
+    # training run resolved its op vocabulary (diff32 for ours/grad_corr, legacy20
+    # for everything else), and it is what decides which op set + which magnitude
+    # levels file test_robust sweeps.
+    perturbation_set = cfg.val_cfg.get("perturbation_set") if cfg.get("val_cfg") else None
     cfg.val_cfg = dict(type="ValLoop")
 
     cfg.launcher = args.launcher
@@ -365,9 +390,15 @@ def test_once(args):
 
     # test
     # cfg.work_dir = cfg.work_dir + "_TEMP"
-    test_levels = "sensaug/testing/test_levels_new.json"
-    print_log(f"Testing on levels: {test_levels}", logger="current")
-    test_robust(cfg, args, sa_results_file=test_levels)
+    if perturbation_set == "diff32":
+        test_levels = "sensaug/testing/shared_levels_diff32.json"
+    else:
+        test_levels = "sensaug/testing/test_levels_new.json"
+    print_log(
+        f"Testing on levels: {test_levels} (perturbation_set={perturbation_set})",
+        logger="current",
+    )
+    test_robust(cfg, args, sa_results_file=test_levels, perturbation_set=perturbation_set)
 
 
 if __name__ == "__main__":
