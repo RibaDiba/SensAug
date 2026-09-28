@@ -2,8 +2,10 @@ import os
 import numpy as np
 import re
 import glob
+import json
 import logging
 import shutil
+import zlib
 
 from sensaug.cluster_config import load_seg_config
 
@@ -196,6 +198,273 @@ def _active_pruning_vocab(args):
     if args.aug_type in ("ours", "grad_corr", "default"):
         return set(DIFF32_OPS)
     return set()
+
+
+#: The random-pruning arms. `none` is the default -- no random prune at all, so
+#: every invocation that predates this flag lands there unchanged. `null` is the
+#: control arm for mRMR: drop N ops chosen at random, once, and keep them dropped
+#: for the whole run. A tuple rather than a dispatch dict like DOWNWEIGHT_METHODS
+#: because there is no per-arm function to dispatch TO -- the arm differs only in
+#: how the op names are chosen, after which it is an ordinary
+#: --pruned-augmentations run and every existing consumer handles it unchanged.
+RANDOM_PRUNE_METHODS = ("none", "null")
+
+#: The color/photometric ops --no-inv-aug removes, per vocabulary. Mirrors
+#: RobustValLoop._remove_H_names (sensaug/loops/sensaug_loop.py) -- restated here
+#: rather than imported because the loop resolves them from an instance that does
+#: not exist yet at argparse time, and the two have to agree for a random draw's
+#: count to mean what it says.
+_REMOVE_H_NAMES = {
+    "diff32": ("lighter_H", "darker_H"),
+    "legacy20": ("PosterizeTransform", "SolarizeTransform"),
+}
+
+
+def _random_prune_set_name(aug_type):
+    """Which perturbation registry a random prune draws from, or None.
+
+    The same mapping `_active_pruning_vocab` makes, expressed as the
+    `resolve_perturbation_set` key rather than the resolved name set, because the
+    pool also has to respect --geometric-only / --photometric-only and those
+    filters live inside that function.
+    """
+    if aug_type == "random":
+        return "legacy20"
+    if aug_type in ("ours", "grad_corr", "default"):
+        return "diff32"
+    return None
+
+
+def random_prune_pool(args, already_pruned=()):
+    """The ops a `null` draw is allowed to remove, sorted.
+
+    Deliberately narrower than "every op in the vocabulary", so that dropping N
+    means the run really does train on N fewer ops than its control:
+
+    * --geometric-only / --photometric-only already restrict what is sampled,
+      and resolve_perturbation_set applies them.
+    * --no-inv-aug removes two ops at the SA curve's source (update_sa_curve's
+      `exclude=`), and job_scripts/train_nexus_gamma.sbatch passes it on EVERY
+      run. Drawing one of those would spend a prune on an op that was already
+      gone, leaving this arm N-1 real prunes against an mRMR arm's N.
+    * anything --pruned-augmentations or the cluster config already removed, so a
+      random draw COMPOSES with an explicit list instead of overlapping it and
+      quietly shrinking its own count.
+
+    Empty for an --aug-type that samples from no perturbation registry at all
+    (none, autoaugment, ...), which is what lets one bounds check on `count` also
+    reject those arms.
+    """
+    set_name = _random_prune_set_name(args.aug_type)
+    if set_name is None:
+        return []
+
+    excluded = set(already_pruned)
+    if args.no_inv_aug:
+        excluded.update(_REMOVE_H_NAMES[set_name])
+
+    names = resolve_perturbation_set(
+        set_name,
+        geometric_only=args.geometric_only,
+        photometric_only=args.photometric_only,
+    )
+    return sorted(n for n in names if n not in excluded)
+
+
+def _seed_from_text(text):
+    """A stable 32-bit seed from an arbitrary run id.
+
+    zlib.crc32 rather than hash(): PYTHONHASHSEED is randomized per process, so
+    hash() of the same SLURM job id would differ between ranks -- which is the
+    exact failure resolve_random_prune_seed exists to prevent.
+    """
+    try:
+        return int(text) % (2**32)
+    except ValueError:
+        return zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF
+
+
+def resolve_random_prune_seed(cli_value, env=None):
+    """Resolve the `null` arm's seed to `(seed, source)`. Raises ValueError.
+
+    Every rank runs train.py independently under torchrun, and at argparse time
+    torch.distributed is NOT yet initialized -- that happens inside
+    Runner.from_cfg, long after this. So there is no collective here to sync a
+    seed with, and mmengine.dist.sync_random_seed() does not help: with dist
+    uninitialized it sees world_size == 1 and returns a per-process seed without
+    broadcasting anything. A freshly generated seed would therefore give every
+    rank a DIFFERENT pruned set -- four banks averaged into one gradient update,
+    with nothing in the logs saying so.
+
+    Hence: the seed is either stated outright, or derived from something every
+    rank of the same job already agrees on and that still differs between runs.
+    If neither is available and this is demonstrably multi-rank, refuse rather
+    than guess.
+    """
+    env = os.environ if env is None else env
+
+    if cli_value is not None:
+        return int(cli_value) % (2**32), "--random-prune-seed"
+
+    for key in ("SLURM_JOB_ID", "TORCHELASTIC_RUN_ID"):
+        raw = env.get(key)
+        if raw:
+            return _seed_from_text(raw), key
+
+    world_size = env.get("WORLD_SIZE")
+    if world_size in (None, "", "1"):
+        return int.from_bytes(os.urandom(4), "little"), "urandom"
+
+    raise ValueError(
+        f"--random-prune-method=null needs a seed that every rank agrees on, and "
+        f"this launch has WORLD_SIZE={world_size} with neither SLURM_JOB_ID nor "
+        f"TORCHELASTIC_RUN_ID set to derive one from. Generating one here would "
+        f"give each rank a different pruned set, which no log would reveal. Pass "
+        f"--random-prune-seed explicitly."
+    )
+
+
+def draw_random_prune(pool, count, seed):
+    """Draw `count` op names from `pool`, deterministically for a given seed.
+
+    A private RandomState rather than the global numpy RNG, which set_manual_seed
+    pins to 0 for the run proper and which GpuAugSegDataPreProcessor then draws
+    every per-image augmentation from -- consuming from it here would shift every
+    subsequent draw as a function of how many ops were pruned, so the two arms
+    would differ by more than their banks. `pool` is sorted, so the result cannot
+    depend on dict iteration order either.
+    """
+    rng = np.random.RandomState(seed)
+    return sorted(rng.choice(list(pool), size=count, replace=False).tolist())
+
+
+def reject_random_prune(args, pool=None):
+    """Return a rejection message for the random-pruning flags, or None.
+
+    Returns a string rather than raising so the CLI can route it through
+    `parser.error` -- exit 2, before any config is built or work_dir created --
+    while the tests can assert on it directly. Same posture as
+    `reject_skip_pruned_eval`.
+
+    Called twice: once without `pool` for the checks that need no vocabulary, and
+    again with it for the bounds check, so a bad flag combination is rejected
+    before the pool is even resolved.
+    """
+    method = args.random_prune_method
+    count = args.random_prune_count
+
+    if method == "none":
+        stray = [
+            name
+            for name, value in (
+                ("--random-prune-count", count),
+                ("--random-prune-seed", args.random_prune_seed),
+            )
+            if value is not None
+        ]
+        if stray:
+            return (
+                f"{', '.join(stray)} set without --random-prune-method=null, so "
+                f"nothing would be pruned at random. An arm is never left "
+                f"unnamed -- the same rule --corr-downweight-method applies on "
+                f"grad_corr, and for the same reason: the arm is not recoverable "
+                f"from the checkpoint afterwards."
+            )
+        return None
+
+    if count is None:
+        return (
+            "--random-prune-method=null requires --random-prune-count N, the "
+            "number of ops to drop at random. It has no default: the point of "
+            "the arm is to match some specific mRMR run's prune count, and "
+            "guessing one would make the comparison meaningless."
+        )
+
+    if count < 1:
+        return f"--random-prune-count must be >= 1, got {count}."
+
+    if pool is None:
+        return None
+
+    if not pool:
+        return (
+            f"--random-prune-method=null has nothing to draw from on "
+            f"--aug-type={args.aug_type}: it samples from no perturbation set, "
+            f"so there are no ops to prune. Use ours, grad_corr, default or "
+            f"random."
+        )
+
+    if count >= len(pool):
+        # >= rather than >: pruning the whole pool leaves a pdf of nothing but
+        # ("none", 0), and CollectGradientHook refuses a static prune naming
+        # every op outright. Failing here says why; failing there says less.
+        flags = "".join(
+            f", {flag}"
+            for flag, on in (
+                ("--no-inv-aug", args.no_inv_aug),
+                ("--geometric-only", args.geometric_only),
+                ("--photometric-only", args.photometric_only),
+            )
+            if on
+        )
+        return (
+            f"--random-prune-count={count} would leave no augmentations: only "
+            f"{len(pool)} ops are eligible on this run (--aug-type="
+            f"{args.aug_type}{flags}; already pruned: "
+            f"{sorted(set(args.pruned_augmentations))}). Eligible ops: {pool}"
+        )
+
+    return None
+
+
+def random_prune_record(args):
+    """The reproducibility record for a `null` run, as a JSON-able dict.
+
+    Neither the seed nor the draw is recoverable from a checkpoint, and the seed
+    is not necessarily in the launch command either (it can be derived from the
+    SLURM job id), so the arm has to write itself down or it cannot be repeated.
+    """
+    dropped = set(args.random_prune_ops)
+    return {
+        "method": args.random_prune_method,
+        "count": args.random_prune_count,
+        "seed": args.random_prune_seed_used,
+        "seed_source": args.random_prune_seed_source,
+        "aug_type": args.aug_type,
+        "perturbation_set": _random_prune_set_name(args.aug_type),
+        "pool_size": len(args.random_prune_pool),
+        "pool": list(args.random_prune_pool),
+        "dropped": list(args.random_prune_ops),
+        "kept": [n for n in args.random_prune_pool if n not in dropped],
+        "pruned_augmentations": list(args.pruned_augmentations),
+    }
+
+
+def log_random_prune(args, work_dir):
+    """Record the `null` arm's draw, to the run's log and to its work_dir.
+
+    Called from train() after Runner.from_cfg for two reasons: print_log(
+    logger="current") only reaches {work_dir}/<timestamp>/<timestamp>.log once
+    the runner's logger exists (same reason as warn_ignored_downweight_method),
+    and is_main_process() only tells the truth once dist is initialized -- before
+    that every rank believes it is rank 0 and all four would race on the same
+    file.
+    """
+    if args.random_prune_method != "null":
+        return
+
+    record = random_prune_record(args)
+    print_log(
+        f"[random-prune] arm=null seed={record['seed']} "
+        f"(from {record['seed_source']}), dropped {record['count']} of "
+        f"{record['pool_size']} eligible ops: {record['dropped']}. "
+        f"Training on: {record['kept']}",
+        logger="current",
+    )
+
+    if is_main_process():
+        with open(os.path.join(work_dir, "random_prune.json"), "w") as f:
+            json.dump(record, f, indent=2)
 
 
 def warn_ignored_downweight_method(args):
@@ -861,6 +1130,7 @@ def train(args):
     warn_ignored_skip_pruned_eval(args)
     warn_ignored_pruned_augmentations(args, _active_pruning_vocab(args))
     warn_ignored_hold_none_prob(args)
+    log_random_prune(args, cfg.work_dir)
 
     # Install the initial uniform training policy for the GPU arms.
     #
@@ -1204,6 +1474,48 @@ if __name__ == "__main__":
         "actually samples from is accepted but logged as inert.",
     )
     parser.add_argument(
+        "--random-prune-method",
+        type=str,
+        default="none",
+        choices=list(RANDOM_PRUNE_METHODS),
+        help="the random-pruning arm. `none` (default) draws nothing and leaves "
+        "the run exactly as it was. `null` is the control arm for mRMR: before "
+        "training starts, pick --random-prune-count ops at random out of the "
+        "ones this run would otherwise sample from, and drop them for the whole "
+        "run -- so the comparison is 'does ranking ops by redundancy beat "
+        "dropping the same number of them at random?'. Unlike mRMR the prune is "
+        "fixed, never re-derived: it carries no R, no lambda and no correlation "
+        "pipeline, and feeds straight into --pruned-augmentations.",
+    )
+    parser.add_argument(
+        "--random-prune-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help="how many ops --random-prune-method=null DROPS (not keeps). "
+        "Required on that arm, no default. To match a finished mRMR stage-1 "
+        "run, use the word count of its mrmr_pruned_ops.txt. Note the pool it "
+        "draws from already excludes whatever --no-inv-aug, --geometric-only / "
+        "--photometric-only and any explicit --pruned-augmentations removed, so "
+        "N is always N ops fewer than the control trains on. As with mRMR, "
+        "pruning raises P(no augmentation) unless --hold-none-prob is set: pass "
+        "that flag on both arms of a comparison or on neither.",
+    )
+    parser.add_argument(
+        "--random-prune-seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="seed for --random-prune-method=null's draw. Optional: when "
+        "omitted it is derived from SLURM_JOB_ID, else TORCHELASTIC_RUN_ID, "
+        "else (single-process runs only) os.urandom. Whatever is used is logged "
+        "and written to {work_dir}/random_prune.json. Pass it explicitly to "
+        "repeat a draw, or to sweep several random draws of the same size "
+        "(seeds 0, 1, 2 ...). It must be identical on every rank -- multi-rank "
+        "launches with no derivable seed are refused rather than silently "
+        "training a different bank per rank.",
+    )
+    parser.add_argument(
         "--adamw",
         action="store_true",
         default=False,
@@ -1279,6 +1591,44 @@ if __name__ == "__main__":
     if rejection is not None:
         parser.error(rejection)
 
+    # The `null` random-pruning arm. Resolved here, at argparse time, for three
+    # reasons: it must land in args.pruned_augmentations before build_config
+    # reads it (the SA curve's exclude=, the GPU sampling bank, the gradient
+    # sweep's static_pruned_ops all come off that one list); it must be known
+    # before the exp_name suffix below, which carries the seed; and a bad
+    # combination should cost exit 2 rather than a compute node and a queue.
+    args.random_prune_ops = []
+    args.random_prune_pool = []
+    args.random_prune_seed_used = None
+    args.random_prune_seed_source = None
+
+    rejection = reject_random_prune(args)
+    if rejection is not None:
+        parser.error(rejection)
+
+    if args.random_prune_method == "null":
+        args.random_prune_pool = random_prune_pool(args, args.pruned_augmentations)
+        rejection = reject_random_prune(args, pool=args.random_prune_pool)
+        if rejection is not None:
+            parser.error(rejection)
+
+        try:
+            seed, seed_source = resolve_random_prune_seed(args.random_prune_seed)
+        except ValueError as e:
+            parser.error(str(e))
+
+        args.random_prune_seed_used = seed
+        args.random_prune_seed_source = seed_source
+        args.random_prune_ops = draw_random_prune(
+            args.random_prune_pool, args.random_prune_count, seed
+        )
+        # Union, not replacement: the draw already excluded everything on the
+        # resolved list, so this composes the two rather than letting one hide
+        # the other. Sorted so the list a run records is stable.
+        args.pruned_augmentations = sorted(
+            set(args.pruned_augmentations) | set(args.random_prune_ops)
+        )
+
     if args.exp_name is None:
         args.exp_name = f"ours_{args.backbone}_{args.dataset}"
         # args.exp_name = f"none_{args.backbone}_{args.dataset}" if args.aug_type is None \
@@ -1293,6 +1643,16 @@ if __name__ == "__main__":
     # would interleave two incomparable sets of R matrices in corr_matrix_log.json.
     if args.aug_type == "grad_corr":
         suffix = "gradcorr_nosa" if args.no_corr_sa else "gradcorr"
+        if suffix not in args.exp_name:
+            args.exp_name = args.exp_name + "_" + suffix
+
+    # And again for the null arm, carrying BOTH the count and the seed. Two
+    # draws of the same size at different seeds are different experiments;
+    # without the seed they would share a work_dir, interleave their logs, and
+    # -- because the Nexus sbatch's resume guard keys off
+    # {work_dir}/{exp_name}/last_checkpoint -- silently resume each other.
+    if args.random_prune_method == "null":
+        suffix = f"nullprune{args.random_prune_count}_s{args.random_prune_seed_used}"
         if suffix not in args.exp_name:
             args.exp_name = args.exp_name + "_" + suffix
 
