@@ -10,18 +10,39 @@ Built on top of MMSegmentation + MMEngine. Custom components (hooks, loops, data
 
 ## Cluster & environment
 
-- Cluster: **Della** (Princeton HPC), SLURM scheduler
-- Conda env: `sensaug` (Python 3.10, PyTorch 2.0, MMSeg latest)
-- Cluster config: `configs/della.yaml` — set all paths here, not in code
-- CUDA module: `cuda/11.7.0`
-- **Compute nodes have no internet access.** Backbones whose config downloads a
-  pretrained checkpoint at `model.init_weights()` time (segformer, pspnet-rsb,
-  convnext, swin) need that checkpoint pre-staged — see
-  [Pretrained backbone checkpoints](#pretrained-backbone-checkpoints) below.
+Two clusters, one config file each. **Nexus is where the current work runs** — this
+checkout lives at `/gammascratch/amodak/SensAug` and every experiment under
+`experiments/` was produced there.
 
-## Active dataset: Cityscapes
+| | **Nexus** (UMD) | **Della** (Princeton) |
+|---|---|---|
+| cluster config | `configs/nexus.yaml` | `configs/della.yaml` |
+| launcher | `job_scripts/train_nexus_gamma.sbatch` | `job_scripts/train_della{,_1gpu,_4gpu}.sbatch` |
+| partition / account | `gamma` (fallbacks: `scavenger`, `tron`) | — |
+| GPUs | 4× `rtxa6000`, DDP via `torchrun` | 1 or 4 |
+| datasets | all 9 in `configs/nexus.yaml` | cityscapes only |
+| internet on compute nodes | **yes** | **no** — see below |
 
-Currently configured in `configs/della.yaml`. Data lives at:
+- Conda env: `sensaug` (Python 3.10, PyTorch 2.0, MMSeg latest). On Nexus,
+  `module load miniforge3` first — `conda` is not on a fresh compute-node PATH.
+- CUDA module: `cuda/11.7.0` on both.
+- Set all paths in the cluster config, never in code.
+- **Della's compute nodes have no internet access.** Backbones whose config
+  downloads a pretrained checkpoint at `model.init_weights()` time (segformer,
+  pspnet-rsb, convnext, swin) need that checkpoint pre-staged — see
+  [Pretrained backbone checkpoints](#pretrained-backbone-checkpoints) below. Nexus
+  needs none of that.
+
+## Datasets
+
+On **Nexus**, `configs/nexus.yaml` carries all nine (cityscapes, ade20k,
+pascal_voc12, loveda, potsdam, synapse, a2i2haze, acdc, idd) and
+`scripts/prepare_datasets.py` installs seven of them — see [Adding a new
+dataset](#adding-a-new-dataset-3-steps-from-readme). Recent `grad_corr` and `ours`
+runs are on pascal_voc12, loveda, acdc and ade20k.
+
+On **Della** only Cityscapes is configured, and its setup is unfinished. Data lives
+at:
 ```
 data/cityscapes/
   gtFine/          ← extracted (annotations)
@@ -30,7 +51,7 @@ data/cityscapes/
   gtFine_trainvaltest.zip
 ```
 
-### Cityscapes setup — pending steps
+### Cityscapes setup on Della — pending steps
 
 MMSeg expects:
 - `leftImg8bit/{train,val,test}/city/*.png` — RGB images
@@ -89,7 +110,25 @@ Not covered by this mechanism: `deeplabv3plus` (uses mmcv's
 
 ## How to train
 
-### Submit to Della (recommended)
+### Submit to Nexus (what the current experiments use)
+```bash
+# positional: aug-type backbone dataset [exp_name]
+# defaults:   ours segformer pascal_voc12
+sbatch job_scripts/train_nexus_gamma.sbatch grad_corr segformer pascal_voc12
+```
+
+Everything else is env vars, so a variant needs no edit to the script: `NAME`,
+`RUN_TAG` (suffixes the exp name for repeat runs), `CONFIG`, `WORK_DIR`,
+`RANDOM_PRUNE_COUNT` / `RANDOM_PRUNE_SEED` (the `null` arm; seed defaults to the
+SLURM job id and is always passed explicitly so `EXP_NAME` carries it),
+`CONDA_ENV`, `REPO_DIR`, `ALLOW_RESUME`, and for Lever 3 `DOWNWEIGHT` (default
+`mRMR`) / `CORR_LAMBDA` (default `0.25`) / `PRUNED_AUGS`. It appends
+`--corr-downweight-method` + `--corr-lambda` only on `grad_corr` runs, because
+train.py warns they are inert elsewhere. Logs land in
+`job_scripts/logs/<job-name>/`. It runs `torchrun` with one process per GPU and
+always passes `--launcher=pytorch --no-inv-aug --auto-scale-lr --descending-MA`.
+
+### Submit to Della
 ```bash
 # defaults: aug=none, backbone=pspnet, dataset=cityscapes
 sbatch job_scripts/train_della.sbatch
@@ -101,12 +140,12 @@ sbatch job_scripts/train_della.sbatch ours segformer cityscapes
 ### Run locally
 ```bash
 python train.py \
-  --cluster-config=configs/della.yaml \
-  --backbone=pspnet \
-  --dataset=cityscapes \
+  --cluster-config=configs/nexus.yaml \
+  --backbone=segformer \
+  --dataset=pascal_voc12 \
   --aug-type=none \
   --work_dir=./experiments \
-  --exp_name=none_pspnet_cityscapes \
+  --exp_name=none_segformer_pascal_voc12 \
   --no-inv-aug
 ```
 
@@ -115,7 +154,7 @@ python train.py \
 |---|---|---|
 | `--aug-type` | `none`, `ours`, `default`, `grad_corr`, `random`, `autoaugment`, `augmix`, `randaugment`, `trivialaugment`, `idbh`, `vip` | `ours` = sensitivity-informed. `grad_corr` = **enables the gradient cross-correlation pipeline** (logs the matrix R) — it is its own `--aug-type` value, not a separate flag. (A standalone `--grad-corr` flag existed at one point; it's gone — `--aug-type=grad_corr` is the only way to turn the correlation pipeline on.) |
 | `--backbone` | `pspnet`, `segformer`, `convnext`, `deeplabv3plus`, `swin`, `mae`, `vit` | must have a config under `sensaug/custom_configs/mmseg/<backbone>/` |
-| `--dataset` | keys from `configs/della.yaml` | currently only `cityscapes` on Della |
+| `--dataset` | keys from the cluster config's `datasets:` | 9 on Nexus; only `cityscapes` on Della |
 | `--no-inv-aug` | flag | exclude color/photometric augmentations |
 | `--no-warmup` | flag | skip clean-training warmup rounds |
 | `--no-corr-sa` | flag | under `--aug-type=grad_corr`, disable the SA loop — trains exactly like `none` while still running the correlation measurement. This is the control arm |
@@ -129,7 +168,24 @@ python train.py \
 | `--corr-downweight-method` | `none`, `soft-weighting`, `mRMR` | which function turns R into the reweighted pdf. `none` = pdf used as generated (R still measured and logged, just not fed back); `soft-weighting` = the max-entropy tilt; `mRMR` = **hard pruning** — rank the ops by minimum-Redundancy Maximum-Relevance and zero everything outside the budget. **Required** on every `--aug-type=grad_corr` run (no default — an arm is never left unnamed); a WARNING and otherwise inert on every other arm, `--no-corr-sa` included. See [Adding a down-weighting method](#adding-a-down-weighting-method) |
 | `--corr-lambda-ramp` | `linear`, `constant` | ramp λ from 0 over training (default) vs. full strength from the first R emission |
 | `--corr-keep-within-op` | flag | keep the `lighter_X`/`darker_X` and `_pos`/`_neg` cells in `red(a)`; excluded by default |
+| `--corr-skip-pruned-eval` | flag | ⚠️ **rejected on `--aug-type=grad_corr`** — the only arm where it could act. See [Static pruning](#static-pruning----pruned-augmentations) |
+| `--pruned-augmentations` | op names | permanently exclude ops from this whole run. Overrides (does not merge with) the cluster config's `pruned_augmentations:`. See [Static pruning](#static-pruning----pruned-augmentations) |
+| `--hold-none-prob` | flag | hold P(no augmentation) fixed as `--pruned-augmentations` shrinks the bank, so the prune changes *which* aug is sampled and not *how often* one is. Off by default. See [Static pruning](#static-pruning----pruned-augmentations) |
+| `--random-prune-method` | `none`, `null` | the random-pruning arm. `null` draws a fixed random subset of ops and prunes them for the whole run — the **control for mRMR**. Default `none` (no draw). See [The `null` random-pruning arm](#the-null-random-pruning-arm) |
+| `--random-prune-count` | int | how many ops `null` **drops** (not keeps). Required on that arm, no default |
+| `--random-prune-seed` | int | optional. Omitted → derived from `SLURM_JOB_ID`, else `TORCHELASTIC_RUN_ID`, else (single-process only) `os.urandom`; a multi-rank launch with none of those is **refused**. Whatever is used is logged and written to `random_prune.json` |
 | `--sa_interval` | int | ⚠️ dead flag — parsed but never read. SA-curve recompute is every `SA_CURVE_CADENCE`-th round (6), defined in `sensaug/round_schedule.py` and applied in `sensaug/loops/sensaug_loop.py` |
+| `--geometric-only` / `--photometric-only` | flag | restrict the op bank to the 10 geometric or the 22 photometric ops. Referenced all over this file; applied at `GpuAugSegDataPreProcessor._op_bank` and `resolve_perturbation_set` |
+| `--random-aug` | flag | sample the bank uniformly instead of from the SA pdf |
+| `--uniform` | flag | build a flat pdf (the SA curve is still measured and logged, just not used to shape it) |
+| `--weighted-augs` | flag | `generate_pdf_new_weighted_aug` instead of `generate_pdf_new` — ops are not treated equally |
+| `--descending-MA` | flag | prioritize *less* severe augmentations in the pdf. The Nexus sbatch passes this on every run |
+| `--corr-magnitude-mode` | `mode`, `sampled_shared`, `sampled_independent`, `fixed` | how each op's probe magnitude is drawn from its SA distribution. `mode` (default) is the modal level, constant across the batch; `fixed` always uses the 0.5 reference. Ignored without a snapshot |
+| `--corr-magnitudes` | path | seed the probe's magnitude snapshot from a JSON file, for a run with no SA of its own (e.g. `sensaug/testing/shared_levels_diff32.json`). A live SA snapshot supersedes it |
+| `--use-foundation-backbone` | flag | DINOv2 backbone |
+| `--freeze-early-layers` | flag | freeze the backbone's early layers |
+| `--amp` / `--adamw` / `--auto-scale-lr` | flag | mixed precision, AdamW, LR scaled to the real batch size |
+| `--launcher` | `none`, `pytorch`, … | `pytorch` under `torchrun` (what both 4-GPU sbatches pass) |
 
 ## The two pipelines
 
@@ -140,7 +196,7 @@ Training runs two independent measurements. They share no hook point and no code
 | Sensitivity analysis (SA) | which perturbations is the model *worst at*? (weights the training aug PDF) | every `round_interval` | `sensaug/loops/sensaug_loop.py` → `RobustValLoop` |
 | Gradient cross-correlation | which perturbations are *redundant with each other*? (the matrix R) | on the rounds `configs/rounds.yaml` names (shipped default 3, 4, 7, 10, 13, 16 of 20, via `corr_cadence: 3`); `--corr-interval` for a fixed clock instead | `sensaug/round_schedule.py` → `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
 
-- **SA** runs only under `--aug-type=ours`, from the val loop. The SA *curve* is recomputed every 6th round (`SA_CURVE_CADENCE`), so its effective cadence is `6 × round_interval`.
+- **SA** runs under `--aug-type=ours` *and* `--aug-type=grad_corr` (the latter unless `--no-corr-sa`), from the val loop. Both resolve `cfg.val_cfg.perturbation_set` to `diff32`; every other arm that builds an SA loop gets `legacy20`. The SA *curve* is recomputed every 6th round (`SA_CURVE_CADENCE`), so its effective cadence is `6 × round_interval`.
 - **Which val loop runs.** `--aug-type=ours` → `RobustValLoop`; `--aug-type=grad_corr` → `GradCorrValLoop`, which subclasses it and adds exactly one thing, Lever 3's redundancy reweighting. The base declares `_apply_redundancy_reweighting` as an identity function and the subclass overrides it, so the three pdf generators and `run()` carry no `if grad_corr` branch. `--aug-type=grad_corr --no-corr-sa` builds neither — mmengine's stock `ValLoop`.
 - **Correlation** is opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag layered on top of another one (`--aug-type=none --grad-corr` is not valid; that flag doesn't exist). It fires from `after_train_iter`, freezing the model and sweeping the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per aug per image. `CollectGradientHook` (priority NORMAL) sweeps; `PerturbationSensitivityAnalysisHookWithGradients` (priority LOW) correlates the sweep it just wrote — the priority ordering is load-bearing. Both are given the same gate — an explicit `fire_iters` set by default, an `interval` under `--corr-interval` — normalized by `resolve_gate()` and applied by `fires_at()`, both in `grad_hook.py`. For the unaugmented control arm — R measured against a baseline with no training augmentation, which is what the SA-on number gets compared to — pass `--aug-type=grad_corr --no-corr-sa`: that disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.
 
@@ -227,48 +283,182 @@ control round outside the firing set is an error. `sensaug/round_schedule.py` ho
 it as pure integer math (no torch, no mmseg), tested in `tests/test_round_schedule.py`.
 
 
+## Static pruning (`--pruned-augmentations`)
+
+Removes named ops from a run entirely — the stage-2 half of
+`job_scripts/train_mrmr_prune_retrain.sbatch`, where stage 1 measures R under
+`--corr-downweight-method=mRMR` and stage 2 retrains with what it pruned. Distinct
+from mRMR's own pruning in one way that drives everything below: **a statically
+pruned op is gone for the whole run and cannot return**, where an mRMR-pruned op
+is re-derived every round and may come back.
+
+It reaches five places. The first two were always there; the rest were added
+because "we removed this op" has to be true system-wide, not only in the sampler:
+
+| where | what |
+|---|---|
+| `RobustValLoop.update_sa_curve` | `exclude=`, at the SA curve's source — so the op never reaches the round-eval, and never reaches any pdf built from the curve |
+| `GpuAugSegDataPreProcessor._op_bank` | dropped from the uniform sampling bank (`--random-aug`) |
+| `CollectGradientHook` | `static_pruned_ops`: no forward/backward, ever. **Not** routed through `skip_pruned` — that path backfills from `_last_full_row`, and a statically pruned op has no prior measurement to backfill from |
+| `corr_matrix_log.json` | recorded as `"static_pruned"`, kept **out of** `"dropped"`. `dropped` means "measured, no variance" and stays a health signal worth chasing; `static_pruned` is a fact about the run's configuration |
+| the pdf's op count | only under `--hold-none-prob` — see below |
+
+R stays **32×32**: a pruned op keeps its row and column, filled with NaN, so
+`corr_matrix_log.json` is comparable across arms and `corr_viz` shades those
+rows distinctly (`STATIC_PRUNED_FILL`) rather than hatching them like a failed
+measurement.
+
+**`--hold-none-prob`, and why it is off by default.** The pdf carries a synthetic
+`("none", 0)` entry whose mass is derived from the count of surviving ops, so
+pruning 6 of 30 raises P(no augmentation) by ~0.7 pp. The pruned arm then trains
+on clean images that much more often than its control — a second difference
+inside a two-arm comparison, and a violation of the invariant `_downweight_mrmr`
+already holds ("changes which augmentation is sampled, never how often"). With
+the flag, the denominator counts the pruned ops as if still present and their
+mass goes to the survivors. Off by default so a run launched before the flag
+existed is reproduced exactly; **pass it on both arms or neither.**
+
+Two things it does *not* cover, both pre-existing and both pinned in
+`tests/test_static_prune.py`:
+
+- `generate_pdf_new` evaluates `betabinom.pmf(i, len(levels), 0.75, 1.0)` for
+  `i` one short of that pmf's support, so ~13% of the perturbation mass falls
+  through to `("none", 0)` and the real P(none) is ~16%, not the `1/(N+1)` ≈ 3%
+  the code reads as. `--hold-none-prob` holds the *allotment* fixed, so it holds
+  the leaked fraction fixed too — the drift is fixed either way.
+- `generate_pdf_new_weighted_aug` (`--weighted-augs`) drifts too, from that same
+  truncation being a function of the op count (~6.4% at 10 ops, ~5.5% at 30).
+  Same order, different mechanism, **not** addressed by this flag: correcting it
+  means choosing how to renormalize a truncated pmf, which changes the shape of
+  the ranking rather than its scale.
+
+**`--corr-skip-pruned-eval` is rejected on `--aug-type=grad_corr`.** It would skip
+the sweep for mRMR-pruned ops and backfill each from an *earlier* checkpoint's
+gradients, which are then correlated against freshly measured rows — so one R
+mixes vintages and successive emissions stop being comparable. Watching R change
+as the model improves is what a grad_corr session is for, so a stage-1
+measurement run sweeps everything on purpose. The flag stays inert-with-a-warning
+on every other arm (nothing but `GradCorrValLoop` publishes
+`runner.corr_pruned_ops`). To actually stop training on an op, prune it
+statically.
+
+### The `null` random-pruning arm
+
+`--random-prune-method=null --random-prune-count N` answers the one question
+mRMR invites: **does ranking ops by redundancy actually beat dropping the same
+number of them at random?** Before training starts it draws N ops at random and
+hands them to `--pruned-augmentations`, so from that point on it *is* a static
+prune — same five call sites, same `"static_pruned"` bookkeeping, same NaN rows
+in a 32×32 R. Nothing under `sensaug/` knows this arm exists.
+
+It differs from mRMR exactly where a control should: the prune is **fixed for the
+run and never re-derived**, carries no R, no λ, no correlation pipeline, and no
+`GradCorrValLoop`. It is deliberately *not* a `DOWNWEIGHT_METHODS` entry — those
+dispatch on a published R this arm never has.
+
+- **N is the count DROPPED**, so it matches a finished stage-1 run mechanically:
+  `wc -w < experiments/<stage1>/mrmr_pruned_ops.txt`.
+- **The pool is narrower than the bank**, and that is what makes N mean N. It
+  excludes `--no-inv-aug`'s two ops (which the Nexus sbatch passes on *every*
+  run, so the pool is 30, not 32), the `--geometric-only` / `--photometric-only`
+  filter, and anything already on `--pruned-augmentations` — the draw composes
+  with an explicit list rather than overlapping it. Pruning the whole pool is
+  refused: it would leave a pdf of nothing but `("none", 0)`.
+- **The seed is never generated per rank.** Every rank runs `train.py`
+  independently and torch.distributed is not initialized at argparse time, so
+  there is no collective to sync with — and `mmengine.dist.sync_random_seed()`
+  does not help, since with dist uninitialized it sees `world_size == 1` and
+  returns a per-process seed without broadcasting. A generated seed would train a
+  different bank on each GPU, averaged into one update, invisibly. Hence the
+  precedence in the flags table above, and the outright refusal when nothing is
+  derivable. `train_nexus_gamma.sbatch` always passes one explicitly (the job id
+  by default) so `EXP_NAME` can carry it.
+- **The draw uses a private `RandomState`**, never the global numpy RNG that
+  `set_manual_seed` pins to 0 and `GpuAugSegDataPreProcessor` samples every
+  per-image op from — consuming from that stream here would shift every later
+  draw as a function of the pruned count, so the two arms would differ by more
+  than their banks.
+- **Both the count and the seed go in the exp name** (`_nullprune6_s17`).
+  Two draws of the same size at different seeds are different experiments; without
+  the seed they would share a work_dir and the resume guard would have them
+  silently resume each other.
+- **`{work_dir}/random_prune.json`** records seed, seed source, pool, dropped and
+  kept. Neither the seed nor the draw is recoverable from a checkpoint, and the
+  seed is not necessarily in the launch command either.
+- **`--hold-none-prob` applies here exactly as it does to any other prune**: pass
+  it on both arms or neither.
+
+Launching a matched arm against a finished mRMR stage 1:
+
+```bash
+RANDOM_PRUNE_COUNT=$(wc -w < experiments/<stage1>/mrmr_pruned_ops.txt) \
+  sbatch job_scripts/train_nexus_gamma.sbatch ours segformer ade20k
+```
+
+Legal on any arm with a non-empty pool (`ours`, `default`, `grad_corr`,
+`random`); every other `--aug-type` samples from no registry and is refused.
+
+**`--no-inv-aug` is now excluded at the same source.** `_remove_H_perturbations`
+used to pop `lighter_H`/`darker_H` from `miou_record` *after* `test_perturbed_new`
+had already run a full 5-level eval on each; those names now go into
+`update_sa_curve`'s `exclude=` alongside the pruned ops. The method is kept —
+it still guards the `load_sa_curve()` path, where the curve is read off disk
+unfiltered — and is a no-op on the `update_sa_curve` path.
+
 ## The three augmentation vocabularies
 
 Everything above turns on which set of op names is in play. There are three, and
-two of them share all 32 keys while meaning different classes under each.
+two of them share all 32 keys while meaning different implementations under each.
 
 | `perturbation_set` | ops | keys | implementation | used by |
 |---|---|---|---|---|
-| `new` | 20 | PascalCase (`BrightnessTransform`, `NegativeRotate`) | CPU cv2/numpy transforms | `--aug-type=ours`, `random` |
-| `diff` | 32 | snake_case (`lighter_R`, `rotate_neg`) | GPU-batched torch ops, wrapped per-image | **measurement only** — the gradient probe |
-| `aligned` | 32 | snake_case, **identical to `diff`** | the CPU transform classes | `--aug-type=grad_corr` |
+| `legacy20` | 20 | PascalCase (`BrightnessTransform`, `NegativeRotate`) | CPU cv2/numpy transform classes | `--aug-type=random`, and the CPU SA path |
+| `non-diff32` | 32 | snake_case (`lighter_R`, `rotate_neg`) | the CPU transform classes | CPU consumers that need R's names |
+| `diff32` | 32 | snake_case, **identical to `non-diff32`** | GPU-batched torch ops, applied by `sensaug/dataset/gpu_augment.py` | `--aug-type=ours`, `default`, `grad_corr` |
 
 `resolve_perturbation_set()` (`sensaug/dataset/augmentations.py`) is the single
 dispatch point. An import-time assertion pins
-`set(ALIGNED_PERTURBATIONS) == set(DIFFERENTIABLE_PERTURBATIONS)`.
+`set(NON_DIFF32_OPS) == set(DIFF32_OPS)`.
 
-**Why `aligned` exists.** R is indexed by the 32 `DIFFERENTIABLE_PERTURBATIONS`
-names. The training pdf is indexed by whatever `perturbation_set` resolves to. Under
-`new` those two overlap on *nothing*, so no per-op quantity read off R could ever
-index into the pdf. `diff` has the right names but is GPU-batched-only by design and
-40–150× slower applied per-image on CPU, which is exactly what a training pipeline
-and the SA round-eval both do. `aligned` is the same 32 names through the fast CPU
-classes.
+**Why the 32-key sets exist.** R is indexed by the 32 `DIFF32_OPS` names. The
+training pdf is indexed by whatever `perturbation_set` resolves to. Under `legacy20`
+those two overlap on *nothing*, so no per-op quantity read off R could ever index
+into the pdf — which is what makes Lever 3 impossible on that set. The 32-key sets
+give R's names to the pdf.
 
-Two things `aligned` does **not** give you:
+**Why `diff32` is the one the GPU arms run.** The ops are batched GPU tensor
+functions by design, and applying them per-image on CPU (which is what a pipeline
+transform and the SA round-eval both do) is 40–150× slower — that is what made
+`grad_corr` round-evals the dominant cost of a run. `gpu_augment` applies them
+batched, after collation, as preprocessor state, so the SA round-eval no longer
+rebuilds the val dataloader once per (op, level) pair. `non-diff32` is the same 32
+names through the CPU classes, for consumers that genuinely need a transform class.
 
-- **Magnitude scales are not calibrated against `diff`.** Same op identity, different
-  units — `blur` is the starkest (cv2's kernel-size-derived implicit sigma vs. sigma
-  directly). A per-op *score* transfers between the two; a magnitude does not. This
-  degrades the SA→probe magnitude handoff, not the op identity.
-- **The 10 geometric ops' R is still contaminated.** The CPU classes warp the label
-  with the image (`Rotate._rotate_seg`), so training on them is fine — but
-  `_DiffAugTransform.transform` and `CollectGradientHook._grad_for_op` do not, so
-  their measured `dL/dmagnitude` is dominated by image-label misalignment. Measured
-  consequence: the geometric ops correlate with almost nothing (mean |r| 0.08–0.11 vs
-  0.14–0.20 photometric), so `red(a)` ranks them *least* redundant and would
-  **upweight** them. Until `warp_image_and_label` is wired into those two call sites,
-  prefer `--photometric-only` for any Lever 3 run you intend to report.
+One thing `non-diff32` does **not** give you: **magnitude scales are not calibrated
+against `diff32`.** Same op identity, different units — `blur` is the starkest (cv2's
+kernel-size-derived implicit sigma vs. sigma directly). A per-op *score* transfers
+between the two; a magnitude does not.
+
+**The 10 geometric ops warp the label with the image**, on every path. The CPU
+classes do it by construction (`Rotate._rotate_seg`, and `Rotate._rotate` rebuilds
+the cv2 matrix from whichever array it is warping). On the `diff32` path both
+consumers — `CollectGradientHook._grad_for_op` and
+`GpuAugSegDataPreProcessor._apply_ops` — call `geometric_affine_matrix` +
+`warp_image_and_label` *instead of* the raw op, which reproduces the op's own image
+warp exactly while carrying the label along. `warp_image_and_label` re-expresses the
+matrix in the label's own pixel frame (`_matrix_in_frame`), because mmseg val
+pipelines `Resize` the image and then `LoadAnnotations` at the original size, so the
+two rasters routinely differ (pascal_voc12, ade20k, acdc; not cityscapes or loveda,
+whose val scales are no-ops). Anything new holding a geometric key and a label goes
+through that pair, not through `DIFF32_OPS[name]`.
+
+The `red(a)` figures this file used to quote for geometric vs. photometric ops were
+measured before that was true and have been removed; **they need re-measuring** — see
+the verification note in "Known issue" below.
 
 Because `perturbation_set` selects between two registries with identical keys,
-`_perturbation_transform_cfg()` (`sensaug/runner_utils.py`) takes it as an argument.
-Omitting it falls back to name-based dispatch, which resolves the 32 shared keys to
-the **`diff`** classes — the slow path — without failing or logging anything.
+`_perturbation_transform_cfg()` (`sensaug/runner_utils.py`) takes it as an argument
+and raises rather than unpacking `diff32`'s raw callable into a transform class.
 
 ## Lever 3: redundancy down-weighting of the training pdf
 
@@ -350,11 +540,12 @@ zero**. Lives in `sensaug/loops/grad_corr_loop.py` (`_downweight_mrmr`), not in
   therefore prunes little, and logs that it did.
 - **Read it next to a `soft-weighting` run at the same λ.** Deletion is a stronger
   claim than mean |r| 0.11–0.22 supports on its own.
-- **The geometric contamination bites harder here.** The 10 geometric ops' R is
-  dominated by image-label misalignment, which makes them look *least* redundant — so
-  mRMR preferentially keeps them and prunes photometric ops. Pair any reportable mRMR
-  run with `--photometric-only` until `warp_image_and_label` is wired into
-  `_DiffAugTransform.transform` and `CollectGradientHook._grad_for_op`.
+- **The geometric ops' R is worth re-reading before you trust a prune.** It was
+  contaminated by image-label misalignment until `_matrix_in_frame` landed, which made
+  the geometric ops look *least* redundant — so mRMR preferentially kept them and
+  pruned photometric ops. That is fixed, but no mRMR run has been re-measured against
+  the corrected R yet: check which ops a stage-1 run actually prunes before letting
+  stage 2 retrain on the result.
 
 To support a pairwise method, `runner.corr_redundancy` now also carries `names`, `r`
 (the matrix), `mask_within_op` and `survives` alongside `red`/`raw`/`dropped`. `r` and
@@ -419,7 +610,7 @@ immediately rather than at analysis time.
 ### DDP correctness: R must be built on every rank, not just rank 0
 
 `PerturbationSensitivityAnalysisHookWithGradients._emit()`
-(`sensaug/hooks/grad_sens_analysis.py`, **uncommitted on this branch**) used to gate
+(`sensaug/hooks/grad_sens_analysis.py`, fixed in `f71c990`) used to gate
 the entire R computation behind `is_main_process()`. Under multi-GPU DDP (e.g.
 `job_scripts/train_della_4gpu.sbatch`), `RobustValLoop` rebuilds **each rank's own**
 train dataloader from **that rank's own** `runner.corr_redundancy` — so publishing the
@@ -434,30 +625,53 @@ the same `red(a)`. The `is_main_process()` guards moved *inside* `_emit`, now sc
 only to the side effects that must not be duplicated: the `corr_log_path` /
 `bootstrap_log_path` read-modify-writes and the TensorBoard logging.
 
-## Known issue: `--aug-type=grad_corr` jobs burn their SLURM walltime on SA round-evals, not training
+## Resolved: `--aug-type=grad_corr` walltime, and where a run's time actually goes
 
-Diagnosed from `experiments/grad_corr_grad_corr_2_pspnet_cityscapes_4gpu_gradcorr` (job `11809659`, 6h walltime): the job was killed by SLURM at the time limit ([logs/grad_corr_2.11809659.err](logs/grad_corr_2.11809659.err) — `CANCELLED ... DUE TO TIME LIMIT`), having reached only iter 28000/80000 (35%). Not a crash. Breakdown of the 6h: **actual training ≈ 38 min (~10%)**, one correlation sweep ≈ 4 min (~1%), **SA round-evals ≈ 5h20m (~88%)**.
+**The history.** `experiments/grad_corr_grad_corr_2_pspnet_cityscapes_4gpu_gradcorr`
+(job `11809659`, 6h) was killed by SLURM at the time limit having reached iter
+28000/80000. Not a crash: **training ≈ 38 min (~10%)**, one correlation sweep ≈ 4 min,
+**SA round-evals ≈ 5h20m (~88%)** — two individual round-evals took 1h49m and 3h11m.
+The cause was that the SA round-eval rebuilt the val dataloader once per
+`(perturbation, magnitude)` pair and ran the differentiable ops through a CPU
+per-image pipeline transform, which is 40–150× slower than the batched GPU form they
+are written for.
 
-**Root cause:** for `--aug-type=grad_corr`, `train.py` sets `cfg.val_cfg.perturbation_set = "diff"`. Every SA round (`round_interval`, default `max_iters // 20`) once `self.sa_curve` is non-`None`, `RobustValLoop.run()` (`sensaug/loops/sensaug_loop.py`) calls `generate_pdf_new()` → `test_perturbed_new()`, which rebuilds the val/test dataloader once per `(perturbation, magnitude)` pair and runs a full mIoU eval over it. For the `"diff"` vocabulary this inserts the CPU per-image `Diff*` transforms (`sensaug/dataset/augmentations.py`, `_make_diff_transform`/`DIFF_PERTURBATIONS`) — but `DIFFERENTIABLE_PERTURBATIONS` ops (`sensaug/dataset/differentiable_augmentations.py`) are **GPU-batched-only by design** and 40-150x slower per-image on CPU. `update_sa_curve()` (every 6th round) sweeps this same way. In the diagnosed run, two of these round-evals (iters 20000 and 24000) each took 1h49m–3h11m; ordinary training iterations run at ~0.08s/iter and are not the bottleneck.
+**What fixed it** (`cc1e403`): the 32 ops are no longer a pipeline transform at all.
+`GpuAugSegDataPreProcessor` (`sensaug/dataset/gpu_augment.py`) applies them batched on
+GPU after collation, so a round-eval sets *preprocessor state* (`set_eval_spec`)
+instead of rebuilding a dataloader, and the training pdf likewise becomes state
+(`set_train_spec`) rather than a rebuilt train loader. Op names are unchanged, so
+`publish_corr_magnitudes` still fires and `--corr-magnitude-mode`'s adaptive probing
+survives — which is what ruled out the other candidate fix, switching the SA loop to
+the disjoint `legacy20` vocabulary.
 
-**Partial fix already applied (uncommitted, this branch):** `sensaug/loops/sensaug_loop.py` (`RobustValLoop.run()`, guards around the `apply_random_alpha_training_augmentations`/`apply_random_perturbations_train_dataloader_new` calls) and `train.py` (`build_config`, the `RandomAlphaTrainTransform` `perturbation_set` arg) now force the **train** dataloader to always use `perturbation_set="new"`, never rebuilding it onto `"diff"`. This fixed the training-loop side of the 40-150x slowdown. It does **not** touch the **SA round-eval** side (`test_perturbed_new`/`update_sa_curve`/`generate_pdf_new`, still on `"diff"` when `--aug-type=grad_corr`) — that remains the open bug above.
+**The measurement that closes this out** — `grad-corr-pascal_voc12-2`, segformer,
+4×A6000, 20k iters, 20 rounds, 6 correlation sweeps:
 
-**Why "just switch the SA loop to `\"new\"` too" doesn't work:** `NEW_PERTURBATIONS` and `DIFFERENTIABLE_PERTURBATIONS` are **disjoint vocabularies** — different op names and different magnitude scales. `RobustValLoop.publish_corr_magnitudes()` guards against publishing a `"new"`-keyed snapshot for an R-keyed probe, specifically because a mismatched snapshot would make every op in `CollectGradientHook` silently fall back to the fixed reference magnitude (`0.5`, `grad_hook.py`) instead of the SA-informed one. Switching the SA loop to `"new"` would fix the walltime problem but **silently disable `--corr-magnitude-mode mode`'s adaptive probing for the whole run**.
+| | before (job `11809659`) | after |
+|---|---|---|
+| completed | 28000/80000, killed at 6h | **20000/20000 in 1h53m** |
+| worst single non-training span | 3h11m | **11m51s** |
+| median non-training span | — | 2m47s |
+| correlation sweep | ~4 min | ~4m20s (unchanged — it was never the problem) |
 
-**Fix applied (this branch): `--aug-type=grad_corr` now uses `perturbation_set="aligned"`,** the third vocabulary described above — the same 32 op names, played through the fast CPU transform classes. This keeps the names R needs (so `publish_corr_magnitudes` still fires and adaptive probing survives) while taking the per-image torch ops off both the SA round-eval and the training pipeline. It also un-gates the training-side pdf, which is what makes Lever 3 possible at all.
+So the pathology is gone and runs finish. **Round-evals are still the majority of
+wall time** (≈95 of those 113 min), which is inherent: 30–32 ops × 4 levels × a full
+val pass per round. If a run is tight on walltime, raise `--round_interval` above the
+`max_iters // 20` default rather than reaching for `--corr-interval`.
 
-**Still to be measured, and this is the number that closes this entry out:** the round-eval is now 32 ops × 4 levels instead of 20 × 4 — ~1.6× more evals, each vastly cheaper. The net has **not** been measured on a real run yet. Compare against the diagnosed baseline (job `11809659`: ~5h20m of a 6h budget in round-evals) and record the result here either way.
+## Cluster config: `configs/nexus.yaml` / `configs/della.yaml`
 
-**Until that measurement exists:** launch `--aug-type=grad_corr` jobs with generous `--time`, or raise `--round_interval` above the `max_iters // 20` default.
-
-## Cluster config: `configs/della.yaml`
-
-Parsed by `sensaug/cluster_config.py`. Controls all paths **and the two pipelines' iteration intervals**. The *round grid* is not here — it lives in `configs/rounds.yaml`, see [The round schedule](#the-round-schedule).
+Parsed by `sensaug/cluster_config.py`. Controls all paths, **the two pipelines' iteration intervals**, and the run-wide static prune list. The *round grid* is not here — it lives in `configs/rounds.yaml`, see [The round schedule](#the-round-schedule). The two files have the same shape and differ only in paths, the dataset list, and `pretrained_cache_dir` (Della only).
 
 ```yaml
-data_root: /projects/PUCHALLA/LLP2024/tumor/data
-mmconfig_path: /projects/PUCHALLA/LLP2024/tumor/sensaug/custom_configs/mmseg
+data_root: /gammascratch/amodak/SensAug/data          # della: /projects/PUCHALLA/...
+mmconfig_path: /gammascratch/amodak/SensAug/sensaug/custom_configs/mmseg
 primary_metric: mIoU
+
+# Della only -- its compute nodes have no internet, so init_cfg URLs are
+# redirected here. Populate with scripts/download_pretrained_checkpoints.py.
+pretrained_cache_dir: /projects/PUCHALLA/LLP2024/tumor/pretrained_checkpoints
 
 schedule:                       # both in ITERATIONS; null → default
   round_interval: null          # SA pipeline's clock. null → max_iters // n_rounds
@@ -466,8 +680,13 @@ schedule:                       # both in ITERATIONS; null → default
                                 #   SCHEDULE, not a fixed interval. Set a number
                                 #   only to opt back out onto a clock of its own.
 
-datasets:
-  cityscapes: cityscapes        # key → subfolder under data_root
+# Whole-run op exclusions, regardless of --aug-type. See Static pruning below.
+# --pruned-augmentations OVERRIDES this list rather than merging with it.
+pruned_augmentations: []
+
+datasets:                       # key → subfolder under data_root
+  cityscapes: cityscapes        # nexus also has ade20k, pascal_voc12, loveda,
+                                # potsdam, synapse, a2i2haze, acdc, idd
 supported_backbones:
   - pspnet
   - segformer
@@ -502,7 +721,7 @@ Copy from `pspnet_r18-d8_4xb2-80k_a2i2haze.py` and swap dataset refs. Also creat
 sensaug/custom_configs/mmseg/_base_/datasets/DATASETNAME.py
 ```
 
-**Step 3** — Add to `configs/della.yaml`:
+**Step 3** — Add to the cluster config you run on (`configs/nexus.yaml` / `configs/della.yaml`):
 ```yaml
 datasets:
   cityscapes: cityscapes
@@ -526,11 +745,13 @@ See the [README](README.md#setting-up-supported-datasets) for the full per-datas
 |---|---|
 | `train.py` | Main training entrypoint |
 | `test.py` | Robustness testing on OOD datasets |
-| `configs/della.yaml` | Della cluster paths/datasets (edit this) |
+| `configs/nexus.yaml` / `configs/della.yaml` | Cluster paths/datasets/intervals (edit these, not code) |
 | `sensaug/cluster_config.py` | Parses the YAML config |
 | `sensaug/dataset/datasets.py` | Custom dataset class registrations |
-| `sensaug/dataset/augmentations.py` | Custom MMSeg transform registrations |
-| `sensaug/dataset/differentiable_augmentations.py` | Autograd-compatible augmentation ops (`DIFFERENTIABLE_PERTURBATIONS`) — what R is computed over |
+| `sensaug/dataset/augmentations.py` | Custom MMSeg transform registrations, the three op registries (`LEGACY20_OPS`, `NON_DIFF32_OPS`, and the `diff32` dispatch) and `resolve_perturbation_set` |
+| `sensaug/dataset/differentiable_augmentations.py` | The base 14 autograd-compatible ops (`DIFFERENTIABLE_PERTURBATIONS`), all photometric |
+| `sensaug/dataset/differentiable_augmentations_aa.py` | The 18 AutoAugment-family ops, `DIFF32_OPS` (14 + 18 — what R is indexed by), `GEOMETRIC_OP_KEYS`, and the label-safe pair `geometric_affine_matrix` / `warp_image_and_label` |
+| `sensaug/dataset/gpu_augment.py` | `GpuAugSegDataPreProcessor` — applies the 32 ops batched on GPU after collation, and the `set_train_spec` / `set_eval_spec` / `clear_spec` / `suspended_augmentation` state API |
 | `sensaug/hooks/sensitivity_hooks.py` | Legacy SA hooks (**not registered by train.py** — the SA loop does this now) |
 | `sensaug/hooks/grad_hook.py` | `CollectGradientHook` — the frozen-frame per-image gradient sweep, and the shared `fires_at()` clock |
 | `sensaug/hooks/grad_sens_analysis.py` | `PerturbationSensitivityAnalysisHookWithGradients` — builds the cross-correlation matrix R from the sweep, and publishes `red(a)` |
@@ -541,16 +762,29 @@ See the [README](README.md#setting-up-supported-datasets) for the full per-datas
 | `scripts/compute_grad_corr.py` | recompute R for an already-trained checkpoint without retraining — drives the grad_corr hooks off a loaded model + val dataloader; SLURM wrapper is `job_scripts/compute_grad_corr.sbatch` |
 | `scripts/calibrate_kid_magnitudes.py` | pick a per-op probe magnitude via KID (Kernel Inception Distance) so every op carries a comparable distortion budget, for checkpoints with no SA-published magnitude to draw from |
 | `scripts/run_grad_corr.sh` | reference invocation chaining the two scripts above against a finished experiment |
-| `sensaug/loops/sensaug_loop.py` | `RobustValLoop` — **the SA pipeline**. `--aug-type=ours` runs this |
+| `sensaug/loops/sensaug_loop.py` | `RobustValLoop` — **the SA pipeline**. `--aug-type=ours` runs this (and `grad_corr` via its subclass) |
 | `sensaug/loops/grad_corr_loop.py` | `GradCorrValLoop` — `RobustValLoop` + Lever 3's redundancy down-weighting. `--aug-type=grad_corr` runs this |
 | `sensaug/loops/train_loops.py` | `RobustIterBasedTrainLoop`, `SubsetTestLoop`, `SubsetValLoop` — loops a real training job runs |
 | `sensaug/loops/test_loops.py` | `DebugAugLoop`, `VisualizeSampleLoop`, `KIDTestLoop` — development/inspection only, no metrics |
 | `sensaug/custom_configs/mmseg/` | Per-backbone MMSeg config files |
+| `job_scripts/train_nexus_gamma.sbatch` | **Nexus SLURM job script — the one in use** |
 | `job_scripts/train_della.sbatch` | Della SLURM job script |
+| `job_scripts/train_mrmr_prune_retrain.sbatch` | two-stage mRMR measure-then-retrain, the consumer of `--pruned-augmentations` |
+| `scripts/prepare_datasets.py` | scripted install of seven of the Nexus datasets; `--check` reports status without downloading |
+| `scripts/eval_all_augmentations.py` | per-op robustness eval of a finished checkpoint (`job_scripts/eval_all_augmentations.sbatch`) |
 
 ## Experiments output
 
-Saved to `./experiments/<exp_name>/`. Contains checkpoints, tensorboard logs, and a copy of the cluster config used (`seg_config.yaml`).
+Saved to `./experiments/<exp_name>/`. Contains checkpoints, tensorboard logs, the
+resolved mmseg config, and copies of both config files the run was launched with
+(`seg_config.yaml` and `rounds.yaml`) — so a later analysis need not trust that
+either still says what it said months ago.
+
+The Nexus sbatch derives `<exp_name>` as
+`<aug_type>_<NAME>_<backbone>_<dataset>_4gpu[_<RUN_TAG>]` and refuses to start on a
+work_dir that already holds checkpoints unless `ALLOW_RESUME=1` — so a repeat of the
+same config needs a fresh `RUN_TAG` rather than silently continuing the earlier run's
+checkpoint under a different config.
 
 Per-pipeline logs:
 
@@ -559,15 +793,12 @@ Per-pipeline logs:
 | `sa_curve_log.txt` | SA pipeline | JSONL, one SA curve per recompute |
 | `perturb_eval.txt` | SA pipeline | JSONL, per-round perturbed eval metrics |
 | `aug_gradient_log.txt` | correlation pipeline | JSONL, one record per sweep batch — every per-image gradient, so R is recomputable offline without retraining |
-| `corr_matrix_log.json` | correlation pipeline | one JSON array, one record per emission: raw + scale-normalized R, dropped ops, shared-image-factor loadings, and `role` (`control` for the pre-pdf baseline probe, `active` otherwise) |
+| `corr_matrix_log.json` | correlation pipeline | one JSON array, one record per emission: raw + scale-normalized R, shared-image-factor loadings, `role` (`control` for the pre-pdf baseline probe, `active` otherwise), and three disjoint absence fields — `dropped` (measured, no variance), `stale` (measured earlier, reused now) and `static_pruned` (never measured; see [Static pruning](#static-pruning----pruned-augmentations)) |
 | `corr_bootstrap_log.txt` | correlation pipeline | JSONL, per-cell bootstrap CIs and BH-FDR q-values |
 | `corr_redundancy_log.txt` | correlation pipeline | JSONL, one record per emission: per-op `red(a)` (standardized) and the raw row sums |
+| `random_prune.json` | `--random-prune-method=null` only | the arm's seed, its source, the eligible pool, and the dropped/kept split — neither the seed nor the draw is recoverable from a checkpoint |
 
 Launch tensorboard:
 ```bash
 tensorboard --logdir experiments/ --host 0.0.0.0
 ```
-
-## Nexus cluster
-
-Reference config at `configs/nexus.yaml` — shows the full set of supported datasets (cityscapes, ade20k, pascal_voc12, loveda, potsdam, synapse, a2i2haze, acdc, idd). Della currently only has Cityscapes.

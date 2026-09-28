@@ -2,6 +2,8 @@
 data/
 experiments/
 experiments_eval/
+experiments_final_eval/
+experiments_final/
 archive/
 pretrained_checkpoints/
 sensaug/dataset/vip_fractals
@@ -187,3 +189,4 @@ cython_debug/
 # Claude config
 .claude/
 CLAUDE.MD
+results_summary/
