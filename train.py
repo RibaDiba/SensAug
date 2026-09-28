@@ -751,6 +751,12 @@ def build_config(args):
 
     cfg.test_dataloader = cfg.val_dataloader
 
+    # Smoke-test override. Applied here, before anything below derives an
+    # interval from max_iters (checkpoint cadence, the round grid). The LR
+    # schedule is left alone: it only shapes the curve, and a smoke run is not
+    # trained to anything worth reading.
+    if args.max_iters is not None:
+        cfg.train_cfg.max_iters = args.max_iters
 
     # Set up working dir to save files and logs.
     cfg.work_dir = os.path.join(args.work_dir, args.exp_name)
@@ -866,6 +872,13 @@ def build_config(args):
     cfg.test_dataloader.dataset.data_root = data_root
     cfg.val_dataloader.dataset.data_root = data_root
 
+    # acdc borrows the cityscapes config (see the mm_configs glob above), whose
+    # data_prefix/type point at leftImg8bit/ + gtFine/; ACDC is laid out as
+    # rgb_anno/ + gt/ with its own suffixes. Without this every acdc run dies at
+    # dataset build with FileNotFoundError on leftImg8bit/val.
+    if args.dataset == "acdc":
+        cfg = apply_acdc_train_eval(cfg)
+
     # set up visualizer
     cfg.randomness = dict(seed=0)
     np.random.seed(0)
@@ -908,7 +921,8 @@ def build_config(args):
     #         cfg.train_cfg.max_iters * 2
     #     )  # NOTE: since we have early stopping, we just increase this.
 
-    cfg.default_hooks.logger.interval = 200
+    # min() so a --max-iters smoke run shorter than 200 still logs its loss.
+    cfg.default_hooks.logger.interval = min(200, cfg.train_cfg.max_iters)
     cfg.default_hooks.checkpoint.interval = cfg.train_cfg.max_iters // 20
     cfg.default_hooks.checkpoint.save_best = "mIoU"
     cfg.default_hooks.checkpoint.max_keep_ckpts = 3
@@ -1280,6 +1294,14 @@ if __name__ == "__main__":
         help="interval of iterations to re-compute sa",
     )
     parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=None,
+        help="override the backbone config's train_cfg.max_iters. For smoke tests: "
+        "with the default round grid it must be >= 20 (max_iters // 20 is the "
+        "round interval), or pass --round_interval too.",
+    )
+    parser.add_argument(
         "--round_interval",
         type=int,
         default=None,
@@ -1377,7 +1399,7 @@ if __name__ == "__main__":
         "Maximum-Relevance (relevance = the SA loop's own pdf mass, redundancy = "
         "the pairwise cells of R) and sets every op outside the top "
         "ceil(A/(1+lambda)) to probability exactly zero -- lambda buys a smaller "
-        "bank rather than a flatter one (0.25 keeps ~80% of the ops, 0.5 ~67%, "
+        "bank rather than a flatter one (0.25 keeps ~80%% of the ops, 0.5 ~67%%, "
         "1.0 half). Deletion is a stronger claim than the observed correlation "
         "sizes support, so read an mRMR run next to a soft-weighting run at the "
         "same lambda, and pair it with --photometric-only until the geometric "
