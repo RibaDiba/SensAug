@@ -1,0 +1,40 @@
+# The SA val-round grid, and where on it the gradient cross-correlation pipeline
+# fires. Cluster-independent on purpose: this is an experiment parameter, unlike
+# the paths in della.yaml / nexus.yaml, and duplicating it per cluster is how the
+# two drift apart. Select another file with --rounds-config.
+#
+# Parsed by sensaug/round_schedule.py. Unknown keys are an error, not a no-op.
+
+# Val/SA rounds per run. Sets the DEFAULT round_interval (max_iters // n_rounds);
+# --round_interval and schedule.round_interval in the cluster config still
+# override that, and the schedule below then follows the interval that won, not
+# this number.
+n_rounds: 20
+
+# Rounds the SA loop spends on the initial uniform policy before it starts
+# generating a pdf. --no-warmup forces 0, and drops the control probe with it.
+warmup_rounds: 4
+
+# Where the correlation pipeline fires, as ROUND numbers (not iterations).
+# null derives them: [warmup_rounds - 1], the control probe, plus every 6th round
+# from warmup_rounds onward, excluding the final round. At 20/4 that is
+# [3, 4, 10, 16] -- one baseline, then one emission per SA-curve recompute, each
+# governing the rounds that curve governs (4-9, 10-15, 16-18).
+corr_rounds: null
+
+# The subset of the above whose R is a BASELINE: measured, logged and plotted as
+# usual, but never published to the training pdf. null derives it as the firing
+# rounds that fall inside the warmup window, i.e. [3].
+control_rounds: null
+
+# How many ROUNDS apart correlation emissions land, post-warmup. null ties it to
+# the SA pipeline's own curve-recompute cadence (round_schedule.py's
+# SA_CURVE_CADENCE, currently 6) -- one control probe + one emission per SA-curve
+# recompute, [3, 4, 10, 16] at the defaults. Set lower to publish a fresher
+# red(a) more often; the SA curve itself still only recomputes every
+# SA_CURVE_CADENCE rounds -- this does not move that, it just refreshes the
+# redundancy score between recomputes. Must be a positive integer.
+#
+# 3 (below) gives [3, 4, 7, 10, 13, 16] at the defaults -- 5 active emissions
+# instead of 3. Restore the old spacing with 6 (or null).
+corr_cadence: 3

@@ -396,6 +396,44 @@ def color_op(images: Tensor, delta: Union[float, Tensor]) -> Tensor:
 # --- label-safe geometric warp ----------------------------------------------
 
 
+def _matrix_in_frame(matrix: Tensor, src_hw, dst_hw) -> Tensor:
+    """Re-express a (B, 2, 3) affine written in `src_hw` PIXEL coordinates so it
+    means the same visual transform in `dst_hw` pixel coordinates.
+
+    `affine_matrix` bakes the frame it was built for into the matrix: the
+    rotation/shear center is (w/2, h/2) and `geometric_affine_matrix` converts
+    translate magnitudes into pixels with that same w/h. Handing such a matrix to
+    a differently-sized raster rotates about a point that is not its center and
+    translates by the wrong number of pixels. That is not hypothetical -- mmseg
+    val pipelines `Resize` the image and then `LoadAnnotations` at the ORIGINAL
+    size ("ground truth does not need to do resize transform"), so on every
+    dataset whose val Resize is not a no-op (pascal_voc12, ade20k, acdc; not
+    cityscapes or loveda, whose scales match their native size) the image and its
+    label reach warp_image_and_label at different resolutions.
+
+    The change of frame is the conjugation M' = S M S^-1 with
+    S = diag(w_dst/w_src, h_dst/h_src). For a diagonal S that is four element
+    scalings: the diagonal of the linear part is invariant, the off-diagonals
+    pick up sx/sy and sy/sx, and the translation column scales by (sx, sy).
+
+    Identical shapes short-circuit and return `matrix` itself, so runs on a
+    dataset that never had the mismatch are bit-identical.
+    """
+    src_h, src_w = int(src_hw[0]), int(src_hw[1])
+    dst_h, dst_w = int(dst_hw[0]), int(dst_hw[1])
+    if (src_h, src_w) == (dst_h, dst_w):
+        return matrix
+
+    sx = dst_w / src_w
+    sy = dst_h / src_h
+    out = matrix.clone()
+    out[:, 0, 1] = out[:, 0, 1] * (sx / sy)
+    out[:, 1, 0] = out[:, 1, 0] * (sy / sx)
+    out[:, 0, 2] = out[:, 0, 2] * sx
+    out[:, 1, 2] = out[:, 1, 2] * sy
+    return out
+
+
 def warp_image_and_label(
     images: Tensor,
     label: Tensor,
@@ -405,7 +443,7 @@ def warp_image_and_label(
     """Apply one affine matrix to an image batch AND its label map.
 
     Only the 5 geometric ops need this -- photometric ops move no pixels, so
-    their labels are unchanged. Three things have to be true at once and none of
+    their labels are unchanged. Four things have to be true at once and none of
     them is the default:
 
     - the IMAGE warp is bilinear and keeps the graph, so d loss / d magnitude
@@ -416,7 +454,19 @@ def warp_image_and_label(
       of id 3 and id 8 is id 5.5);
     - out-of-frame label pixels are filled with the ignore index, not 0. kornia
       pads with zeros by default, which on Cityscapes is the `road` class -- the
-      loss would then be computed against a quarter-image of fabricated road.
+      loss would then be computed against a quarter-image of fabricated road;
+    - the label is warped by the matrix expressed in the LABEL's pixel frame
+      (`_matrix_in_frame`), not the image's. `matrix` carries the image's center
+      and the image's pixel translation, and the two rasters are routinely
+      different sizes at val time -- see `_matrix_in_frame`. Reusing it verbatim
+      warps both, but by different amounts, which is the same misregistration
+      this function exists to prevent, just harder to see.
+
+    The CPU classes get this right structurally rather than by correction:
+    `Rotate._rotate` rebuilds `get_rot_about_center_cv2(input.shape, ...)` from
+    whichever array it is about to warp, so each raster gets a matrix in its own
+    frame. Here there is one differentiable matrix (the image's, because that is
+    the one the gradient flows through) and the label's is derived from it.
 
     `label` may be (B, H, W) or (B, 1, H, W); the returned label matches the
     input's rank and is integral (long).
@@ -426,10 +476,11 @@ def warp_image_and_label(
 
     squeezed = label.dim() == 3
     label_in = label.unsqueeze(1) if squeezed else label
+    label_hw = label_in.shape[-2:]
     label_out = warp_affine(
         label_in.to(images.dtype),
-        matrix.detach(),
-        dsize=label_in.shape[-2:],
+        _matrix_in_frame(matrix.detach(), (h, w), label_hw),
+        dsize=label_hw,
         mode="nearest",
         padding_mode="fill",
         fill_value=torch.tensor(
@@ -454,11 +505,10 @@ def geometric_affine_matrix(
     would notice.
     """
     if name not in GEOMETRIC_OP_KEYS:
-        if name in PHOTOMETRIC_OP_KEYS:
+        if name in PHOTOMETRIC_OP_KEYS or name in DIFFERENTIABLE_PERTURBATIONS:
             return None
         raise KeyError(
-            f"Unknown op {name!r}; expected one of "
-            f"{sorted(AUTOAUGMENT_DIFFERENTIABLE_PERTURBATIONS)}"
+            f"Unknown op {name!r}; expected one of {sorted(DIFF32_OPS)}"
         )
     sign = -1.0 if name.endswith("_neg") else 1.0
     delta = _batch_delta(magnitude, images) * sign
@@ -547,17 +597,15 @@ assert GEOMETRIC_OP_KEYS | PHOTOMETRIC_OP_KEYS == set(
 # ops ported from the reference repo", and the tests that pin it to exactly that
 # vocabulary are still testing something true.
 #
-# WARNING -- the 10 geometric keys move pixels, and neither consumer moves the
-# LABEL to match:
-#   * sensaug.dataset.augmentations._DiffAugTransform.transform rewrites
-#     results["img"] only, never results["gt_seg_map"];
-#   * CollectGradientHook._grad_for_op computes model.loss(perturbed,
-#     data_samples) against the unwarped data_samples.
-# So for rotate/shear/translate the measured d loss / d magnitude is dominated
-# by image-label misalignment, not by the model's sensitivity to the
-# perturbation. The numbers will look plausible and large. warp_image_and_label
-# above is the piece that fixes this; wiring it into those two call sites is
-# deliberately not done here.
+# The 10 geometric keys move pixels, so the LABEL has to move with them, and both
+# consumers do that -- CollectGradientHook._grad_for_op and
+# GpuAugSegDataPreProcessor._apply_ops each call geometric_affine_matrix +
+# warp_image_and_label INSTEAD of the op function, which reproduces the op's own
+# image warp exactly while carrying the label along. A consumer that applied
+# DIFF32_OPS[name] directly to a geometric key would measure image-label
+# misalignment rather than the model's sensitivity, and the numbers would look
+# plausible and large rather than obviously broken -- so that pair, not the raw
+# op, is the entry point for anything holding a geometric key and a label.
 DIFF32_OPS: Dict[str, object] = {
     **DIFFERENTIABLE_PERTURBATIONS,
     **AUTOAUGMENT_DIFFERENTIABLE_PERTURBATIONS,

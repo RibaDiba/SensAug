@@ -87,16 +87,26 @@ def _build_perturbed_pipeline(
 
     insert_index = -1
     if len(perturb_levels) != 0:
+        # Both moves target index 1, so whichever runs LAST owns that slot and
+        # pushes the other one back. On the eval path Resize has to end up ahead
+        # of LoadAnnotations: mmseg's test pipelines load the annotation after
+        # Resize on purpose, leaving the label at ori_shape -- which is exactly
+        # where EncoderDecoder.postprocess_result puts the prediction back.
+        # Resize the label instead and IoUMetric.intersect_and_union indexes an
+        # [H, W] prediction with an [H', W'] mask, which is an IndexError on any
+        # dataset whose images are not already at the config's test scale
+        # (pascal_voc12, ade20k). Cityscapes only survived it because its test
+        # scale equals its native size, so the resize is a no-op there.
+        for i, aug in enumerate(pipeline):  # put transform after load annotations
+            if aug["type"] == "LoadAnnotations":
+                pipeline.insert(1, pipeline.pop(i))
+                break
+
         if not train:
             for i, aug in enumerate(pipeline):
                 if aug["type"] == "Resize":
                     pipeline.insert(1, pipeline.pop(i))
                     break
-
-        for i, aug in enumerate(pipeline):  # put transform after load annotations
-            if aug["type"] == "LoadAnnotations":
-                pipeline.insert(1, pipeline.pop(i))
-                break
 
     inserted: List[str] = []
     for p_type, value in perturb_levels.items():

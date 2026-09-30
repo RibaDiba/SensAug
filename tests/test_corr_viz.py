@@ -207,3 +207,74 @@ def test_render_handles_the_real_op_counts(n_ops):
     names = [f"op_{i}" for i in range(n_ops)]
     img = render_matrix(_r(n_ops=n_ops), names, "R", subtitle="x")
     assert img.ndim == 3 and img.shape[2] == 3
+
+
+# --- statically pruned ops ---------------------------------------------------
+#
+# `--pruned-augmentations` produces an all-NaN row exactly like a dropped op, but
+# for a reason that is a fact about the run's configuration rather than about the
+# data. Reading "we chose not to measure this" as "the measurement failed" is
+# what these keep from happening.
+
+
+def test_a_statically_pruned_op_is_not_counted_as_dropped():
+    r = _drop(_drop(_r(), 3), 6)
+    # dropped_ops() alone cannot tell the two apart -- that is why the caller
+    # passes the names it knows.
+    assert dropped_ops(r).tolist() == [3, 6]
+
+    report = markdown_report(
+        NAMES, r,
+        checkpoint=0.5, iteration=100, n_images=10, n_probes=2,
+        dropped_names=["op_3"],
+        static_pruned=["op_6"],
+    )
+    dropped_line = next(l for l in report.splitlines() if l.startswith("- dropped:"))
+    assert "op_3" in dropped_line and "op_6" not in dropped_line
+    assert "statically pruned" in report and "op_6" in report
+
+
+def test_report_omits_the_pruned_line_when_nothing_is_pruned():
+    """A run with no static prune must read exactly as it did before the flag."""
+    r = _drop(_r(), 3)
+    kwargs = dict(
+        checkpoint=0.5, iteration=100, n_images=10, n_probes=2,
+        dropped_names=["op_3"],
+    )
+    assert markdown_report(NAMES, r, **kwargs) == markdown_report(
+        NAMES, r, static_pruned=(), **kwargs
+    )
+    assert "statically pruned" not in markdown_report(NAMES, r, **kwargs)
+
+
+def test_a_pruned_op_is_labelled_pruned_not_dropped():
+    r = _drop(_r(), 3)
+    pruned = render_matrix(r, NAMES, "R", static_pruned=["op_3"])
+    dropped = render_matrix(r, NAMES, "R")
+    # Same matrix, different figure: the label and the fill both changed.
+    assert not np.array_equal(pruned, dropped)
+
+
+def test_pruned_and_dropped_rows_render_differently():
+    """The distinction has to survive to the image, not only to the label -- the
+    heatmap is what anyone actually looks at."""
+    both = _drop(_drop(_r(), 3), 6)
+    as_pruned = render_matrix(both, NAMES, "R", static_pruned=["op_6"])
+    as_dropped = render_matrix(both, NAMES, "R")
+    assert not np.array_equal(as_pruned, as_dropped)
+
+
+def test_static_pruned_names_not_in_the_matrix_are_ignored():
+    """R is always the full 32 names; a caller passing a name from another
+    vocabulary must not shift the row indices."""
+    r = _r()
+    assert np.array_equal(
+        render_matrix(r, NAMES, "R", static_pruned=["not_an_op"]),
+        render_matrix(r, NAMES, "R"),
+    )
+
+
+def test_an_all_pruned_matrix_still_renders():
+    """Degenerate, but it runs inside after_train_iter and may not crash."""
+    img = render_matrix(np.full((8, 8), np.nan), NAMES, "R", static_pruned=NAMES)
+    assert img.ndim == 3 and img.shape[2] == 3

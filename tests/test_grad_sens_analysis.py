@@ -583,6 +583,42 @@ def test_an_emission_publishes_a_redundancy_score(tmp_path):
     assert all(np.isfinite(v) for v in published["red"].values())
 
 
+def test_the_emission_publishes_r_itself_not_just_the_row_sums(tmp_path):
+    """A PAIRWISE down-weighting method -- mRMR ranks ops against each other --
+    cannot reconstruct R from the per-op row sums, so the matrix travels with the
+    score. `names` is the axis order of both `r` and `survives`, and `mode` /
+    `mask_within_op` say how compute_red read them, so a pairwise method can honour
+    --corr-red-mode and --corr-keep-within-op instead of quietly disagreeing with
+    red(a) about what R says."""
+    published = _emit_once(tmp_path, _redundancy_hook(tmp_path)).corr_redundancy
+
+    assert published["names"] == NAMES
+    assert published["mask_within_op"] is True
+    r = np.asarray(published["r"], dtype=float)
+    assert r.shape == (N_OPS, N_OPS)
+    assert np.isfinite(r).any()
+    # Symmetric with a unit diagonal wherever it is defined at all -- i.e. it is R,
+    # not the standardized score reshaped.
+    finite = np.isfinite(r)
+    assert np.allclose(r[finite], r.T[finite])
+
+
+def test_r_is_kept_out_of_the_redundancy_jsonl(tmp_path):
+    """corr_matrix_log.json already holds R in full under the same `iter`, so
+    writing it again here would turn one line per emission into an AxA block and
+    buy nothing. The runner record carries it; the log joins on `iter`."""
+    _emit_once(tmp_path, _redundancy_hook(tmp_path))
+
+    record = json.loads(
+        (tmp_path / "corr_redundancy_log.txt").read_text().strip().split("\n")[0]
+    )
+
+    assert "r" not in record and "survives" not in record
+    # ...but the small structural fields a reader needs to interpret it do stay.
+    assert record["names"] == NAMES
+    assert record["mask_within_op"] is True
+
+
 def test_the_published_score_is_standardized(tmp_path):
     """What makes one lambda portable across runs and checkpoints. If the raw row
     sums were published instead, a lambda tuned on one checkpoint would mean
@@ -682,3 +718,189 @@ def test_an_unknown_red_mode_is_rejected_at_construction(tmp_path):
     way into a multi-hour run."""
     with pytest.raises(ValueError, match="unknown red_mode"):
         PerturbationSensitivityAnalysisHookWithGradients(interval=10, red_mode="cubed")
+
+
+# --- the round-aligned schedule and its control probe --------------------------
+
+
+def _scheduled_hook(tmp_path, fire_iters, control_iters=()):
+    """A hook on the explicit round schedule rather than the modulo clock."""
+    return _hook(
+        interval=None,
+        fire_iters=fire_iters,
+        control_iters=control_iters,
+        bootstrap=False,
+        n_min=8,
+    )
+
+
+def test_the_schedule_fires_on_exactly_the_listed_iterations(tmp_path):
+    """No modulo, and no implicit final-iteration emission: the round schedule
+    deliberately leaves the last round out, because training ends with it and no
+    pdf would ever read the R it produced."""
+    from sensaug.hooks.grad_hook import fires_at
+
+    hook = _scheduled_hook(tmp_path, fire_iters=(16, 20, 44, 68))
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=80)
+
+    fired = []
+    for iteration in range(80):
+        runner.iter = iteration
+        if fires_at(runner, hook.interval, hook.fire_iters):
+            fired.append(iteration + 1)  # the 1-based count fires_at tests
+
+    assert fired == [16, 20, 44, 68]
+    assert 80 not in fired, "the final iteration must not fire on this clock"
+
+
+def test_both_halves_share_the_schedule_too(tmp_path):
+    """Same claim as test_both_halves_of_the_pipeline_share_one_clock, for the
+    other mode: the analyser correlates the sweep the collector just took, so a
+    gate that disagreed by one iteration would drain an empty or stale buffer."""
+    from sensaug.hooks.grad_hook import CollectGradientHook, fires_at
+
+    iters = (16, 20, 44, 68)
+    collector = CollectGradientHook(fire_iters=iters)
+    analyser = _scheduled_hook(tmp_path, fire_iters=iters, control_iters=(16,))
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=80)
+
+    for iteration in range(80):
+        runner.iter = iteration
+        assert fires_at(runner, collector.interval, collector.fire_iters) == fires_at(
+            runner, analyser.interval, analyser.fire_iters
+        )
+
+
+def test_a_control_emission_is_logged_but_never_published(tmp_path):
+    """Round 3's probe is the pre-pdf baseline every later matrix is read against.
+    It is measured and written like any other emission, and it must not reach
+    training -- withheld explicitly, not left to the fact that the next emission
+    would overwrite it first."""
+    hook = _scheduled_hook(tmp_path, fire_iters=(16, 20), control_iters=(16,))
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=80)
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 15  # iteration_count 16 -- the control probe
+    hook.after_train_iter(runner, batch_idx=15)
+
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert len(records) == 1, "the control probe is still a full emission"
+    assert records[0]["role"] == "control"
+    assert getattr(runner, "corr_redundancy", None) is None
+    assert not (tmp_path / "corr_redundancy_log.txt").exists()
+
+
+def test_the_next_emission_after_the_control_publishes_normally(tmp_path):
+    hook = _scheduled_hook(tmp_path, fire_iters=(16, 20), control_iters=(16,))
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=80)
+
+    _fill(buffer, n_probes=6)
+    runner.iter = 15
+    hook.after_train_iter(runner, batch_idx=15)
+
+    _fill(buffer, n_probes=6, seed=1)
+    runner.iter = 19  # iteration_count 20 -- an active round
+    hook.after_train_iter(runner, batch_idx=19)
+
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert [r["role"] for r in records] == ["control", "active"]
+    assert runner.corr_redundancy is not None
+    assert set(runner.corr_redundancy["red"]) == set(NAMES)
+
+
+def test_a_control_emission_does_not_clear_an_existing_score(tmp_path):
+    """Inert with respect to training, not merely neutral: a control that wiped
+    the current score would change the pdf by deletion instead of by publication."""
+    hook = _scheduled_hook(tmp_path, fire_iters=(16,), control_iters=(16,))
+    runner = _FakeRunner(tmp_path, {name: [] for name in NAMES}, max_iters=80)
+    runner.corr_redundancy = {"from": "an earlier round"}
+
+    hook.prune_augmentations(runner, np.eye(N_OPS), checkpoint=0.2, role="control")
+
+    assert runner.corr_redundancy == {"from": "an earlier round"}
+
+
+def test_an_interval_run_labels_every_emission_active(tmp_path):
+    """--corr-interval and the offline recompute have no baseline round, so
+    nothing should be tagged as one."""
+    _emit_once(tmp_path, _redundancy_hook(tmp_path))
+    records = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert records[0]["role"] == "active"
+
+
+def test_a_control_round_outside_the_schedule_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="not in fire_iters"):
+        _scheduled_hook(tmp_path, fire_iters=(20, 44), control_iters=(16,))
+
+
+# --- statically pruned ops ----------------------------------------------------
+#
+# CollectGradientHook writes an all-NaN row for anything --pruned-augmentations
+# removed, which correlate() then reports as dropped. `dropped` has to keep
+# meaning "the measurement failed", because that is the number worth chasing when
+# it rises; a configured absence belongs in its own field.
+
+
+def _pruned_runner(tmp_path, pruned, n_probes=6, batch=4):
+    """A buffer where `pruned`'s rows are NaN, exactly as the sweep writes them."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    _fill(buffer, n_probes=n_probes, batch=batch)
+    for name in pruned:
+        buffer[name] = [np.full(batch, np.nan) for _ in range(n_probes)]
+    runner.aug_grad_static_pruned = frozenset(pruned)
+    return runner
+
+
+def test_static_pruned_is_recorded_and_kept_out_of_dropped(tmp_path):
+    pruned = [NAMES[1], NAMES[4]]
+    runner = _pruned_runner(tmp_path, pruned)
+    hook = _hook()
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["static_pruned"] == sorted(pruned)
+    assert record["dropped"] == []
+    assert not set(record["dropped"]) & set(record["static_pruned"])
+    # R keeps its full shape -- the pruned ops are present as NaN rows, not
+    # removed from the index, so a log is comparable across arms.
+    assert record["names"] == NAMES
+    assert np.array(record["R_raw"], dtype=float).shape == (N_OPS, N_OPS)
+
+
+def test_a_genuinely_dropped_op_is_still_reported_as_dropped(tmp_path):
+    """The other half of the same claim: subtracting static_pruned must not
+    subtract a real failure."""
+    runner = _pruned_runner(tmp_path, [NAMES[1]])
+    # A constant row: measured, but no variance -- the real "dropped" case.
+    # normalize_per_image=False because the per-image scale divide turns a
+    # constant row back into a varying one, and `dropped` is read off the
+    # normalized matrix when normalization is on.
+    runner.aug_grad_buffer[NAMES[3]] = [np.full(4, 7.0) for _ in range(6)]
+    hook = _hook(normalize_per_image=False)
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["dropped"] == [NAMES[3]]
+    assert record["static_pruned"] == [NAMES[1]]
+
+
+def test_no_static_prune_records_an_empty_list(tmp_path):
+    """The regression guard: an ordinary grad_corr run gains a key, nothing else."""
+    buffer = {name: [] for name in NAMES}
+    runner = _FakeRunner(tmp_path, buffer, max_iters=1000)
+    _fill(buffer, n_probes=6)
+    hook = _hook()
+
+    runner.iter = 499
+    hook.after_train_iter(runner, batch_idx=499)
+
+    (record,) = json.loads((tmp_path / "corr_matrix_log.json").read_text())
+    assert record["static_pruned"] == []
+    assert record["dropped"] == []

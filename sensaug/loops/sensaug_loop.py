@@ -4,8 +4,9 @@ This is the loop `--aug-type=ours` runs. Every `round_interval` iterations it
 re-evaluates how badly the model does under each perturbation, turns that into a
 sampling pdf over (perturbation, magnitude) pairs, and rebuilds the train
 dataloader to sample augmentations from it. The SA *curve* itself is recomputed
-every 6th round (hardcoded in `run()`), so its effective cadence is
-`6 x round_interval`.
+every `SA_CURVE_CADENCE`-th round (6, from `sensaug/round_schedule.py`), so its
+effective cadence is `6 x round_interval` -- and that is the grid the gradient
+cross-correlation pipeline's sweeps are scheduled onto.
 
 `--aug-type=grad_corr` runs `GradCorrValLoop` (`grad_corr_loop.py`), which is a
 strict superset of this: same SA machinery, plus Lever 3's redundancy
@@ -37,6 +38,12 @@ import torch
 from sensaug.sensitivity_analysis import *  # noqa: F401,F403
 from sensaug.runner_utils import *  # noqa: F401,F403
 from sensaug.corr_magnitudes import conditional_levels, modal_magnitude
+# The SA-curve cadence is defined once, in the module that also builds the
+# correlation pipeline's firing schedule out of it. The two must agree: those
+# sweeps exist to land on the rounds this `%` selects.
+from sensaug.round_schedule import SA_CURVE_CADENCE
+from sensaug.dataset.differentiable_augmentations_aa import DIFF32_OPS
+from sensaug.dataset.augmentations import LEGACY20_OPS
 
 __all__ = [
     "dict_mean",
@@ -72,6 +79,9 @@ class RobustValLoop(ValLoop):
         photometric_only: bool = False,
         weighted_augs: bool = False,
         perturbation_set: str = "legacy20",
+        corr_skip_pruned_eval: bool = False,
+        pruned_augmentations: list = None,
+        hold_none_prob: bool = False,
         fp16: bool = False,
     ) -> None:
         super().__init__(runner, dataloader, evaluator, fp16)
@@ -99,6 +109,27 @@ class RobustValLoop(ValLoop):
         self.photometric_only = photometric_only
         self.weighted_augs = weighted_augs
 
+        # Only meaningful under GradCorrValLoop + a HARD_PRUNING_METHODS arm
+        # (mRMR): skip re-evaluating an op nobody is currently training on,
+        # except on the rounds the SA curve itself refreshes. Inert here --
+        # `runner.corr_pruned_ops` is never populated unless the down-weighting
+        # loop is the one running -- so this flag is safe to carry on the base
+        # class rather than duplicating test_perturbed_new for the subclass.
+        self.corr_skip_pruned_eval = corr_skip_pruned_eval
+        # (op -> (miou_by_level, mean_metrics)) as of the last round it was
+        # actually measured. What a skip round reads back instead of a fresh
+        # eval; see test_perturbed_new.
+        self._last_measured = {}
+        # Set for real in run(), right where the SA-curve recompute gate is
+        # already evaluated -- test_perturbed_new reads this directly (same
+        # object, no lag). CollectGradientHook needs the equivalent signal too,
+        # but reads it as a STATIC full_recheck_iters schedule fixed at
+        # config-build time instead (sensaug/round_schedule.py), not a live
+        # attribute here: a runtime flag would lag by one round on that hook,
+        # since after_train_iter hooks run before this round's own run() call
+        # on a shared firing iteration.
+        self._sa_curve_just_recomputed = False
+
         # Which augmentation vocabulary SA measures. "legacy20" is the historical
         # LEGACY20_OPS set; "non-diff32" and "diff32" are both keyed by the 32 op
         # names the gradient cross-correlation pipeline differentiates, so that the
@@ -114,6 +145,37 @@ class RobustValLoop(ValLoop):
         # implementations sharing a name, and 8 of the 32 were not even calibrated
         # against each other.
         self.perturbation_set = perturbation_set
+        # Static, whole-run exclusion list (--pruned-augmentations). Applied at
+        # the SA curve's source in update_sa_curve -- test_perturbed_new and
+        # every pdf generator below it only ever iterate self.sa_curve, so
+        # excluding a pruned op there is sufficient to keep it out of the
+        # round-eval sweep AND every pdf built from it.
+        self.pruned_augmentations = list(pruned_augmentations or [])
+
+        # The color/photometric ops --no-inv-aug drops, resolved ONCE here
+        # rather than inside _remove_H_perturbations, because two call sites now
+        # need them: that method (which still guards the load_sa_curve() path,
+        # where the curve comes off disk unfiltered) and update_sa_curve's
+        # `exclude=`, which keeps them out of the round-eval in the first place.
+        # Previously they were only ever popped from miou_record AFTER
+        # test_perturbed_new had already paid for a full 5-level eval on each.
+        self._remove_H_names = (
+            ["lighter_H", "darker_H"]
+            if self._is_corr_vocabulary
+            else ["PosterizeTransform", "SolarizeTransform"]
+        )
+
+        # How many ops --pruned-augmentations removed that WOULD otherwise have
+        # reached the pdf: in this run's vocabulary, and not already gone via
+        # remove_H. This is the only quantity --hold-none-prob needs; see
+        # _none_prob_denominator for what it is for.
+        self.hold_none_prob = hold_none_prob
+        _vocab = set(DIFF32_OPS) if self._is_corr_vocabulary else set(LEGACY20_OPS)
+        _also_removed = set(self._remove_H_names) if self.remove_H else set()
+        self._n_static_excluded = len(
+            {n for n in self.pruned_augmentations if n in _vocab} - _also_removed
+        )
+
         self.corr_magnitudes_path = os.path.join(
             runner.cfg.work_dir, "corr_magnitudes.json"
         )
@@ -173,6 +235,14 @@ class RobustValLoop(ValLoop):
             num_levels=5,
             tolerance=0.05,
             perturbation_set=self.perturbation_set,
+            # Both exclusions at the SOURCE. test_perturbed_new and every pdf
+            # generator below it only ever iterate self.sa_curve, so excluding
+            # here keeps an op out of the round-eval sweep AND out of every pdf
+            # built from it. The remove_H half used to be applied instead by
+            # _remove_H_perturbations, which pops from miou_record only after a
+            # full 5-level eval has already been run on each of those ops.
+            exclude=self.pruned_augmentations
+            + (self._remove_H_names if self.remove_H else []),
         )
 
         assert self.sa_curve is not None, "SA curve is None after broadcasting"
@@ -192,8 +262,34 @@ class RobustValLoop(ValLoop):
         metrics_record = {}
         final_metrics = {}
 
+        # Currently-pruned ops (mRMR, via GradCorrValLoop) are skipped on every
+        # round EXCEPT the ones where the SA curve itself just refreshed -- that's
+        # the natural point to re-measure everything, since the curve's own
+        # relevance numbers just changed too. `corr_pruned_ops` is only ever
+        # populated by GradCorrValLoop, so this is empty (a full sweep every
+        # round, today's behaviour) unless both the flag and a hard-pruning
+        # method are active.
+        skip_ops = (
+            frozenset()
+            if not self.corr_skip_pruned_eval or self._sa_curve_just_recomputed
+            else getattr(self.runner, "corr_pruned_ops", frozenset())
+        )
+        stale_ops = []
+
         # iterate through perturbation levels and test their MIOU performance
         for p_type, levels in self.sa_curve.items():
+            if p_type in skip_ops and p_type in self._last_measured:
+                # Not training on this op right now -- reuse its last real
+                # reading instead of spending a full eval pass re-measuring an
+                # op nobody is sampling. Flagged in final_metrics["_stale_ops"]
+                # below, not silently blended in: this is exactly the data a
+                # "did pruning hurt robustness" comparison reads.
+                miou_record[p_type], metrics_record[p_type] = self._last_measured[
+                    p_type
+                ]
+                stale_ops.append(p_type)
+                continue
+
             miou_record[p_type] = {}
             metrics_record[p_type] = []
 
@@ -219,10 +315,22 @@ class RobustValLoop(ValLoop):
                 metrics_record[p_type]
             )  # average metric for p type across all levels
 
+            # Cache the fresh reading so a later skip round has something real
+            # to carry forward -- see the skip branch above.
+            self._last_measured[p_type] = (
+                miou_record[p_type],
+                metrics_record[p_type],
+            )
+
         for p_type, mean_dict in metrics_record.items():
             for metric, value in mean_dict.items():
                 new_key = p_type.replace("_", "") + f"_{metric}"
                 final_metrics[new_key] = value
+
+        if stale_ops:
+            # Self-documenting: a reader of perturb_eval.txt must be able to
+            # tell a carried-forward number from a fresh one.
+            final_metrics["_stale_ops"] = sorted(stale_ops)
 
         return miou_record, final_metrics
 
@@ -265,7 +373,7 @@ class RobustValLoop(ValLoop):
         cross-correlation probe.
 
         Only meaningful for an R-keyed vocabulary ("non-diff32" or "diff32"): the probe
-        differentiates DIFFERENTIABLE_PERTURBATIONS, so a snapshot keyed by
+        differentiates DIFF32_OPS, so a snapshot keyed by
         LEGACY20_OPS names would match nothing and every op would silently
         fall back to the fixed reference magnitude. Skipped outright rather than
         published-and-ignored, so `runner.corr_magnitudes` is never a misleading
@@ -303,7 +411,7 @@ class RobustValLoop(ValLoop):
             return
 
         snapshot = conditional_levels(
-            self.pdf_dict, op_names=set(DIFFERENTIABLE_PERTURBATIONS)  # noqa: F405
+            self.pdf_dict, op_names=set(DIFF32_OPS)
         )
         self.runner.corr_magnitudes = snapshot
 
@@ -344,6 +452,37 @@ class RobustValLoop(ValLoop):
             logger="current",
         )
 
+    def _none_prob_denominator(self, n_surviving: int) -> int:
+        """Op count the ``("none", 0)`` mass is computed against.
+
+        Default: the surviving count, exactly as it always has been -- returning
+        `n_surviving` unchanged reproduces the old arithmetic bit-for-bit, which
+        is what keeps a run launched before this flag existed comparable with one
+        launched after.
+
+        Under ``--hold-none-prob``: the count this run WOULD have had without
+        ``--pruned-augmentations``, so the static prune redistributes mass
+        between ops without changing how often any augmentation fires at all.
+        That is the same invariant `_downweight_mrmr` already holds via its
+        `free_mass / survivor_mass` rescale, and the one CLAUDE.md states for
+        Lever 3 ("changes which augmentation is sampled, never how often").
+        Without it, pruning 6 of 30 ops raises P(no augmentation) by ~0.7pp -- a
+        second difference between arms, on top of the one being measured.
+
+        Note this fixes the ALLOTMENT, not P(none) directly. `generate_pdf_new`
+        leaks ~13% of each op's allotment back into ("none", 0) through a
+        truncated beta-binomial (see its call site and
+        tests/test_static_prune.py), so its real P(none) is ~16% rather than the
+        `1/(N+1)` its arithmetic reads as. Holding the allotment fixed holds the
+        leaked fraction fixed too, so the drift is removed either way -- but
+        "P(none) == 1/(N+1)" is not a claim to make about that generator.
+
+        `remove_H` and the vocabulary choice deliberately still set the bank
+        size: they are configured identically across the arms being compared, so
+        they are not a within-experiment intervention the way the prune is.
+        """
+        return n_surviving + (self._n_static_excluded if self.hold_none_prob else 0)
+
     def _remove_H_perturbations(self, miou_record):
         """Drop the color/photometric ops from the training pdf (`--no-inv-aug`).
 
@@ -353,15 +492,17 @@ class RobustValLoop(ValLoop):
         differentiable counterpart), so it is the hue ops themselves -- which is
         also what the flag's name (remove_H) says. Popping nothing at all would
         silently ignore --no-inv-aug for those whole vocabularies.
+
+        Kept even though `update_sa_curve` now excludes the same names at the
+        source, because the two guard DIFFERENT paths: that exclusion only
+        applies to a curve this loop computed, while `load_sa_curve()` reads one
+        off disk that nothing ever filtered. On the `update_sa_curve` path this
+        is a no-op -- `dict.pop(name, None)` on names already absent -- so the
+        overlap costs nothing and the disk path stays covered.
         """
         if not self.remove_H:
             return
-        names = (
-            ("lighter_H", "darker_H")
-            if self._is_corr_vocabulary
-            else ("PosterizeTransform", "SolarizeTransform")
-        )
-        for name in names:
+        for name in self._remove_H_names:
             miou_record.pop(name, None)
 
     def generate_uniform_pdf(self):
@@ -372,12 +513,28 @@ class RobustValLoop(ValLoop):
 
         # process miou_record into a probability density function
         pdf_dict = {}
-        num_perturbations = len(miou_record.keys()) + 1  # add 1 for "none" perturbation
+        # Two different counts, and conflating them is the bug this splits apart.
+        # `n_surviving` is what the perturbation mass is shared BETWEEN; `denom`
+        # is what P(none) is computed FROM. They are equal unless
+        # --hold-none-prob is on, in which case denom also counts the statically
+        # pruned ops and P(none) stops drifting with the size of the bank -- see
+        # _none_prob_denominator. With the flag off this is bit-identical to the
+        # old `1 / ((N + 1) * num_levels)`.
+        n_surviving = len(miou_record.keys())
+        denom = self._none_prob_denominator(n_surviving)
 
         for perturbation, levels in sorted(miou_record.items()):
             num_levels = len(levels.keys())
             for level, _ in levels.items():
-                pdf_dict[(perturbation, level)] = 1.0 / (num_perturbations * num_levels)
+                # One fused division rather than (total / n_surviving) / levels:
+                # with the flag off `denom == n_surviving` cancels and this is
+                # bit-identical to the original `1.0 / ((N + 1) * num_levels)`,
+                # where the staged form differs from it by an ULP. That matters
+                # only because "the control arm's pdf did not move" has to be
+                # checkable by equality rather than by tolerance.
+                pdf_dict[(perturbation, level)] = denom / float(
+                    (denom + 1) * n_surviving * num_levels
+                )
 
         pdf_dict_perturb_prob = sum(list(pdf_dict.values()))
 
@@ -418,7 +575,25 @@ class RobustValLoop(ValLoop):
 
         pdf_dict_perturb_prob = sum(list(pdf_dict.values()))
 
-        # add a "none" perturbation
+        # add a "none" perturbation.
+        #
+        # No _none_prob_denominator call here, and this generator is NOT immune
+        # to the drift that flag exists for -- it just drifts for a different
+        # reason, which the flag does not address.
+        #
+        # lambda_bb is a pmf over `len(all_mious)` = (ops x levels) but is only
+        # evaluated at i = 0 .. len(all_mious)-1, one short of that pmf's
+        # support, so the block sums to slightly under 0.95 and the shortfall
+        # falls through to ("none", 0). How short depends on len(all_mious),
+        # hence on the op count: P(none) runs ~6.4% at 10 ops and ~5.5% at 30.
+        # Same order as the 1/(N+1) drift, different mechanism.
+        #
+        # Left alone deliberately. Correcting it means deciding how to
+        # renormalize a truncated pmf, which changes the SHAPE of the ranking
+        # this generator exists to impose rather than just its scale -- a
+        # modelling decision, not a bug fix, and one no current arm needs
+        # (--weighted-augs is not used by any launch script here). Pinned in
+        # tests/test_static_prune.py so it stays on the record.
         pdf_dict[("none", 0)] = 1.0 - pdf_dict_perturb_prob
 
         if is_main_process():
@@ -442,9 +617,16 @@ class RobustValLoop(ValLoop):
 
         # process miou_record into a probability density function
         pdf_dict = {}
+        # `num_perturbations` shares the mass out between the ops that actually
+        # survived; `denom` is what P(none) = 1/(denom+1) is computed from. Equal
+        # unless --hold-none-prob is on -- see _none_prob_denominator -- so with
+        # the flag off this is the original arithmetic unchanged.
         num_perturbations = len(miou_record.keys())
-        perturbation_total_prob = num_perturbations / float(num_perturbations + 1)
-        perturbation_uniform_prob = perturbation_total_prob / num_perturbations
+        denom = self._none_prob_denominator(num_perturbations)
+        perturbation_total_prob = denom / float(denom + 1)
+        perturbation_uniform_prob = (
+            perturbation_total_prob / num_perturbations if num_perturbations else 0.0
+        )
 
         for perturbation, levels in sorted(miou_record.items()):
 
@@ -537,7 +719,10 @@ class RobustValLoop(ValLoop):
                 )
 
             else:
-                if (self.n_rounds - self.warmup_rounds) % 6 == 0:
+                self._sa_curve_just_recomputed = (
+                    self.n_rounds - self.warmup_rounds
+                ) % SA_CURVE_CADENCE == 0
+                if self._sa_curve_just_recomputed:
                     self.update_sa_curve()
 
                 if self.sa_curve is not None:

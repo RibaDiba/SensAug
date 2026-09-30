@@ -8,12 +8,6 @@ from mmcv.transforms.base import BaseTransform
 from mmseg.registry import TRANSFORMS
 
 import torch
-from torchvision.transforms.v2 import (
-    AugMix,
-    RandAugment,
-    TrivialAugmentWide,
-    AutoAugment,
-)
 from torchvision.transforms.v2 import AutoAugmentPolicy, functional as F
 from torchvision.transforms import InterpolationMode
 
@@ -22,6 +16,11 @@ from sensaug.dataset.utils.non_geometric_transforms import (
     ColorAutoAugment,
     ColorRandAugment,
     ColorTrivialAugmentWide,
+)
+from sensaug.dataset.utils.label_safe_transforms import (
+    LabelSafeAutoAugment,
+    LabelSafeRandAugment,
+    LabelSafeTrivialAugmentWide,
 )
 
 from sensaug.dataset.utils.cropping import *
@@ -242,8 +241,16 @@ class FastNoiseTransform(BaseTransform):
 
 @TRANSFORMS.register_module()
 class AugMixTransform(BaseTransform):
+    """AugMix for segmentation: photometric ops only.
+
+    AugMix blends several independently augmented copies of the image, so a
+    geometric op in any chain leaves no single label that matches the output.
+    The geometric ops are therefore dropped (``ColorAugMix``); the photometric
+    ops, magnitudes and mixing are torchvision's AugMix unchanged.
+    """
+
     def __init__(self):
-        self.augmix = AugMix(
+        self.augmix = ColorAugMix(
             severity=3,
             mixture_width=3,
             chain_depth=-1,
@@ -254,10 +261,28 @@ class AugMixTransform(BaseTransform):
         )
 
     def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.augmix(img_pil)
-        # img_np, cropped_rect = crop_and_resize_data(np.array(img_pil).astype(np.uint8))
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
+        # BGR -> RGB for the call: torchvision's Color op uses RGB luma weights.
+        rgb = torch.from_numpy(np.ascontiguousarray(results["img"][..., ::-1]))
+        rgb = self.augmix(rgb.permute(2, 0, 1))
+        results["img"] = np.ascontiguousarray(rgb.permute(1, 2, 0).numpy()[..., ::-1])
+        return results
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}()"
+
+
+class _LabelSafeAutoAugmentTransform(BaseTransform):
+    """Runs a label-safe torchvision auto-augment method on img + gt_seg_map.
+
+    See sensaug.dataset.utils.label_safe_transforms: the method itself is the
+    torchvision reference, and every geometric op is replayed on the label.
+    """
+
+    def transform(self, results: dict) -> dict:
+        img, seg = self.policy.apply(results["img"], results.get("gt_seg_map"))
+        results["img"] = img
+        if seg is not None:
+            results["gt_seg_map"] = seg
         return results
 
     def __repr__(self) -> str:
@@ -265,29 +290,19 @@ class AugMixTransform(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class AutoAugmentTransform(BaseTransform):
+class AutoAugmentTransform(_LabelSafeAutoAugmentTransform):
     def __init__(self):
-        self.autoAugment = AutoAugment(
+        self.policy = LabelSafeAutoAugment(
             policy=AutoAugmentPolicy.IMAGENET,
             interpolation=InterpolationMode.NEAREST,
             fill=None,
         )
 
-    def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.autoAugment(img_pil)
-        # img_np, cropped_rect = crop_and_resize_data(np.array(img_pil).astype(np.uint8))
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}()"
-
 
 @TRANSFORMS.register_module()
-class RandAugmentTransform(BaseTransform):
+class RandAugmentTransform(_LabelSafeAutoAugmentTransform):
     def __init__(self):
-        self.randAugment = RandAugment(
+        self.policy = LabelSafeRandAugment(
             num_ops=2,
             magnitude=9,
             num_magnitude_bins=31,
@@ -295,31 +310,13 @@ class RandAugmentTransform(BaseTransform):
             fill=None,
         )
 
-    def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.randAugment(img_pil)
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}()"
-
 
 @TRANSFORMS.register_module()
-class TrivialAugmentWideTransform(BaseTransform):
+class TrivialAugmentWideTransform(_LabelSafeAutoAugmentTransform):
     def __init__(self):
-        self.trivialAugment = TrivialAugmentWide(
+        self.policy = LabelSafeTrivialAugmentWide(
             num_magnitude_bins=31, interpolation=InterpolationMode.NEAREST, fill=None
         )
-
-    def transform(self, results: dict) -> dict:
-        img_pil = torch.tensor(results["img"]).permute(2, 0, 1)
-        img_pil = self.trivialAugment(img_pil)
-        results["img"] = img_pil.permute(1, 2, 0).numpy()
-        return results
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}()"
 
 
 ####### Photometric AutoAugment Based Augmentations #######
@@ -785,7 +782,11 @@ class BrightnessTransform(BaseTransform):
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
         results["img"] = np.ascontiguousarray(results["img"])
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # results["ori_shape"] = results["img"].shape[:2]  # this op never changes
+        # spatial dims; overwriting ori_shape with the post-Resize shape clobbers
+        # the true native size EncoderDecoder.postprocess_result needs to resize
+        # the prediction back to before IoUMetric compares it against the
+        # never-resized label -- see tests/test_perturbed_pipeline_order.py.
         return results
 
 
@@ -809,7 +810,7 @@ class ColorTransform(BaseTransform):
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
         results["img"] = np.ascontiguousarray(results["img"])
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -831,7 +832,7 @@ class ContrastTransform(BaseTransform):
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
         results["img"] = np.ascontiguousarray(results["img"])
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -852,7 +853,7 @@ class SharpnessTransform(BaseTransform):
         img_pil = F.adjust_sharpness(img_pil, 1.0 + self.magnitude)
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -876,7 +877,7 @@ class PosterizeTransform(BaseTransform):
         img_pil = F.posterize(img_pil, bits)
         img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
         results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
         return results
 
 
@@ -896,7 +897,7 @@ class SolarizeTransform(BaseTransform):
             img_pil = img_pil.flip(dims=(0,))  # RGB -> BGR
             results["img"] = img_pil.permute(1, 2, 0).numpy().astype(np.uint8)
 
-        results["ori_shape"] = results["img"].shape[:2]  # necessary
+        # ori_shape left untouched -- see BrightnessTransform.transform above.
 
         return results
 
@@ -915,6 +916,7 @@ class RandomAlphaTrainTransform(BaseTransform):
         geometric_only: bool = False,
         photometric_only: bool = False,
         perturbation_set: str = "legacy20",
+        pruned: tuple = (),
     ):
         self.geometric_only = geometric_only
         self.photometric_only = photometric_only
@@ -928,7 +930,13 @@ class RandomAlphaTrainTransform(BaseTransform):
         # the pipeline for that set. The guard below is what says so out loud.
         _reject_gpu_set(perturbation_set, type(self).__name__)
         self.perturbation_set = perturbation_set
-        resolve_perturbation_set(perturbation_set, geometric_only, photometric_only)
+        # Static, whole-run exclusion list (--pruned-augmentations), distinct
+        # from the geometric/photometric filters above. See
+        # resolve_perturbation_set's `exclude` param.
+        self.pruned = tuple(pruned)
+        resolve_perturbation_set(
+            perturbation_set, geometric_only, photometric_only, exclude=self.pruned
+        )
 
     def transform(self, results: dict) -> dict:
         results["img"] = np.ascontiguousarray(results["img"].copy())
@@ -939,7 +947,10 @@ class RandomAlphaTrainTransform(BaseTransform):
         num_transforms = 1
 
         perturbations = resolve_perturbation_set(
-            self.perturbation_set, self.geometric_only, self.photometric_only
+            self.perturbation_set,
+            self.geometric_only,
+            self.photometric_only,
+            exclude=self.pruned,
         )
         perturbation_list = list(perturbations.keys()) + ["none"]
 
@@ -1040,7 +1051,10 @@ class ImageNetCTransform(BaseTransform):
         img = np.array(img).astype(np.uint8)
         img = img[..., ::-1]  # RGB -> BGR
         results["img"] = img
-        results["ori_shape"] = img.shape[:2]
+        # ori_shape left untouched -- none of the IMAGENETC_NAME_FN_DICT corruptions
+        # (motion_blur, zoom_blur, pixelate, jpeg_compression, snow, frost, fog)
+        # change spatial dims, so this used to just clobber the true native shape
+        # with the post-Resize one -- see BrightnessTransform.transform above.
 
         return results
 
@@ -1296,7 +1310,8 @@ class CombinationPerturbation(BaseTransform):
         img = img + np.random.normal(0, self.noise_sigma, size=img.shape)
 
         results["img"] = np.clip(img, a_min=0, a_max=255).astype(np.uint8)
-        results["ori_shape"] = img.shape[:2]
+        # ori_shape left untouched -- color/blur/noise perturbations never change
+        # spatial dims; see BrightnessTransform.transform above.
         return results
 
     def __repr__(self) -> str:
@@ -1661,7 +1676,10 @@ NON_DIFF32_OPS_PHOTOMETRIC = {
 }
 
 def resolve_perturbation_set(
-    name: str, geometric_only: bool = False, photometric_only: bool = False
+    name: str,
+    geometric_only: bool = False,
+    photometric_only: bool = False,
+    exclude=(),
 ) -> dict:
     """Select a perturbation registry by name, honouring the geometric/photometric
     filters.
@@ -1680,31 +1698,50 @@ def resolve_perturbation_set(
     all three. Callers that need a transform class are CPU-only by construction
     and must never be handed ``diff32`` -- `_perturbation_transform_cfg` raises
     rather than unpacking a callable into a class.
+
+    ``exclude`` is this module's one dispatch point for the static
+    `--pruned-augmentations` list: names in it are dropped from whichever set
+    was selected, AFTER the geometric/photometric filter, so every consumer of
+    this function (the CPU samplers, and -- via
+    ``sensaug.runner_utils._perturbation_transform_cfg`` -- the SA round-eval
+    enumeration) skips them uniformly. A name not present in the selected set
+    (wrong vocabulary, or already excluded by geometric/photometric-only) is
+    silently a no-op here; `train.py` is what warns a pruned name is inert for
+    a given run.
     """
     if name == "legacy20":
         if geometric_only:
-            return LEGACY20_OPS_GEOMETRIC
-        if photometric_only:
-            return LEGACY20_OPS_PHOTOMETRIC
-        return LEGACY20_OPS
+            base = LEGACY20_OPS_GEOMETRIC
+        elif photometric_only:
+            base = LEGACY20_OPS_PHOTOMETRIC
+        else:
+            base = LEGACY20_OPS
 
-    if name == "non-diff32":
+    elif name == "non-diff32":
         if geometric_only:
-            return NON_DIFF32_OPS_GEOMETRIC
-        if photometric_only:
-            return NON_DIFF32_OPS_PHOTOMETRIC
-        return NON_DIFF32_OPS
+            base = NON_DIFF32_OPS_GEOMETRIC
+        elif photometric_only:
+            base = NON_DIFF32_OPS_PHOTOMETRIC
+        else:
+            base = NON_DIFF32_OPS
 
-    if name == GPU_PERTURBATION_SET:
+    elif name == GPU_PERTURBATION_SET:
         if geometric_only:
-            return DIFF32_OPS_GEOMETRIC
-        if photometric_only:
-            return DIFF32_OPS_PHOTOMETRIC
-        return DIFF32_OPS
+            base = DIFF32_OPS_GEOMETRIC
+        elif photometric_only:
+            base = DIFF32_OPS_PHOTOMETRIC
+        else:
+            base = DIFF32_OPS
 
-    raise ValueError(
-        f"unknown perturbation_set {name!r}, expected one of {PERTURBATION_SETS}"
-    )
+    else:
+        raise ValueError(
+            f"unknown perturbation_set {name!r}, expected one of {PERTURBATION_SETS}"
+        )
+
+    if not exclude:
+        return base
+    excluded = set(exclude)
+    return {k: v for k, v in base.items() if k not in excluded}
 
 # @TRANSFORMS.register_module()
 # class PackSegInputs(BaseTransform):

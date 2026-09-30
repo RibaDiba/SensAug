@@ -25,4 +25,15 @@ tqdm
 Wand
 pytest
 
+# torch.utils.cpp_extension still imports pkg_resources at module level, which
+# setuptools>=81 no longer bundles -- see CHANGELOG.md, job sensaug-test-2/7304793.
+setuptools<81
+# mmengine's TensorBoard vis-backend needs both; neither is pulled in transitively.
+# See CHANGELOG.md, job sensaug-test-2/7304801.
+future
+tensorboard
+
 cityscapesscripts
+
+# scripts/prepare_datasets.py -> synapse converter reads .nii.gz volumes.
+nibabel

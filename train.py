@@ -2,8 +2,10 @@ import os
 import numpy as np
 import re
 import glob
+import json
 import logging
 import shutil
+import zlib
 
 from sensaug.cluster_config import load_seg_config
 
@@ -29,11 +31,18 @@ from sensaug.dataset.idbh import IDBHTransform  # noqa:F401
 from sensaug.dataset.vip import VIPAugTransform  # noqa:F401
 from sensaug.hooks import *  # noqa:F403
 from sensaug.loops import *  # noqa:F403
+# Explicit for the same reason DOWNWEIGHT_METHODS below is: these are READ here,
+# to turn configs/rounds.yaml into the correlation pipeline's firing schedule.
+from sensaug.round_schedule import (
+    DEFAULT_ROUNDS_CONFIG,
+    load_round_config,
+    resolve_schedule,
+)
 # Explicit rather than left to the star import above: this one is READ here, to
 # build the flag's `choices` from the registry so the two cannot drift. A name
 # that exists only by virtue of a star import is invisible to every linter that
 # would otherwise catch it going stale.
-from sensaug.loops.grad_corr_loop import DOWNWEIGHT_METHODS
+from sensaug.loops.grad_corr_loop import DOWNWEIGHT_METHODS, HARD_PRUNING_METHODS
 from sensaug.visualizer import BPSegLocalVisualizer  # noqa:F401
 
 #: The arms that draw from the 32-op bank. All of them run on the GPU set, so
@@ -112,6 +121,352 @@ def resolve_interval(cli_value, key, default):
     return default if configured is None else configured
 
 
+def resolve_pruned_augmentations(cli_value):
+    """Resolve the pruned-op list: CLI flag > cluster config's `pruned_augmentations:`.
+
+    `cli_value` is `None` when `--pruned-augmentations` was never passed, which
+    means "use the cluster config's list as-is". An explicit CLI value --
+    including an explicit empty one, e.g. `--pruned-augmentations` alone --
+    overrides the config list rather than merging with it, matching
+    `resolve_interval`'s CLI > config precedence for the schedule.
+    """
+    if cli_value is not None:
+        return list(cli_value)
+    return list(PRUNED_AUGMENTATIONS)
+
+
+def validate_pruned_augmentations(names, known):
+    """Raise ValueError if any of `names` isn't a real augmentation op.
+
+    `known` is the full vocabulary of op names that exist ANYWHERE in the
+    codebase (union across all three perturbation sets), not just the ones
+    active for the current --aug-type -- this is a typo check, not an
+    applicability check. Pulled out of the argparse block so it's testable on
+    its own; the CLI call site turns this into `parser.error(...)` so a bad
+    name is caught before any config is built or work_dir created.
+    """
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise ValueError(
+            f"--pruned-augmentations names not found in any perturbation set: "
+            f"{unknown}. Valid names: {sorted(known)}"
+        )
+
+
+def warn_ignored_pruned_augmentations(args, active_vocab):
+    """Warn (never raise) about a pruned name that exists but is inert here.
+
+    A name can be valid (it's in `validate_pruned_augmentations`'s union of
+    every known op) yet belong to a perturbation set this run never touches --
+    e.g. a snake_case diff32/non-diff32 name pruned on --aug-type=random,
+    which only ever samples from legacy20's PascalCase names. That is not an
+    error, but a silent no-op here would be a confusing one to debug later,
+    so it gets one line in the run's own log (same posture and call site as
+    warn_ignored_downweight_method -- after Runner.from_cfg, so it lands in
+    {work_dir}/<timestamp>/<timestamp>.log rather than only the SLURM .out).
+    """
+    inert = [n for n in args.pruned_augmentations if n not in active_vocab]
+    if not inert:
+        return
+
+    print_log(
+        f"[pruned-augmentations] {inert} are valid op names but not part of "
+        f"the perturbation set this run (--aug-type={args.aug_type}) actually "
+        f"samples from, so pruning them has no effect here.",
+        logger="current",
+        level=logging.WARNING,
+    )
+
+
+def _active_pruning_vocab(args):
+    """The op-name vocabulary this run actually samples from, for the pruned-
+    augmentations inertness warning.
+
+    Mirrors the perturbation_set choices build_config makes when it assembles
+    the training pipeline (the `augmentation_type in (...)` branch around the
+    "random"/"ours"/"grad_corr"/"default" pipeline entries, and
+    cfg.val_cfg.perturbation_set for the SA-loop arms): "random" samples from
+    the 20 PascalCase LEGACY20_OPS names; "ours"/"grad_corr"/"default" all
+    train on the 32 shared diff32/non-diff32 snake_case names (DIFF32_OPS).
+    Every other --aug-type (none, autoaugment, augmix, randaugment,
+    trivialaugment, idbh, vip) does not sample from either perturbation-set
+    registry at all, so pruning is unconditionally inert there -- returning an
+    empty set flags every pruned name as such.
+    """
+    if args.aug_type == "random":
+        return set(LEGACY20_OPS)
+    if args.aug_type in ("ours", "grad_corr", "default"):
+        return set(DIFF32_OPS)
+    return set()
+
+
+#: The random-pruning arms. `none` is the default -- no random prune at all, so
+#: every invocation that predates this flag lands there unchanged. `null` is the
+#: control arm for mRMR: drop N ops chosen at random, once, and keep them dropped
+#: for the whole run. A tuple rather than a dispatch dict like DOWNWEIGHT_METHODS
+#: because there is no per-arm function to dispatch TO -- the arm differs only in
+#: how the op names are chosen, after which it is an ordinary
+#: --pruned-augmentations run and every existing consumer handles it unchanged.
+RANDOM_PRUNE_METHODS = ("none", "null")
+
+#: The color/photometric ops --no-inv-aug removes, per vocabulary. Mirrors
+#: RobustValLoop._remove_H_names (sensaug/loops/sensaug_loop.py) -- restated here
+#: rather than imported because the loop resolves them from an instance that does
+#: not exist yet at argparse time, and the two have to agree for a random draw's
+#: count to mean what it says.
+_REMOVE_H_NAMES = {
+    "diff32": ("lighter_H", "darker_H"),
+    "legacy20": ("PosterizeTransform", "SolarizeTransform"),
+}
+
+
+def _random_prune_set_name(aug_type):
+    """Which perturbation registry a random prune draws from, or None.
+
+    The same mapping `_active_pruning_vocab` makes, expressed as the
+    `resolve_perturbation_set` key rather than the resolved name set, because the
+    pool also has to respect --geometric-only / --photometric-only and those
+    filters live inside that function.
+    """
+    if aug_type == "random":
+        return "legacy20"
+    if aug_type in ("ours", "grad_corr", "default"):
+        return "diff32"
+    return None
+
+
+def random_prune_pool(args, already_pruned=()):
+    """The ops a `null` draw is allowed to remove, sorted.
+
+    Deliberately narrower than "every op in the vocabulary", so that dropping N
+    means the run really does train on N fewer ops than its control:
+
+    * --geometric-only / --photometric-only already restrict what is sampled,
+      and resolve_perturbation_set applies them.
+    * --no-inv-aug removes two ops at the SA curve's source (update_sa_curve's
+      `exclude=`), and job_scripts/train_nexus_gamma.sbatch passes it on EVERY
+      run. Drawing one of those would spend a prune on an op that was already
+      gone, leaving this arm N-1 real prunes against an mRMR arm's N.
+    * anything --pruned-augmentations or the cluster config already removed, so a
+      random draw COMPOSES with an explicit list instead of overlapping it and
+      quietly shrinking its own count.
+
+    Empty for an --aug-type that samples from no perturbation registry at all
+    (none, autoaugment, ...), which is what lets one bounds check on `count` also
+    reject those arms.
+    """
+    set_name = _random_prune_set_name(args.aug_type)
+    if set_name is None:
+        return []
+
+    excluded = set(already_pruned)
+    if args.no_inv_aug:
+        excluded.update(_REMOVE_H_NAMES[set_name])
+
+    names = resolve_perturbation_set(
+        set_name,
+        geometric_only=args.geometric_only,
+        photometric_only=args.photometric_only,
+    )
+    return sorted(n for n in names if n not in excluded)
+
+
+def _seed_from_text(text):
+    """A stable 32-bit seed from an arbitrary run id.
+
+    zlib.crc32 rather than hash(): PYTHONHASHSEED is randomized per process, so
+    hash() of the same SLURM job id would differ between ranks -- which is the
+    exact failure resolve_random_prune_seed exists to prevent.
+    """
+    try:
+        return int(text) % (2**32)
+    except ValueError:
+        return zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF
+
+
+def resolve_random_prune_seed(cli_value, env=None):
+    """Resolve the `null` arm's seed to `(seed, source)`. Raises ValueError.
+
+    Every rank runs train.py independently under torchrun, and at argparse time
+    torch.distributed is NOT yet initialized -- that happens inside
+    Runner.from_cfg, long after this. So there is no collective here to sync a
+    seed with, and mmengine.dist.sync_random_seed() does not help: with dist
+    uninitialized it sees world_size == 1 and returns a per-process seed without
+    broadcasting anything. A freshly generated seed would therefore give every
+    rank a DIFFERENT pruned set -- four banks averaged into one gradient update,
+    with nothing in the logs saying so.
+
+    Hence: the seed is either stated outright, or derived from something every
+    rank of the same job already agrees on and that still differs between runs.
+    If neither is available and this is demonstrably multi-rank, refuse rather
+    than guess.
+    """
+    env = os.environ if env is None else env
+
+    if cli_value is not None:
+        return int(cli_value) % (2**32), "--random-prune-seed"
+
+    for key in ("SLURM_JOB_ID", "TORCHELASTIC_RUN_ID"):
+        raw = env.get(key)
+        if raw:
+            return _seed_from_text(raw), key
+
+    world_size = env.get("WORLD_SIZE")
+    if world_size in (None, "", "1"):
+        return int.from_bytes(os.urandom(4), "little"), "urandom"
+
+    raise ValueError(
+        f"--random-prune-method=null needs a seed that every rank agrees on, and "
+        f"this launch has WORLD_SIZE={world_size} with neither SLURM_JOB_ID nor "
+        f"TORCHELASTIC_RUN_ID set to derive one from. Generating one here would "
+        f"give each rank a different pruned set, which no log would reveal. Pass "
+        f"--random-prune-seed explicitly."
+    )
+
+
+def draw_random_prune(pool, count, seed):
+    """Draw `count` op names from `pool`, deterministically for a given seed.
+
+    A private RandomState rather than the global numpy RNG, which set_manual_seed
+    pins to 0 for the run proper and which GpuAugSegDataPreProcessor then draws
+    every per-image augmentation from -- consuming from it here would shift every
+    subsequent draw as a function of how many ops were pruned, so the two arms
+    would differ by more than their banks. `pool` is sorted, so the result cannot
+    depend on dict iteration order either.
+    """
+    rng = np.random.RandomState(seed)
+    return sorted(rng.choice(list(pool), size=count, replace=False).tolist())
+
+
+def reject_random_prune(args, pool=None):
+    """Return a rejection message for the random-pruning flags, or None.
+
+    Returns a string rather than raising so the CLI can route it through
+    `parser.error` -- exit 2, before any config is built or work_dir created --
+    while the tests can assert on it directly. Same posture as
+    `reject_skip_pruned_eval`.
+
+    Called twice: once without `pool` for the checks that need no vocabulary, and
+    again with it for the bounds check, so a bad flag combination is rejected
+    before the pool is even resolved.
+    """
+    method = args.random_prune_method
+    count = args.random_prune_count
+
+    if method == "none":
+        stray = [
+            name
+            for name, value in (
+                ("--random-prune-count", count),
+                ("--random-prune-seed", args.random_prune_seed),
+            )
+            if value is not None
+        ]
+        if stray:
+            return (
+                f"{', '.join(stray)} set without --random-prune-method=null, so "
+                f"nothing would be pruned at random. An arm is never left "
+                f"unnamed -- the same rule --corr-downweight-method applies on "
+                f"grad_corr, and for the same reason: the arm is not recoverable "
+                f"from the checkpoint afterwards."
+            )
+        return None
+
+    if count is None:
+        return (
+            "--random-prune-method=null requires --random-prune-count N, the "
+            "number of ops to drop at random. It has no default: the point of "
+            "the arm is to match some specific mRMR run's prune count, and "
+            "guessing one would make the comparison meaningless."
+        )
+
+    if count < 1:
+        return f"--random-prune-count must be >= 1, got {count}."
+
+    if pool is None:
+        return None
+
+    if not pool:
+        return (
+            f"--random-prune-method=null has nothing to draw from on "
+            f"--aug-type={args.aug_type}: it samples from no perturbation set, "
+            f"so there are no ops to prune. Use ours, grad_corr, default or "
+            f"random."
+        )
+
+    if count >= len(pool):
+        # >= rather than >: pruning the whole pool leaves a pdf of nothing but
+        # ("none", 0), and CollectGradientHook refuses a static prune naming
+        # every op outright. Failing here says why; failing there says less.
+        flags = "".join(
+            f", {flag}"
+            for flag, on in (
+                ("--no-inv-aug", args.no_inv_aug),
+                ("--geometric-only", args.geometric_only),
+                ("--photometric-only", args.photometric_only),
+            )
+            if on
+        )
+        return (
+            f"--random-prune-count={count} would leave no augmentations: only "
+            f"{len(pool)} ops are eligible on this run (--aug-type="
+            f"{args.aug_type}{flags}; already pruned: "
+            f"{sorted(set(args.pruned_augmentations))}). Eligible ops: {pool}"
+        )
+
+    return None
+
+
+def random_prune_record(args):
+    """The reproducibility record for a `null` run, as a JSON-able dict.
+
+    Neither the seed nor the draw is recoverable from a checkpoint, and the seed
+    is not necessarily in the launch command either (it can be derived from the
+    SLURM job id), so the arm has to write itself down or it cannot be repeated.
+    """
+    dropped = set(args.random_prune_ops)
+    return {
+        "method": args.random_prune_method,
+        "count": args.random_prune_count,
+        "seed": args.random_prune_seed_used,
+        "seed_source": args.random_prune_seed_source,
+        "aug_type": args.aug_type,
+        "perturbation_set": _random_prune_set_name(args.aug_type),
+        "pool_size": len(args.random_prune_pool),
+        "pool": list(args.random_prune_pool),
+        "dropped": list(args.random_prune_ops),
+        "kept": [n for n in args.random_prune_pool if n not in dropped],
+        "pruned_augmentations": list(args.pruned_augmentations),
+    }
+
+
+def log_random_prune(args, work_dir):
+    """Record the `null` arm's draw, to the run's log and to its work_dir.
+
+    Called from train() after Runner.from_cfg for two reasons: print_log(
+    logger="current") only reaches {work_dir}/<timestamp>/<timestamp>.log once
+    the runner's logger exists (same reason as warn_ignored_downweight_method),
+    and is_main_process() only tells the truth once dist is initialized -- before
+    that every rank believes it is rank 0 and all four would race on the same
+    file.
+    """
+    if args.random_prune_method != "null":
+        return
+
+    record = random_prune_record(args)
+    print_log(
+        f"[random-prune] arm=null seed={record['seed']} "
+        f"(from {record['seed_source']}), dropped {record['count']} of "
+        f"{record['pool_size']} eligible ops: {record['dropped']}. "
+        f"Training on: {record['kept']}",
+        logger="current",
+    )
+
+    if is_main_process():
+        with open(os.path.join(work_dir, "random_prune.json"), "w") as f:
+            json.dump(record, f, indent=2)
+
+
 def warn_ignored_downweight_method(args):
     """Warn when `--corr-downweight-method` was supplied but nothing will read it.
 
@@ -155,6 +510,89 @@ def warn_ignored_downweight_method(args):
     print_log(
         f"[downweight] --corr-downweight-method="
         f"{args.corr_downweight_method} is set but will NOT be applied: {why}",
+        logger="current",
+        level=logging.WARNING,
+    )
+
+
+SKIP_PRUNED_EVAL_REJECTION = (
+    "--corr-skip-pruned-eval is not supported on --aug-type=grad_corr.\n\n"
+    "It would skip the gradient sweep for whatever ops the down-weighting "
+    "method currently has pruned and backfill each of them from "
+    "CollectGradientHook._last_full_row -- gradients measured at an EARLIER "
+    "checkpoint. Those rows are then correlated against freshly measured ones, "
+    "so a single R mixes vintages and successive emissions are no longer "
+    "comparable to each other. Watching R change as the model improves is what "
+    "a grad_corr session is for, so this is not a saving the pipeline can take.\n\n"
+    "If the goal is to stop training on an op: prune it statically with "
+    "--pruned-augmentations. That excludes it from the SA round-eval, the "
+    "training pdf and the gradient sweep alike, and its row of R is recorded as "
+    "'static_pruned' (never measured) rather than backfilled."
+)
+
+
+def reject_skip_pruned_eval(args):
+    """Return a rejection message for `--corr-skip-pruned-eval`, or None.
+
+    Errors on `grad_corr` -- the ONE arm where the flag could act -- for the
+    reason spelled out in SKIP_PRUNED_EVAL_REJECTION: skipping trades a
+    comparable R for compute the measurement cannot spare.
+
+    Returns a string rather than raising so the CLI can route it through
+    `parser.error` (exit 2, before any config is built or work_dir created)
+    while the tests can assert on it directly.
+    """
+    if not args.corr_skip_pruned_eval or args.aug_type != "grad_corr":
+        return None
+    return SKIP_PRUNED_EVAL_REJECTION
+
+
+def warn_ignored_skip_pruned_eval(args):
+    """Warn when `--corr-skip-pruned-eval` was supplied on an arm that ignores it.
+
+    `runner.corr_pruned_ops` is only ever non-empty under a
+    HARD_PRUNING_METHODS arm (today, just mRMR) running `GradCorrValLoop`, so on
+    every other arm this flag is a no-op skip-list that's always empty: correct,
+    but silently so, which reads exactly like the optimization firing when it
+    never has anything to skip. `grad_corr` itself never reaches here --
+    `reject_skip_pruned_eval` has already stopped the run at the CLI.
+
+    Same posture as warn_ignored_downweight_method: never raises, called from
+    train() after Runner.from_cfg so the warning lands in the run's own log
+    file rather than only the SLURM .out.
+    """
+    if not args.corr_skip_pruned_eval:
+        return
+
+    print_log(
+        f"[skip-pruned-eval] --corr-skip-pruned-eval is set but will NOT skip "
+        f"anything: --aug-type={args.aug_type} builds no GradCorrValLoop, so "
+        f"nothing ever publishes runner.corr_pruned_ops for either sweep to "
+        f"read. To exclude an op from this run, use --pruned-augmentations.",
+        logger="current",
+        level=logging.WARNING,
+    )
+
+
+def warn_ignored_hold_none_prob(args):
+    """Warn when `--hold-none-prob` was supplied but there is no drift to hold.
+
+    The flag only does anything when --pruned-augmentations removed at least one
+    op from the vocabulary this run samples from: with nothing pruned the
+    denominator it pins is already the surviving count. Silent inertness here
+    would be the bad kind -- the launch command reads as if the augmentation
+    rate had been controlled for.
+    """
+    if not args.hold_none_prob:
+        return
+    effective = set(args.pruned_augmentations) & _active_pruning_vocab(args)
+    if effective:
+        return
+
+    print_log(
+        f"[hold-none-prob] --hold-none-prob is set but no op is pruned from the "
+        f"vocabulary --aug-type={args.aug_type} samples from, so P(none) is "
+        f"already at its unpruned value and nothing is held.",
         logger="current",
         level=logging.WARNING,
     )
@@ -313,6 +751,13 @@ def build_config(args):
 
     cfg.test_dataloader = cfg.val_dataloader
 
+    # Smoke-test override. Applied here, before anything below derives an
+    # interval from max_iters (checkpoint cadence, the round grid). The LR
+    # schedule is left alone: it only shapes the curve, and a smoke run is not
+    # trained to anything worth reading.
+    if args.max_iters is not None:
+        cfg.train_cfg.max_iters = args.max_iters
+
     # Set up working dir to save files and logs.
     cfg.work_dir = os.path.join(args.work_dir, args.exp_name)
 
@@ -396,6 +841,7 @@ def build_config(args):
                         geometric_only=args.geometric_only,
                         photometric_only=args.photometric_only,
                         perturbation_set="legacy20",
+                        pruned=tuple(args.pruned_augmentations),
                     )
                 )
         elif augmentation_type == "idbh":
@@ -426,6 +872,13 @@ def build_config(args):
     cfg.test_dataloader.dataset.data_root = data_root
     cfg.val_dataloader.dataset.data_root = data_root
 
+    # acdc borrows the cityscapes config (see the mm_configs glob above), whose
+    # data_prefix/type point at leftImg8bit/ + gtFine/; ACDC is laid out as
+    # rgb_anno/ + gt/ with its own suffixes. Without this every acdc run dies at
+    # dataset build with FileNotFoundError on leftImg8bit/val.
+    if args.dataset == "acdc":
+        cfg = apply_acdc_train_eval(cfg)
+
     # set up visualizer
     cfg.randomness = dict(seed=0)
     np.random.seed(0)
@@ -433,27 +886,43 @@ def build_config(args):
         type="Visualizer", vis_backends=[dict(type="TensorboardVisBackend")]
     )
 
-    N_ROUNDS = 20
-    N_CORR_EMISSIONS = 4
+    # The val-round grid, from configs/rounds.yaml. Cluster-independent, unlike
+    # everything in --cluster-config: how many rounds a run has and where the
+    # correlation pipeline fires on them is an experiment parameter, not a path.
+    round_cfg = load_round_config(args.rounds_config)
 
-    # The two pipelines' clocks, resolved independently of each other. round_interval
-    # drives the SA pipeline (RobustValLoop; its SA-curve recompute is every 6th of
-    # these rounds, in sensaug/loops/sensaug_loop.py). corr_interval drives the gradient
-    # cross-correlation pipeline. Neither is derived from the other.
+    # round_interval drives the SA pipeline (RobustValLoop; its SA-curve recompute
+    # is every SA_CURVE_CADENCE of these rounds, in sensaug/loops/sensaug_loop.py).
+    # rounds.yaml's n_rounds is only the DEFAULT divisor -- the CLI flag and the
+    # cluster config's schedule: block still win.
     round_interval = resolve_interval(
-        args.round_interval, "round_interval", cfg.train_cfg.max_iters // N_ROUNDS
-    )
-    corr_interval = resolve_interval(
-        args.corr_interval, "corr_interval", cfg.train_cfg.max_iters // N_CORR_EMISSIONS
+        args.round_interval,
+        "round_interval",
+        cfg.train_cfg.max_iters // round_cfg.n_rounds,
     )
     cfg.train_cfg.val_interval = round_interval
+
+    # The correlation pipeline's clock. `None` -- neither --corr-interval nor
+    # schedule.corr_interval given -- is the DEFAULT and means "use the SA round
+    # grid" (the schedule built below), not "use max_iters // 4": an emission is
+    # only worth taking where a pdf can read it. Naming an interval opts back out
+    # into a clock that is independent of the rounds.
+    corr_interval = resolve_interval(args.corr_interval, "corr_interval", None)
+
+    # The rounds this run will REALLY have, which is round_cfg.n_rounds only when
+    # nothing overrode the interval above. The schedule is built from this, not
+    # from the configured number: derived from the wrong one, every round would
+    # still look right in the log while pointing at the wrong iteration.
+    n_rounds = cfg.train_cfg.max_iters // round_interval
+    warmup_rounds = 0 if args.no_warmup else round_cfg.warmup_rounds
 
     # if "acdc" not in args.dataset.lower():
     #     cfg.train_cfg.max_iters = (
     #         cfg.train_cfg.max_iters * 2
     #     )  # NOTE: since we have early stopping, we just increase this.
 
-    cfg.default_hooks.logger.interval = 200
+    # min() so a --max-iters smoke run shorter than 200 still logs its loss.
+    cfg.default_hooks.logger.interval = min(200, cfg.train_cfg.max_iters)
     cfg.default_hooks.checkpoint.interval = cfg.train_cfg.max_iters // 20
     cfg.default_hooks.checkpoint.save_best = "mIoU"
     cfg.default_hooks.checkpoint.max_keep_ckpts = 3
@@ -498,11 +967,13 @@ def build_config(args):
         cfg.val_cfg.descending_MA = args.descending_MA  # defaults to False
         # cfg.val_cfg.descending_MA = False # NOTE: False --> severe augmentations prioritized in pdf
         cfg.val_cfg.remove_H = args.no_inv_aug
-        cfg.val_cfg.warmup_rounds = 0 if args.no_warmup else 4
+        cfg.val_cfg.warmup_rounds = warmup_rounds
         cfg.val_cfg.random_aug = args.random_aug
         cfg.val_cfg.geometric_only = args.geometric_only
         cfg.val_cfg.photometric_only = args.photometric_only
         cfg.val_cfg.weighted_augs = args.weighted_augs
+        cfg.val_cfg.pruned_augmentations = args.pruned_augmentations
+        cfg.val_cfg.hold_none_prob = args.hold_none_prob
         # Lever 3's two knobs only exist on GradCorrValLoop. Setting them
         # unconditionally would attach kwargs RobustValLoop does not accept, and
         # under --no-corr-sa (sa_loop False) there is no custom val loop at all --
@@ -515,6 +986,10 @@ def build_config(args):
             # implicit default here would be a silent arm -- unrecoverable from the
             # checkpoint, the logs or the work_dir name after the fact.
             cfg.val_cfg.corr_downweight_method = args.corr_downweight_method
+            # Always False: reject_skip_pruned_eval has already stopped the run
+            # at the CLI if it was asked for. Passed explicitly rather than
+            # dropped so the loop's signature stays the shape the tests exercise.
+            cfg.val_cfg.corr_skip_pruned_eval = False
         # cfg.val_cfg.remove_H = False
         cfg.test_cfg.type = "SubsetTestLoop"
         cfg.test_cfg.ratio = eval_ratio
@@ -526,25 +1001,65 @@ def build_config(args):
             cfg.optimizer.lr *= 0.1
 
     if args.aug_type == "grad_corr":
-        # Gradient-based augmentation cross-correlation. Every `emit_interval`
-        # iters CollectGradientHook freezes the model and sweeps the whole clean
-        # val set for d loss / d magnitude, then
+        # Gradient-based augmentation cross-correlation. At each firing iteration
+        # CollectGradientHook freezes the model and sweeps the whole clean val set
+        # for d loss / d magnitude, then
         # PerturbationSensitivityAnalysisHookWithGradients correlates that sweep
-        # into R. Both gate on the SAME interval, so they are built from one
-        # variable rather than two that could drift apart.
+        # into R. Both are handed the SAME gate, built once here rather than twice.
         #
-        # --corr-sync-sa just hands them the SA loop's clock instead of their own.
-        # No special gate is needed: fires_at() counts runner.iter + 1, which is the
-        # value IterBasedTrainLoop tests against val_interval right after this hook
-        # point, so passing round_interval lands the sweep on exactly the iterations
-        # that are SA rounds.
+        # ORDERING, and every mode below depends on it: IterBasedTrainLoop calls
+        # val_loop.run() AFTER run_iter, so a sweep landing on a val iteration fires
+        # BEFORE that round's val loop rebuilds the pdf. It therefore probes at the
+        # PREVIOUS round's magnitudes (the ones in effect over the window being
+        # measured, which is the right semantics) and its R is on the runner in time
+        # for THIS round's pdf to be reweighted by it.
         #
-        # ORDERING, and it matters: RobustIterBasedTrainLoop calls val_loop.run()
-        # AFTER run_iter, so a synced sweep fires BEFORE the SA round it is synced
-        # to updates the pdf. It therefore probes at the previous round's
-        # magnitudes -- which is the right semantics (those are the magnitudes that
-        # were in effect over the window being measured) but is not obvious.
-        emit_interval = round_interval if args.corr_sync_sa else corr_interval
+        # Three ways to say when, in precedence order:
+        emit_interval = None
+        fire_iters = control_iters = full_recheck_iters = ()
+        if args.corr_sync_sa:
+            # Every SA round. The densest schedule available -- one R per pdf
+            # rebuild, at ~n_rounds/4 times the cost of the default.
+            emit_interval = round_interval
+        elif corr_interval is not None:
+            # An explicitly named interval: a clock independent of the rounds, which
+            # is what this pipeline had by default before the round-aligned
+            # schedule. Emissions land wherever the arithmetic puts them, so an R
+            # can be measured mid-curve and sit unread until the next round.
+            emit_interval = corr_interval
+        else:
+            # THE DEFAULT: the round grid from configs/rounds.yaml. One baseline
+            # probe in the last warmup round, then one emission per SA-curve
+            # recompute, each governing the rounds that curve governs. See
+            # sensaug/round_schedule.py for why those rounds and not others.
+            #
+            # `pre_train_round` mirrors RobustIterBasedTrainLoop's `init_sa`: those
+            # runs spend round 0 on a val pass before training starts, which shifts
+            # every subsequent round one interval earlier.
+            pre_train_round = sa_loop and bool(cfg.resume or args.no_warmup)
+            schedule = resolve_schedule(
+                round_cfg,
+                n_rounds=n_rounds,
+                warmup_rounds=warmup_rounds,
+                round_interval=round_interval,
+                pre_train_round=pre_train_round,
+            )
+            fire_iters = schedule.fire_iters
+            control_iters = schedule.control_iters
+            full_recheck_iters = schedule.full_recheck_iters
+            for warning in schedule.warnings:
+                dist_print(f"WARNING: {warning}")
+            # In the launch log so an experiment records the schedule it actually
+            # ran, not the one rounds.yaml happened to say at analysis time.
+            dist_print(
+                f"Correlation schedule ({'derived' if schedule.derived else 'explicit'}"
+                f", {round_cfg.path}): rounds {list(schedule.rounds)} of {n_rounds} "
+                f"-> iters {list(fire_iters)} (control: {list(control_iters)})"
+            )
+
+        # (The two --corr-skip-pruned-eval schedule warnings that used to sit here
+        # are gone with the flag: reject_skip_pruned_eval stops that combination
+        # at the CLI, so neither could ever fire.)
 
         # The priorities are load-bearing, not cosmetic: both hooks act in
         # after_train_iter, and the correlation hook must see the sweep the
@@ -553,14 +1068,23 @@ def build_config(args):
             dict(
                 type="CollectGradientHook",
                 interval=emit_interval,
+                fire_iters=fire_iters or None,
                 sweep_batch_size=1,
                 magnitude_mode=args.corr_magnitude_mode,
                 magnitudes_path=args.corr_magnitudes,
+                skip_pruned=False,  # see reject_skip_pruned_eval
+                full_recheck_iters=full_recheck_iters,
+                # Statically pruned ops are excluded from the sweep entirely and
+                # get an all-NaN row -- a separate mechanism from skip_pruned,
+                # which backfills from cache. See the hook's class docstring.
+                static_pruned_ops=args.pruned_augmentations,
                 priority="NORMAL",
             ),
             dict(
                 type="PerturbationSensitivityAnalysisHookWithGradients",
                 interval=emit_interval,
+                fire_iters=fire_iters or None,
+                control_iters=control_iters,
                 red_mode=args.corr_red_mode,
                 mask_within_op=not args.corr_keep_within_op,
                 priority="LOW",
@@ -585,6 +1109,7 @@ def build_config(args):
     # mean/std, which is carried through untouched.
     if uses_gpu_augmentation(args.aug_type):
         cfg.model.data_preprocessor.type = "GpuAugSegDataPreProcessor"
+        cfg.model.data_preprocessor.pruned_ops = args.pruned_augmentations
 
     cfg.randomness = dict(seed=0, diff_rank_seed=False)
 
@@ -603,6 +1128,10 @@ def train(args):
     cfg = build_config(args)
     os.makedirs(cfg.work_dir, exist_ok=True)
     shutil.copy(args.cluster_config, os.path.join(cfg.work_dir, "seg_config.yaml"))
+    # Same reason as the line above: the run should carry the schedule it was
+    # launched with, so a later analysis does not have to trust that
+    # configs/rounds.yaml still says what it said months ago.
+    shutil.copy(args.rounds_config, os.path.join(cfg.work_dir, "rounds.yaml"))
     runner = Runner.from_cfg(cfg)
     set_manual_seed(0)  # set seed
     runner.val_loop  # initialize val loop
@@ -612,6 +1141,10 @@ def train(args):
     # val_loop so a bad method name has already failed hard rather than being
     # reported as merely ignored.
     warn_ignored_downweight_method(args)
+    warn_ignored_skip_pruned_eval(args)
+    warn_ignored_pruned_augmentations(args, _active_pruning_vocab(args))
+    warn_ignored_hold_none_prob(args)
+    log_random_prune(args, cfg.work_dir)
 
     # Install the initial uniform training policy for the GPU arms.
     #
@@ -647,12 +1180,23 @@ if __name__ == "__main__":
     SUPPORTED_BACKBONES = _seg["SUPPORTED_BACKBONES"]
     SCHEDULE            = _seg["SCHEDULE"]
     PRETRAINED_CACHE_DIR = _seg["PRETRAINED_CACHE_DIR"]
+    PRUNED_AUGMENTATIONS = _seg["PRUNED_AUGMENTATIONS"]
 
     parser = argparse.ArgumentParser(description="main")
     parser.add_argument(
         "--cluster-config",
         required=True,
         help="path to YAML cluster config (e.g. configs/della.yaml)",
+    )
+    parser.add_argument(
+        "--rounds-config",
+        type=str,
+        default=DEFAULT_ROUNDS_CONFIG,
+        help="path to the YAML val-round grid (default: configs/rounds.yaml). "
+        "Sets how many val/SA rounds a run has, how many of them are warmup, and "
+        "which of them the gradient cross-correlation pipeline fires on. Kept out "
+        "of the cluster config on purpose -- it is an experiment parameter, and "
+        "della.yaml and nexus.yaml should not each carry a copy that can drift.",
     )
     parser.add_argument(
         "--work_dir",
@@ -750,6 +1294,14 @@ if __name__ == "__main__":
         help="interval of iterations to re-compute sa",
     )
     parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=None,
+        help="override the backbone config's train_cfg.max_iters. For smoke tests: "
+        "with the default round grid it must be >= 20 (max_iters // 20 is the "
+        "round interval), or pass --round_interval too.",
+    )
+    parser.add_argument(
         "--round_interval",
         type=int,
         default=None,
@@ -800,19 +1352,25 @@ if __name__ == "__main__":
         "--corr-sync-sa",
         action="store_true",
         default=False,
-        help="fire the gradient sweep on the SA loop's clock (--round_interval) "
-        "instead of its own --corr-interval. The sweep still runs from "
-        "after_train_iter, which is BEFORE that round's val loop updates the pdf, "
-        "so it probes at the previous round's magnitudes.",
+        help="fire the gradient sweep on EVERY SA round (--round_interval) rather "
+        "than on the round-aligned subset the default schedule uses. ~20x the "
+        "sweeps, one per pdf rebuild. The sweep still runs from after_train_iter, "
+        "which is BEFORE that round's val loop updates the pdf, so it probes at the "
+        "previous round's magnitudes. Takes precedence over --corr-interval.",
     )
     parser.add_argument(
         "--corr-interval",
         type=int,
         default=None,
-        help="interval of iterations between gradient sweeps and cross-correlation "
-        "matrix emissions. Overrides schedule.corr_interval in the cluster config. "
-        "Independent of --round_interval. Defaults to max_iters // 4. Ignored when "
-        "--corr-sync-sa is set.",
+        help="put the correlation pipeline on a fixed iteration clock of its own "
+        "instead of the default SA-round-aligned schedule. Overrides "
+        "schedule.corr_interval in the cluster config. By DEFAULT (neither given) "
+        "sweeps fire on the SA rounds that can act on them: the last warmup round "
+        "as an unpublished baseline probe, then every SA-curve recompute round -- "
+        "rounds 3, 4, 10 and 16 of 20 at the default round_interval and warmup. "
+        "Naming an interval here decouples the two again, so an R may be measured "
+        "mid-curve and sit unread until the next round. Ignored when --corr-sync-sa "
+        "is set.",
     )
     parser.add_argument(
         "--corr-lambda",
@@ -837,6 +1395,15 @@ if __name__ == "__main__":
         "-- R is still measured and logged, just not fed back. 'soft-weighting' "
         "is the max-entropy tilt q(a) ~ pdf(a)*exp(-lambda*red(a)), soft by "
         "construction: an op is pushed down but structurally cannot reach zero. "
+        "'mRMR' HARD-PRUNES instead: it ranks the ops by minimum-Redundancy "
+        "Maximum-Relevance (relevance = the SA loop's own pdf mass, redundancy = "
+        "the pairwise cells of R) and sets every op outside the top "
+        "ceil(A/(1+lambda)) to probability exactly zero -- lambda buys a smaller "
+        "bank rather than a flatter one (0.25 keeps ~80%% of the ops, 0.5 ~67%%, "
+        "1.0 half). Deletion is a stronger claim than the observed correlation "
+        "sizes support, so read an mRMR run next to a soft-weighting run at the "
+        "same lambda, and pair it with --photometric-only until the geometric "
+        "ops' R stops being contaminated by image-label misalignment. "
         "This is the third axis of the correlation pipeline -- --corr-red-mode "
         "picks how a row of R reduces to one score per op, --corr-lambda picks "
         "how hard that score pushes, and this picks the form of the push. "
@@ -873,6 +1440,102 @@ if __name__ == "__main__":
         "excluded by default: the two directions of one op measure a "
         "parameterization convention, not redundancy between augmentations anyone "
         "would have chosen independently.",
+    )
+    parser.add_argument(
+        "--corr-skip-pruned-eval",
+        action="store_true",
+        default=False,
+        help="REJECTED on --aug-type=grad_corr, which is the only arm where it "
+        "could ever act. It would skip the gradient sweep and the round-eval for "
+        "whatever ops mRMR currently has pruned, backfilling each from its last "
+        "real measurement -- but that makes a skipped op's row of R come from an "
+        "OLDER checkpoint's gradients while every other row is fresh, so R mixes "
+        "vintages and stops being comparable round over round. Watching R evolve "
+        "as the model improves is the entire purpose of a grad_corr session, so "
+        "the saving is not one this pipeline can take. Inert (warned, not "
+        "rejected) on every other --aug-type: nothing but GradCorrValLoop ever "
+        "publishes runner.corr_pruned_ops, so there is no skip-list to read. To "
+        "actually train without an op, prune it statically with "
+        "--pruned-augmentations, which excludes it everywhere and costs R "
+        "nothing.",
+    )
+    parser.add_argument(
+        "--hold-none-prob",
+        action="store_true",
+        default=False,
+        help="hold P(no augmentation) fixed as --pruned-augmentations shrinks "
+        "the bank. The training pdf carries a synthetic ('none', 0) entry whose "
+        "mass is derived from the count of SURVIVING ops, so pruning 6 of 30 "
+        "silently raises it by ~0.7pp -- the pruned arm then trains on clean "
+        "images that much more often than its control, a second difference "
+        "sitting inside the comparison. With this flag the denominator counts "
+        "the pruned ops as if still present, so their mass goes to the surviving "
+        "ops and the augmentation RATE is unchanged: the prune alters which "
+        "augmentation is sampled, never how often one is. Same invariant "
+        "--corr-downweight-method=mRMR already holds internally. Off by default, "
+        "so a run launched before this flag existed is reproduced exactly. "
+        "Inert (warned) without --pruned-augmentations. Applies to "
+        "generate_pdf_new (the default) and --uniform; NOT to --weighted-augs, "
+        "whose rate moves with the op count for a different reason (a truncated "
+        "beta-binomial over all (op, level) pairs) that this flag does not "
+        "address.",
+    )
+    parser.add_argument(
+        "--pruned-augmentations",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="OP_NAME",
+        help="op names to permanently exclude from sampling for this entire "
+        "run, regardless of --aug-type. Overrides (does not merge with) the "
+        "cluster config's `pruned_augmentations:` list. Valid names are "
+        "LEGACY20_OPS' 20 PascalCase names or the 32 shared diff32/non-diff32 "
+        "snake_case names in sensaug/dataset/augmentations.py -- an unknown "
+        "name aborts before any config is built or work_dir created. A "
+        "known name that isn't part of the vocabulary this run's --aug-type "
+        "actually samples from is accepted but logged as inert.",
+    )
+    parser.add_argument(
+        "--random-prune-method",
+        type=str,
+        default="none",
+        choices=list(RANDOM_PRUNE_METHODS),
+        help="the random-pruning arm. `none` (default) draws nothing and leaves "
+        "the run exactly as it was. `null` is the control arm for mRMR: before "
+        "training starts, pick --random-prune-count ops at random out of the "
+        "ones this run would otherwise sample from, and drop them for the whole "
+        "run -- so the comparison is 'does ranking ops by redundancy beat "
+        "dropping the same number of them at random?'. Unlike mRMR the prune is "
+        "fixed, never re-derived: it carries no R, no lambda and no correlation "
+        "pipeline, and feeds straight into --pruned-augmentations.",
+    )
+    parser.add_argument(
+        "--random-prune-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help="how many ops --random-prune-method=null DROPS (not keeps). "
+        "Required on that arm, no default. To match a finished mRMR stage-1 "
+        "run, use the word count of its mrmr_pruned_ops.txt. Note the pool it "
+        "draws from already excludes whatever --no-inv-aug, --geometric-only / "
+        "--photometric-only and any explicit --pruned-augmentations removed, so "
+        "N is always N ops fewer than the control trains on. As with mRMR, "
+        "pruning raises P(no augmentation) unless --hold-none-prob is set: pass "
+        "that flag on both arms of a comparison or on neither.",
+    )
+    parser.add_argument(
+        "--random-prune-seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="seed for --random-prune-method=null's draw. Optional: when "
+        "omitted it is derived from SLURM_JOB_ID, else TORCHELASTIC_RUN_ID, "
+        "else (single-process runs only) os.urandom. Whatever is used is logged "
+        "and written to {work_dir}/random_prune.json. Pass it explicitly to "
+        "repeat a draw, or to sweep several random draws of the same size "
+        "(seeds 0, 1, 2 ...). It must be identical on every rank -- multi-rank "
+        "launches with no derivable seed are refused rather than silently "
+        "training a different bank per rank.",
     )
     parser.add_argument(
         "--adamw",
@@ -930,6 +1593,64 @@ if __name__ == "__main__":
             "logs afterwards, so it has to be stated up front."
         )
 
+    # Resolve CLI > cluster config, then validate against every known op name
+    # BEFORE any config is built, checkpoint loaded, or work_dir created --
+    # same fail-fast posture as the grad_corr check above. Re-assigned onto
+    # args so build_config can just read args.pruned_augmentations like every
+    # other resolved flag.
+    args.pruned_augmentations = resolve_pruned_augmentations(args.pruned_augmentations)
+    try:
+        validate_pruned_augmentations(
+            args.pruned_augmentations, set(LEGACY20_OPS) | set(DIFF32_OPS)
+        )
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Same fail-fast posture, and the same reason: rejecting a flag combination
+    # after Runner.from_cfg would mean discovering it a compute node and a
+    # scheduler queue later.
+    rejection = reject_skip_pruned_eval(args)
+    if rejection is not None:
+        parser.error(rejection)
+
+    # The `null` random-pruning arm. Resolved here, at argparse time, for three
+    # reasons: it must land in args.pruned_augmentations before build_config
+    # reads it (the SA curve's exclude=, the GPU sampling bank, the gradient
+    # sweep's static_pruned_ops all come off that one list); it must be known
+    # before the exp_name suffix below, which carries the seed; and a bad
+    # combination should cost exit 2 rather than a compute node and a queue.
+    args.random_prune_ops = []
+    args.random_prune_pool = []
+    args.random_prune_seed_used = None
+    args.random_prune_seed_source = None
+
+    rejection = reject_random_prune(args)
+    if rejection is not None:
+        parser.error(rejection)
+
+    if args.random_prune_method == "null":
+        args.random_prune_pool = random_prune_pool(args, args.pruned_augmentations)
+        rejection = reject_random_prune(args, pool=args.random_prune_pool)
+        if rejection is not None:
+            parser.error(rejection)
+
+        try:
+            seed, seed_source = resolve_random_prune_seed(args.random_prune_seed)
+        except ValueError as e:
+            parser.error(str(e))
+
+        args.random_prune_seed_used = seed
+        args.random_prune_seed_source = seed_source
+        args.random_prune_ops = draw_random_prune(
+            args.random_prune_pool, args.random_prune_count, seed
+        )
+        # Union, not replacement: the draw already excluded everything on the
+        # resolved list, so this composes the two rather than letting one hide
+        # the other. Sorted so the list a run records is stable.
+        args.pruned_augmentations = sorted(
+            set(args.pruned_augmentations) | set(args.random_prune_ops)
+        )
+
     if args.exp_name is None:
         args.exp_name = f"ours_{args.backbone}_{args.dataset}"
         # args.exp_name = f"none_{args.backbone}_{args.dataset}" if args.aug_type is None \
@@ -944,6 +1665,16 @@ if __name__ == "__main__":
     # would interleave two incomparable sets of R matrices in corr_matrix_log.json.
     if args.aug_type == "grad_corr":
         suffix = "gradcorr_nosa" if args.no_corr_sa else "gradcorr"
+        if suffix not in args.exp_name:
+            args.exp_name = args.exp_name + "_" + suffix
+
+    # And again for the null arm, carrying BOTH the count and the seed. Two
+    # draws of the same size at different seeds are different experiments;
+    # without the seed they would share a work_dir, interleave their logs, and
+    # -- because the Nexus sbatch's resume guard keys off
+    # {work_dir}/{exp_name}/last_checkpoint -- silently resume each other.
+    if args.random_prune_method == "null":
+        suffix = f"nullprune{args.random_prune_count}_s{args.random_prune_seed_used}"
         if suffix not in args.exp_name:
             args.exp_name = args.exp_name + "_" + suffix
 

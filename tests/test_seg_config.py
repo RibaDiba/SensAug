@@ -35,6 +35,7 @@ def test_load_seg_config_keys(config_file):
     assert set(result.keys()) == {
         "MMCONFIG_PATH", "PRIMARY_METRIC", "DATA_ROOT_LOOKUP",
         "SUPPORTED_DATASETS", "SUPPORTED_BACKBONES", "SCHEDULE",
+        "PRETRAINED_CACHE_DIR", "PRUNED_AUGMENTATIONS",
     }
 
 
@@ -116,6 +117,40 @@ def test_schedule_carries_the_two_clocks(tmp_path):
     result = load_seg_config(str(p))
     assert result["SCHEDULE"]["round_interval"] == 4000
     assert result["SCHEDULE"]["corr_interval"] == 20000
+
+
+def test_pruned_augmentations_is_optional(config_file):
+    # SAMPLE_YAML has no `pruned_augmentations:` key at all.
+    result = load_seg_config(config_file)
+    assert result["PRUNED_AUGMENTATIONS"] == []
+
+
+def test_pruned_augmentations_null_is_empty_not_none(tmp_path):
+    cfg = {
+        "data_root": "/d",
+        "mmconfig_path": "/m",
+        "datasets": {"cityscapes": "cityscapes"},
+        "supported_backbones": ["pspnet"],
+        "pruned_augmentations": None,
+    }
+    p = tmp_path / "null_pruned.yaml"
+    p.write_text(yaml.dump(cfg))
+    result = load_seg_config(str(p))
+    assert result["PRUNED_AUGMENTATIONS"] == []
+
+
+def test_pruned_augmentations_carries_the_list(tmp_path):
+    cfg = {
+        "data_root": "/d",
+        "mmconfig_path": "/m",
+        "datasets": {"cityscapes": "cityscapes"},
+        "supported_backbones": ["pspnet"],
+        "pruned_augmentations": ["lighter_R", "noise"],
+    }
+    p = tmp_path / "pruned.yaml"
+    p.write_text(yaml.dump(cfg))
+    result = load_seg_config(str(p))
+    assert result["PRUNED_AUGMENTATIONS"] == ["lighter_R", "noise"]
 
 
 def test_missing_required_key_raises(tmp_path):

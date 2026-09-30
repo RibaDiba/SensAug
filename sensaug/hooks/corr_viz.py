@@ -42,6 +42,10 @@ POLE_POS = "#6f0000"
 # Dropped ops (all-NaN rows) get the surface color plus a hatch -- readable as
 # "no measurement", never as "measured, and it came out near zero".
 DROPPED_FILL = "#e8e7e3"
+#: Statically pruned ops (--pruned-augmentations). A distinct hue rather than
+#: a second shade of DROPPED_FILL: "we chose not to measure this" and "the
+#: measurement failed" are different claims and must not read as the same one.
+STATIC_PRUNED_FILL = "#cfd8e8"
 
 
 def _srgb_to_linear(c):
@@ -107,9 +111,15 @@ CORR_CMAP = _build_cmap()
 
 
 def dropped_ops(r: np.ndarray) -> np.ndarray:
-    """Indices whose whole row is NaN -- the ops correlate() dropped for having no
-    variance over the window. Derived from R itself so the figure cannot disagree
-    with the matrix it is drawing."""
+    """Indices whose whole row is NaN -- ops with no usable measurement over the
+    window. Derived from R itself so the figure cannot disagree with the matrix it
+    is drawing.
+
+    Cannot on its own tell "measured, no variance" from "never measured because
+    --pruned-augmentations removed it": both are all-NaN rows. Callers that know
+    the difference pass `static_pruned` to `render_matrix` / `markdown_report`,
+    which subtract it out and label the two separately.
+    """
     return np.flatnonzero(~np.isfinite(np.asarray(r)).any(axis=1))
 
 
@@ -122,6 +132,7 @@ def render_matrix(
     warn: str = None,
     vlim: float = 1.0,
     cbar_label: str = "Pearson r",
+    static_pruned=(),
 ) -> np.ndarray:
     """Render R as an (H, W, 3) uint8 array, ready for SummaryWriter.add_image.
 
@@ -141,11 +152,22 @@ def render_matrix(
         vlim: colour limit, ALWAYS fixed by the caller and never derived from the
             data. Autoscaling per emission would make two checkpoints with
             different structure render identically.
+        static_pruned: op NAMES removed for the whole run by
+            --pruned-augmentations. Their rows are all-NaN like a dropped op's,
+            but for a reason that is a fact about the experiment rather than
+            about the data, so they get their own fill, their own label and are
+            excluded from the dropped count.
     """
     r = np.asarray(r, dtype=float)
     n = len(names)
-    dropped = set(dropped_ops(r).tolist())
-    labels = [f"{nm} (dropped)" if i in dropped else nm for i, nm in enumerate(names)]
+    static_idx = {i for i, nm in enumerate(names) if nm in set(static_pruned)}
+    dropped = set(dropped_ops(r).tolist()) - static_idx
+    labels = [
+        f"{nm} (pruned)"
+        if i in static_idx
+        else (f"{nm} (dropped)" if i in dropped else nm)
+        for i, nm in enumerate(names)
+    ]
 
     fig, ax = plt.subplots(figsize=(max(7.0, n * 0.62), max(6.0, n * 0.56)))
     fig.patch.set_facecolor(SURFACE)
@@ -162,14 +184,27 @@ def render_matrix(
     # and a colorblind reader.
     for i in range(n):
         for j in range(n):
-            if not np.isfinite(r[i, j]):
+            if np.isfinite(r[i, j]):
+                continue
+            if i in static_idx or j in static_idx:
+                # Flat fill, no hatch. The hatch means "we tried and got
+                # nothing"; a statically pruned op was never probed, so giving
+                # it the same texture would overstate what the figure knows.
                 ax.add_patch(
                     Rectangle(
                         (j - 0.5, i - 0.5), 1, 1,
-                        fill=False, hatch="///", edgecolor=INK_MUTED,
-                        linewidth=0.0, alpha=0.55,
+                        facecolor=STATIC_PRUNED_FILL, edgecolor=GRIDLINE,
+                        linewidth=0.4,
                     )
                 )
+                continue
+            ax.add_patch(
+                Rectangle(
+                    (j - 0.5, i - 0.5), 1, 1,
+                    fill=False, hatch="///", edgecolor=INK_MUTED,
+                    linewidth=0.0, alpha=0.55,
+                )
+            )
 
     # Blank the diagonal. It is 1.0 by construction, so it carries no information
     # while rendering as the single most saturated band on the figure -- it draws
@@ -270,6 +305,7 @@ def markdown_report(
     q: np.ndarray = None,
     survives: np.ndarray = None,
     top_n: int = 12,
+    static_pruned=(),
 ) -> str:
     """A markdown table of the strongest pairs, for TensorBoard's TEXT tab.
 
@@ -277,6 +313,11 @@ def markdown_report(
     the heatmap that summarises them, so reading R does not mean leaving the UI.
     All the significance columns are optional: with bootstrap=False they are simply
     absent rather than faked.
+
+    `static_pruned` is listed on its own line rather than folded into
+    `dropped_names`: a reader scanning for "did the measurement break" needs the
+    dropped list to mean only that, and an op removed by --pruned-augmentations
+    is a choice the run made, not a failure it hit.
     """
     r = np.asarray(r, dtype=float)
     n = len(names)
@@ -303,6 +344,13 @@ def markdown_report(
         f"- magnitudes **{magnitude_source or 'unknown'} / {magnitude_mode or 'unknown'}**",
         f"- max shared-factor loading **{_num_cell(max_shared_loading, '{:.2f}')}**",
         f"- dropped: **{', '.join(dropped_names) if dropped_names else 'none'}**",
+    ]
+    if static_pruned:
+        lines.append(
+            f"- statically pruned (not measured): "
+            f"**{', '.join(sorted(static_pruned))}**"
+        )
+    lines += [
         "",
         "| " + " | ".join(header) + " |",
         "|" + "|".join(["---"] * len(header)) + "|",

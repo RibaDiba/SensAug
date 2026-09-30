@@ -74,9 +74,44 @@ Testing datasets:
 - Nighttime Driving 
 - IDD
 
-Each dataset has different setup instructions. You can find the setup instructions for most of them (all but a2i2haze) on this [MMSeg tutorial link](https://mmsegmentation.readthedocs.io/en/latest/user_guides/2_dataset_prepare.html).
+Cityscapes and ADE20K are already staged on Nexus. The other seven are installed
+with **[`scripts/prepare_datasets.py`](scripts/prepare_datasets.py)**, which resolves
+each target directory from the same `DATA_ROOT_LOOKUP` that `train.py` uses, runs the
+vendored MMSeg converters ([`sensaug/custom_configs/dataset_converters/`](sensaug/custom_configs/dataset_converters), pinned to mmsegmentation v1.2.2), verifies file counts, and is idempotent (an already-installed dataset is skipped).
 
-Additionally, you can also contact me if you would like a zip file of the post-processed data for convenience: ```lyzheng@umd.edu```.
+```bash
+# see what is / isn't installed, download nothing:
+python scripts/prepare_datasets.py --all --cluster-config configs/nexus.yaml --check
+```
+
+**Public — no login, fully scripted** (also available as `sbatch job_scripts/prepare_datasets.sbatch`):
+
+```bash
+python scripts/prepare_datasets.py pascal_voc12 loveda --cluster-config configs/nexus.yaml
+```
+
+| key | source | notes |
+|---|---|---|
+| `pascal_voc12` | `VOCtrainval_11-May-2012.tar` (Oxford VGG, with pjreddie mirror) | plain VOC2012; the SBD `aug` split is not needed for the shipped config |
+| `loveda` | Zenodo record `5706578` (`Train/Val/Test.zip`, ~9.5 GB) | converted to `img_dir/`+`ann_dir/` |
+
+**Gated — needs a one-time manual, logged-in download.** Run the command with no
+`--src` to print the exact URL and steps; then re-run pointing `--src` at the
+archive(s):
+
+```bash
+python scripts/prepare_datasets.py acdc --cluster-config configs/nexus.yaml --src /path/to/acdc_download
+```
+
+| key | where to register | archive(s) | extra step |
+|---|---|---|---|
+| `potsdam` | isprs.org UrbanSemLab benchmark | `2_Ortho_RGB.zip`, `5_Labels_all.zip` | tiled to 512×512 by the converter |
+| `synapse` | synapse.org project `syn3193805` | `RawData.zip` (BTCV Abdomen) | `pip install nibabel`; train/val split written automatically |
+| `acdc` | acdc.vision.ee.ethz.ch | `rgb_anon_trainvaltest.zip`, `gt_trainval.zip` | test-only; converter maps raw `val/` → `test/` |
+| `idd` | idd.insaan.iiit.ac.in | `idd-segmentation.tar.gz` | test-only; run AutoNUE `createLabels.py` (`--id-type level3Id`) to make `*_gtFine_labelTrainIds.png` first |
+| `a2i2haze` | no public source | post-processed zip from `lyzheng@umd.edu` | expects `imgs/{train,val}` + `labels/{train,val}` |
+
+The MMSeg dataset-prepare tutorial (<https://mmsegmentation.readthedocs.io/en/latest/user_guides/2_dataset_prepare.html>) is the upstream reference for the converter behaviour.
 
 ## Training a Model 
 To train a model, you can either call the Python training file [```train.py```](train.py) directly or use one of the convenience bash scripts provided in ```job_scripts```. 
@@ -103,10 +138,12 @@ There are many command-line arguments in the train.py script, which you can list
 | `--uniform` | flag | False | Use uniform augmentation distribution |
 | `--descending-MA` | flag | False | Prioritize less severe augmentations (descending moving average) |
 | `--freeze-early-layers` | flag | False | Freeze early backbone layers during training |
-| `--round_interval` | int | `max_iters // 20` | Iterations between robustness re-evaluations — the **SA pipeline's clock**. Overrides `schedule.round_interval` in the cluster config. See [Scheduling](#scheduling-two-independent-pipelines) |
+| `--rounds-config` | path | `configs/rounds.yaml` | The **val-round grid**: how many rounds a run has, how many are warmup, and which of them the correlation pipeline fires on. See [Scheduling](#scheduling-two-independent-pipelines) |
+| `--round_interval` | int | `max_iters // n_rounds` | Iterations between robustness re-evaluations — the **SA pipeline's clock**. Overrides `schedule.round_interval` in the cluster config |
 | `--no-corr-sa` | flag | False | Under `--aug-type=grad_corr`, disable the SA loop — trains exactly like `none` while still running the correlation measurement. This is the control arm |
-| `--corr-interval` | int | `max_iters // 4` | Iterations between gradient sweeps and R emissions — the **correlation pipeline's clock**. Only meaningful under `--aug-type=grad_corr`. Overrides `schedule.corr_interval` in the cluster config |
-| `--sa_interval` | int | None | ⚠️ Currently unused — parsed but never read. The SA-curve recompute cadence is hardcoded to every 6th round in `sensaug/loops/sensaug_loop.py` |
+| `--corr-interval` | int | *(unset)* | Put the correlation pipeline on a fixed iteration clock instead of the round-aligned default. Only meaningful under `--aug-type=grad_corr`. Overrides `schedule.corr_interval` in the cluster config |
+| `--corr-sync-sa` | flag | False | Fire the correlation pipeline on **every** SA round rather than the round-aligned subset. Takes precedence over `--corr-interval` |
+| `--sa_interval` | int | None | ⚠️ Currently unused — parsed but never read. The SA-curve recompute cadence is every 6th round (`SA_CURVE_CADENCE` in `sensaug/round_schedule.py`) |
 | `--adamw` | flag | False | Use AdamW optimizer instead of default SGD |
 | `--amp` | flag | False | Enable automatic mixed-precision (AMP) training |
 | `--auto-scale-lr` | flag | False | Auto-scale learning rate based on batch size |
@@ -116,26 +153,54 @@ There are many command-line arguments in the train.py script, which you can list
 
 ### Scheduling: two independent pipelines
 
-Training runs **two separate measurement pipelines**, on two clocks that have nothing to do with each other. Both are set in iterations, in the `schedule:` block of the cluster config, and both can be overridden on the command line.
+Training runs **two separate measurement pipelines**. The SA pipeline runs on a fixed iteration interval; the correlation pipeline, by default, runs on a chosen subset of the *rounds* that interval produces — see [The round schedule](#the-round-schedule) below.
 
-| Pipeline | What it measures | Clock | Where it lives |
+| Pipeline | What it measures | When it fires | Where it lives |
 |---|---|---|---|
-| **Sensitivity analysis (SA)** | Which perturbations the model is currently *worst at* — used to weight the training augmentation PDF | `schedule.round_interval` / `--round_interval` (default `max_iters // 20`) | `sensaug/loops/sensaug_loop.py` (`RobustValLoop`) |
-| **Gradient cross-correlation** | Which perturbations are *redundant with each other* — the correlation matrix R | `schedule.corr_interval` / `--corr-interval` (default `max_iters // 4`) | `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
+| **Sensitivity analysis (SA)** | Which perturbations the model is currently *worst at* — used to weight the training augmentation PDF | every `schedule.round_interval` / `--round_interval` iterations (default `max_iters // n_rounds`) | `sensaug/loops/sensaug_loop.py` (`RobustValLoop`) |
+| **Gradient cross-correlation** | Which perturbations are *redundant with each other* — the correlation matrix R | on the rounds named by `configs/rounds.yaml` (default 3, 4, 10, 16 of 20), or every `--corr-interval` iterations if you name one | `sensaug/round_schedule.py` → `sensaug/hooks/grad_hook.py` → `sensaug/hooks/grad_sens_analysis.py` |
 
 ```yaml
-# configs/della.yaml
+# configs/della.yaml -- iteration intervals only
 schedule:
   round_interval: 4000    # SA pipeline: a val/SA round every 4000 iters
-  corr_interval: 20000    # correlation pipeline: a gradient sweep + R every 20000 iters
+  corr_interval: null     # null -> the correlation pipeline uses the round schedule
 ```
 
 Leave a value `null` (or omit the `schedule:` block entirely) to take the default. Precedence is **CLI flag > cluster config > default**.
 
 Notes on each:
 
-- **SA pipeline.** Runs only under `--aug-type=ours`. Every `round_interval` iterations it re-evaluates perturbation robustness and rebuilds the training sampling PDF. The SA *curve* itself is recomputed every 6th round (hardcoded in `sensaug/loops/sensaug_loop.py`), so the effective SA-curve cadence is `6 × round_interval`.
-- **Correlation pipeline.** Opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag you layer on top of another one (there is no standalone `--grad-corr` flag; `--aug-type=none --grad-corr` is not valid). Every `corr_interval` iterations it freezes the model, sweeps the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per augmentation per image, and correlates that sweep into R. It fires from `after_train_iter`, so it never depends on a val round happening. The final training iteration always fires, so the converged model's R exists even when `max_iters` is not a multiple of `corr_interval`.
+- **SA pipeline.** Runs only under `--aug-type=ours`. Every `round_interval` iterations it re-evaluates perturbation robustness and rebuilds the training sampling PDF. The SA *curve* itself is recomputed every 6th round, so the effective SA-curve cadence is `6 × round_interval`.
+- **Correlation pipeline.** Opt-in via `--aug-type=grad_corr` — it is its own `--aug-type` value, not a flag you layer on top of another one (there is no standalone `--grad-corr` flag; `--aug-type=none --grad-corr` is not valid). At each firing iteration it freezes the model, sweeps the whole clean val set (500 images on Cityscapes) for `d loss / d magnitude` per augmentation per image, and correlates that sweep into R. It fires from `after_train_iter` and calls nothing in the val loop, so it never *depends* on a val round happening — it is only scheduled alongside them.
+
+#### The round schedule
+
+A **round** is one run of the val loop. The grid lives in [`configs/rounds.yaml`](configs/rounds.yaml) — cluster-independent, because how many rounds a run has is an experiment parameter and not a path:
+
+```yaml
+n_rounds: 20          # sets the DEFAULT round_interval (max_iters // n_rounds)
+warmup_rounds: 4      # --no-warmup forces 0
+corr_rounds: null     # null -> derived; or a literal list of round numbers
+control_rounds: null  # null -> derived as the firing rounds inside warmup
+```
+
+At those defaults the correlation pipeline fires on rounds **3, 4, 10, 16** of 20:
+
+| rounds | what |
+|---|---|
+| 0–2 | nothing |
+| 3 | one **control probe** — the baseline, does *not* feed the PDF |
+| 4 | compute, used for rounds 4–9 |
+| 10 | compute, used for rounds 10–15 |
+| 16 | compute, used for rounds 16–18 |
+| 19 | nothing (training's over) |
+
+Rounds 4 / 10 / 16 are exactly the SA-curve recompute rounds, so each matrix stays current for the rounds that curve governs. The sweep runs from `after_train_iter`, which `IterBasedTrainLoop` reaches *before* it calls `val_loop.run()`, so the R measured at round `r` is on the runner in time for round `r`'s own PDF. Round 19 never fires: training ends with it, so nothing could read its R.
+
+Round 3's probe is the last warmup round — R measured on a model no PDF has touched. It is logged like any other emission, with `"role": "control"` in `corr_matrix_log.json`, and is never published to the training PDF.
+
+The emission count is derived, not pinned: `--round_interval=2000` on an 80k run gives 40 rounds and 7 emissions.
 
 R is a claim about the augmentation operators themselves, not about the `ours` training loop, so the pipeline also needs an unaugmented control arm to compare against. That's `--no-corr-sa`: it disables the SA loop, so the run trains exactly like `none` while still running the correlation measurement.
 
@@ -143,7 +208,7 @@ R is a claim about the augmentation operators themselves, not about the `ours` t
 python train.py \
   --cluster-config=configs/della.yaml \
   --backbone=pspnet --dataset=cityscapes \
-  --aug-type=grad_corr --no-corr-sa --corr-interval=20000 \
+  --aug-type=grad_corr --no-corr-sa \
   --work_dir=./experiments --exp_name=corr_baseline_pspnet_cityscapes
 ```
 

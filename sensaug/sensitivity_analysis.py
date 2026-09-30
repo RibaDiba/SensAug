@@ -46,7 +46,7 @@ BASE_DATASET = "leftImg8bit/val"
 
 
 def adaptive_sensitivity_analysis_new(
-    cfg, runner, num_levels, tolerance, perturbation_set="legacy20"
+    cfg, runner, num_levels, tolerance, perturbation_set="legacy20", exclude=()
 ):
     predictor = pchip_interpolator
     perturbation_levels: Dict[str, List[float]] = {}
@@ -67,6 +67,7 @@ def adaptive_sensitivity_analysis_new(
         perturbation_set,
         geometric_only=getattr(cfg, "geometric_only", False),
         photometric_only=getattr(cfg, "photometric_only", False),
+        exclude=exclude,
     ).items()
 
     verify_perturbation_effective(

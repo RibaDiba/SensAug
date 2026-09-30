@@ -22,6 +22,7 @@ easiest way for that to stop being true is for the two to reconstruct RGB [0, 1]
 differently.
 """
 
+import contextlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -42,6 +43,7 @@ __all__ = [
     "set_train_spec",
     "set_eval_spec",
     "clear_spec",
+    "suspended_augmentation",
     "NO_OP",
 ]
 
@@ -109,6 +111,33 @@ def clear_spec(runner, training: bool) -> None:
         dp.set_eval_none()
 
 
+@contextlib.contextmanager
+def suspended_augmentation(model):
+    """Both augmentation slots off for the duration, restored on the way out.
+
+    For measurement code that has to call the preprocessor to get a device-side,
+    normalized, padded batch but must NOT get the training policy applied on the
+    way through -- CollectGradientHook's sweep, whose whole contract is that
+    every op is probed against the same CLEAN image. `training=True` is not
+    optional there (mmseg pads gt_sem_seg only on that branch), so the policy has
+    to come off the preprocessor rather than out of the flag.
+
+    Takes the model rather than the runner, and is a no-op when the preprocessor
+    is the stock SegDataPreProcessor: the non-GPU arms have no policy to suspend
+    and must not be made to raise for lacking one.
+    """
+    dp = _unwrap(model).data_preprocessor
+    if not isinstance(dp, GpuAugSegDataPreProcessor):
+        yield
+        return
+    train_spec, eval_spec = dp._train_spec, dp._eval_spec
+    dp._train_spec = dp._eval_spec = None
+    try:
+        yield
+    finally:
+        dp._train_spec, dp._eval_spec = train_spec, eval_spec
+
+
 @MODELS.register_module()
 class GpuAugSegDataPreProcessor(SegDataPreProcessor):
     """`SegDataPreProcessor` that applies a `diff32` op to the batch on GPU.
@@ -119,12 +148,17 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
     the other's state. `forward`'s `training` flag selects between them.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, pruned_ops: Sequence[str] = (), **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # (kind, payload): ("uniform", (geo, photo)) | ("pdf", pdf_dict) | None
         self._train_spec: Optional[Tuple[str, object]] = None
         # (op_name, magnitude) | None
         self._eval_spec: Optional[Tuple[str, float]] = None
+        # Static, whole-run exclusion list (--pruned-augmentations). Only
+        # consulted by _op_bank, i.e. the "uniform" train-spec branch
+        # (--random-aug under diff32): the "pdf" branch's keys already exclude
+        # pruned ops upstream, at the SA curve's source (RobustValLoop.pruned_augmentations).
+        self._pruned_ops = frozenset(pruned_ops)
         # Sampling RNG is numpy's global, matching the transforms this replaces
         # (RandomAlphaTrainTransform / RandomTrainTransformNew both call
         # np.random.*), so seeding behaviour is unchanged.
@@ -159,7 +193,7 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
     # --- sampling ------------------------------------------------------------
 
     def _op_bank(self, geometric_only: bool, photometric_only: bool) -> List[str]:
-        names = list(DIFF32_OPS)
+        names = [n for n in DIFF32_OPS if n not in self._pruned_ops]
         if geometric_only:
             return [n for n in names if n in GEOMETRIC_OP_KEYS]
         if photometric_only:
@@ -217,7 +251,7 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
         for sample, label in zip(data_samples, labels):
             sample.gt_sem_seg.data = label
 
-    def _apply(self, rgb01, labels, specs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _apply_ops(self, rgb01, labels, specs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply each sampled op to the sub-batch that drew it.
 
         Grouped rather than looped per image so the ops still run batched, which
@@ -287,7 +321,7 @@ class GpuAugSegDataPreProcessor(SegDataPreProcessor):
         with torch.no_grad():
             rgb01 = ((inputs * std + mean) / 255.0).clamp(0.0, 1.0)
             labels = self._gather_labels(data_samples)
-            rgb01, labels = self._apply(rgb01, labels, specs)
+            rgb01, labels = self._apply_ops(rgb01, labels, specs)
             data["inputs"] = (rgb01 * 255.0 - mean) / std
 
         if labels is not None:
